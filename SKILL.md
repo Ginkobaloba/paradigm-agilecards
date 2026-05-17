@@ -96,6 +96,34 @@ Unresolved disagreements between any two planning agents are logged
 verbatim in the manifest under `planner_disagreements:`. Never silently
 average; Drew triages from the manifest.
 
+**Done definition is a planner output, machine-verifiable, no
+interpretation allowed.** One of the planner's required outputs for
+every card is its Done definition: the `acceptance_checks:` YAML block
+inside the body's Acceptance criteria section. Every item in that
+block MUST be a runnable assertion (`shell`, `file_exists`,
+`file_absent`, `grep_match`, `grep_absent`, `http_status`), not prose.
+A card whose "done" cannot be expressed as runnable assertions either
+needs to be split until its sub-cards can, or marked tier 5 / 6 so the
+high-stakes path puts a human at the merge gate where subjective
+review belongs. The validation pass in section 4 enforces this.
+
+**AC is immutable post-creation.** Once a batch is written, the
+`acceptance_checks:` block of a card cannot be edited by the executor
+agent. If the executor needs to argue for an amendment (e.g., a test
+turns out to be wrong, an assumption was off), the mechanism is the
+standup amendment pattern (see section 11). The executor's voice is
+preserved because they are closest to the work; the immutability is
+the guard against an agent rewriting the goalposts mid-run.
+
+**Future optimization note (not committed for v1.1).** Planning is
+multi-agent by default: Planner + adversarial Reviewer, both at opus
+with extended thinking. A staged variant exists as a token-efficiency
+lever, to be explored once `/cards stats` produces estimated-vs-actual
+data: stage 1 sonnet-no-ET decomposition pass, stage 2 opus AC and
+tier assignment, stage 3 opus or sonnet+ET adversarial review. Not a
+v1.1 change. Flagged here so the data the system collects can inform
+the decision later instead of vibes.
+
 ---
 
 ## 3. Tier assignment
@@ -145,6 +173,16 @@ failure and abort. No half-written state in `C:\dev\todo\`.
 4. **Hot-paths cross-check.** For any card whose `touches:` matches a
    project-config `hot_paths:` glob, raise the card's parallel
    sensitivity. Surface in the dry-run summary.
+5. **AC machinability check.** For each card, parse the
+   `acceptance_checks:` YAML block. Every item must have a `check:`
+   field whose `type` is one of the supported runnable types (`shell`,
+   `file_exists`, `file_absent`, `grep_match`, `grep_absent`,
+   `http_status`). Prose-only AC items cause an abort with the
+   offending card id and item index. The exception is tier 5 / 6
+   cards, which may carry up to one subjective item per card because
+   the merge gate already routes through a human; the planner must
+   mark that item with `subjective: true` so the runner does not
+   attempt to execute it.
 
 ---
 
@@ -290,6 +328,102 @@ runner with a stale read?). Surface and stop.
 
 When in doubt: prefer fewer rounds, log the uncertainty in the
 manifest, let Drew decide.
+
+---
+
+## 11. AC immutability and the standup amendment pattern
+
+The `acceptance_checks:` block of a card is immutable after the card
+is written. The executor agent MUST NOT edit it directly. This is
+enforced in `RUNNER_CONTRACT.md` (executor protocol) and recapped in
+section 2 above.
+
+The escape valve, because reality sometimes invalidates a planner's
+assumption, is the standup amendment pattern:
+
+1. The executor adds a `change_request:` block to the card body
+   explaining the proposed amendment and the reasoning. Suggested
+   shape:
+
+   ```yaml
+   change_request:
+     proposed_at: 2026-05-17T14:32:00Z
+     proposed_by: executor-agent-id-or-trace
+     target_check: "the description string of the AC item, or its index"
+     proposed_change: "what the executor wants changed"
+     reasoning: "what they learned that invalidates the original"
+     evidence: "command output, file path, log excerpt"
+   ```
+
+2. The card moves from `active/` to `amendments/` and its `status`
+   field is set to `awaiting_amendment_review`. The runner does the
+   move; the executor signals it by writing the `change_request`
+   block and then exiting cleanly.
+
+3. The reviewer (Drew, and / or a sibling reviewer agent) evaluates
+   the request in a standup. This is a deliberately human-touched
+   gate: the planner thought one thing, the executor learned another,
+   and the call between them is not delegated to either side
+   unilaterally.
+
+4. Outcomes:
+   - **Approved.** The AC item is amended in place. Provenance fields
+     are attached to the changed item (`amended_at`, `amended_by`,
+     `amendment_reason`, plus the full `original:` block of the
+     pre-amendment item). The card moves back to `active/` and the
+     executor finishes against the amended AC. The original is
+     retained so the change is auditable forever.
+   - **Denied.** The executor finishes against the original AC, or
+     the card moves to `blocked/` if the original truly cannot be
+     satisfied.
+
+Amended item shape inside `acceptance_checks:`:
+
+```yaml
+acceptance_checks:
+  - description: "Post-amendment description"
+    check: { ... amended check spec ... }
+    amended_at: 2026-05-17T15:10:00Z
+    amended_by: drew
+    amendment_reason: "Original test assumed in-process bucket; redis
+      bucket is the only correct shape after b001-02 revision."
+    original:
+      description: "Pre-amendment description"
+      check: { ... pre-amendment check spec ... }
+```
+
+This pattern preserves the executor's voice (they raised the issue)
+without giving them the keys to the contract (they cannot unilaterally
+relax it). Cost is one human review per amendment. Benefit is a
+contract that cannot be silently rewritten mid-run.
+
+---
+
+## 12. Human-in-the-loop principle
+
+The /cards system is not designed for a world where Drew is absent.
+Drew is a permanent collaborator who participates in standups,
+retros, and amendment reviews. The system is built around that fact,
+not around a future where the human is optimized out.
+
+Concretely this shapes:
+
+- **AC amendments** (section 11) require a human reviewer in the
+  approval path. A sibling reviewer agent may participate, but the
+  approval call is human-touched by default.
+- **Sprint close** (Future Work, sprint scheduler entry in
+  `README.md`) surfaces every unfinished card as a forced decision
+  for the human, not as a silent rollover.
+- **High-stakes merge gates** (tier 5 / 6) already route to Drew per
+  `RUNNER_CONTRACT.md`. That stays.
+- **Planner-reviewer disagreements** that don't converge in two
+  rounds are surfaced to Drew, not auto-resolved.
+
+Where the system can absorb human absence (the runner survives
+restarts; cards are durable state; orphan reclaim handles executor
+crashes) it does. Where the system requires human judgment (contract
+amendments, sprint scoping, high-stakes review) it asks. The
+distinction is deliberate, not a transitional state.
 
 ---
 

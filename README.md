@@ -6,7 +6,9 @@ cards that a fleet of agents can run in parallel.
 The skill is the planner. It writes cards to `C:\dev\todo\backlog\` and a
 batch manifest to `C:\dev\todo\_batches\`. A separate runner (out of scope
 for this skill) polls `backlog\`, spawns executor agents, and moves cards
-through `active\` -> `done\` or `blocked\`.
+through `active\` -> `done\` or `blocked\`. Cards whose executor proposes
+an AC amendment (see SKILL.md section 11) pass through `amendments\` for
+human review before resuming.
 
 ---
 
@@ -279,9 +281,15 @@ are notes for future-Drew, not promises.
   one ~5-hour usage window. Aggregates the token and duration metrics
   into per-sprint retros (estimated vs actual, what got cut, what
   blocked). Lets the user schedule future sprints based on historical
-  accuracy. Natural product extension: package /cards plus the
-  scheduler plus a local orchestrator that doesn't have token caps
-  as a single tool for solo-with-agents agile.
+  accuracy. At sprint close, every unfinished card surfaces as a
+  forced human decision (re-queue, deprioritize, split, drop,
+  escalate). No silent rollover. This is the Linear-style cycle close
+  behavior; it is the only way to keep the planner-vs-reality loop
+  honest, because silent auto-carry hides the same misestimation
+  every sprint until the backlog is unsustainable. Natural product
+  extension: package /cards plus the scheduler plus a local
+  orchestrator that doesn't have token caps as a single tool for
+  solo-with-agents agile.
 - Dead-letter queue for cards that fail repeatedly.
 - Dynamic backlog reprioritization (re-tier in flight).
 - Cryptographic `claimed_by` (signed claims to prevent runner spoofing

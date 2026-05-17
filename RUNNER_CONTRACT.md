@@ -15,10 +15,11 @@ deliberately a description, not an implementation.
 
 ```
 C:\dev\todo\
-  backlog\    cards that have not been claimed
-  active\     cards an executor is currently working on
-  done\       cards whose work merged successfully
-  blocked\    cards finished but unmerged, or paused on a dependency
+  backlog\       cards that have not been claimed
+  active\        cards an executor is currently working on
+  amendments\    cards awaiting review of an executor change_request
+  done\          cards whose work merged successfully
+  blocked\       cards finished but unmerged, or paused on a dependency
   _batches\
     .counter
     b<NNN>-manifest.yaml
@@ -42,9 +43,25 @@ itself does not change; only its parent directory changes.
 backlog --claim--> active --finish + merge_status=merged--> done
                        \--finish + merge_status!=merged--> blocked
                        \--dependency unmet (re-check)--> backlog
+                       \--change_request written--> amendments
+amendments --amendment approved--> active
+amendments --amendment denied--> active (against original) or blocked
 backlog --dependency permanently blocked--> blocked
 blocked --unblocked--> backlog or active (runner choice)
 ```
+
+Allowed `status` (subfolder / field) values:
+
+- `backlog`
+- `active`
+- `amendments` (field value: `awaiting_amendment_review`)
+- `done`
+- `blocked`
+
+The `awaiting_amendment_review` field value pairs with the
+`amendments/` subfolder. Naming asymmetry is deliberate: the
+subfolder is short for filesystem ergonomics, the field is explicit
+for human readers grepping for state.
 
 Allowed `merge_status` values:
 
@@ -95,6 +112,57 @@ pick). On every runner pass:
 
 This makes executor crashes recoverable without manual intervention.
 The card schema reserves the fields; the runner owns the policy.
+
+---
+
+## AC amendment protocol (executor and runner)
+
+The `acceptance_checks:` block of a card is immutable after the card
+is written. The executor agent MUST NOT edit it. Attempting to edit
+AC is a contract violation; the runner SHOULD detect the edit on
+heartbeat and abort the card with a marker in Completion notes.
+
+The supported escape valve is the standup amendment pattern. Executor
+side:
+
+1. Detect that an AC item is wrong, ambiguous, or invalidated by
+   reality.
+2. Append a `change_request:` block to the card body (see SKILL.md
+   section 11 for the shape). Do NOT modify the `acceptance_checks:`
+   block.
+3. Set the card's `status` field to `awaiting_amendment_review`.
+4. Update `last_heartbeat` one final time and exit cleanly. Do not
+   continue working the card.
+
+Runner side, on noticing a card whose `status` field is
+`awaiting_amendment_review`:
+
+1. Move the card from `active/` to `amendments/` (atomic move,
+   subfolder change only; filename unchanged).
+2. Clear `claimed_by`, `started_at`, `last_heartbeat`. The branch is
+   left alone; partial work on the executor's branch is preserved.
+3. Notify the human review path (mechanism is runner-defined: a
+   marker file, a Slack ping, a queue entry, etc.). The runner does
+   not auto-approve.
+
+Reviewer side (human and / or sibling reviewer agent):
+
+- **Approve.** Edit the relevant item inside the card's
+  `acceptance_checks:` block: replace the item with the amended
+  version and attach provenance fields (`amended_at`, `amended_by`,
+  `amendment_reason`, `original:` carrying the pre-amendment item).
+  Set status back to `backlog` or `active` per runner choice; the
+  runner moves the file accordingly.
+- **Deny.** Add a `change_request_decision:` block to the card body
+  with reasoning. Move the card back to `active/` (executor finishes
+  against the original AC) or `blocked/` (original AC cannot be
+  satisfied). Do not delete the `change_request:` block; it stays as
+  audit trail.
+
+The runner MUST never amend AC on its own initiative. Amendments are
+human-touched by default (sibling reviewer agents may participate but
+the approval is recorded against a human or against a reviewer agent
+that Drew explicitly delegated to in the project config).
 
 ---
 
@@ -149,7 +217,8 @@ Related Claude Code issues for context: #40164 (parallel agent file
 contention) and #34645 (.git/config.lock race). Same mitigations apply.
 
 **Atomic move between subfolders.** Card state transitions rely on
-atomic file moves across `backlog/`, `active/`, `done/`, `blocked/`.
+atomic file moves across `backlog/`, `active/`, `amendments/`,
+`done/`, `blocked/`.
 The filename stays the same; only the parent directory changes. On
 NTFS, `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING` is documented
 atomic within a volume, but the dev-meta repo includes
@@ -159,6 +228,68 @@ subfolders is atomic under concurrent contention. Run that script
 once per device before trusting parallel runners on that machine. If
 the test fails, fall back to `Move-Item` with explicit lock-retry
 loop (see test script comments).
+
+---
+
+## Worktree isolation and cross-contamination defense
+
+Parallel executor agents share the same machine and the same git
+repo. Without explicit isolation they will step on each other in
+subtle ways. The runner MUST enforce the following:
+
+1. **Per-worktree clean env block.** Each spawned executor gets an
+   isolated env var block. No env shared across siblings. Inherit
+   only the minimum the agent needs (PATH, HOME, TEMP, plus anything
+   the project config explicitly lists). In particular, do not share
+   `OPENAI_*`, `ANTHROPIC_*`, `AWS_*`, `GH_TOKEN`, or any credential
+   var across worktrees unless the project config explicitly says
+   so. Treat every executor as if it were running on a fresh host.
+
+2. **Per-worktree dependency caches.** Each worktree gets its own
+   `node_modules/`, `__pycache__/`, `.venv/`, `target/`, etc. No
+   symlinks to a shared install. Yes this costs disk; the alternative
+   is two executors corrupting each other's installs mid-card. Set
+   `npm_config_cache` and pip equivalents to a per-worktree path if
+   the package manager respects it; otherwise tolerate the duplicate
+   downloads.
+
+3. **Per-worktree git config.** Use `git config --worktree` for any
+   per-card config (user.name, user.email, commit signing, hooks).
+   Do not modify the user-global git config from within an executor.
+   The runner MAY pre-seed `--worktree` config before handing the
+   worktree to the agent.
+
+4. **Pre-flight clean-state check.** The executor's first action on
+   claiming a card is a clean-state assertion: `git status` returns
+   clean, no untracked files matching the project's `.gitignore`-able
+   patterns, no `.git/*.lock` files present, no leftover process
+   locks (lockfiles, PID files) in the worktree from a prior crashed
+   agent. If any of those fail, the executor aborts and the runner
+   moves the card back to `backlog/` with a marker in Completion
+   notes.
+
+5. **Mid-execution log / output isolation.** An in-flight executor's
+   logs, intermediate outputs, and scratch files are written to a
+   per-card path the runner allocates (suggested:
+   `C:\dev\todo\_runs\<trace_id>\`). Sibling agents MUST NOT read
+   that path while the card is in `active/` or `amendments/`. The
+   runner exposes the path to downstream consumers (review, retro,
+   audit) only after the card moves to `done/` or `blocked/`. This
+   prevents one agent's half-written log being parsed as ground truth
+   by another agent's tool call.
+
+6. **Serialized worktree creation via global mutex.** Worktree
+   creation calls (`git worktree add`) must be serialized across
+   parallel runners by a global file lock (`C:\dev\todo\.runner.lock`
+   or equivalent). Git's internal locks (`.git/config.lock`,
+   `.git/worktrees/*/locked`) are not safe under concurrent
+   `git worktree add` invocations; see issue #34645. Hold the mutex
+   for the duration of the `git worktree add` call only, not for
+   the executor's lifetime.
+
+These are not optional. Skipping any of them produces failure modes
+that are intermittent, machine-specific, and miserable to debug after
+the fact. Pay the isolation cost up front.
 
 ---
 
@@ -316,8 +447,11 @@ recorded them.
 
 - Frontmatter schema as defined in `templates/card.md`. Field renames or
   removals are breaking changes.
-- Status subfolder names: exactly `backlog`, `active`, `done`, `blocked`,
-  `_batches`.
+- Status subfolder names: exactly `backlog`, `active`, `amendments`,
+  `done`, `blocked`, `_batches`.
+- Status field values: `backlog`, `active`, `awaiting_amendment_review`,
+  `done`, `blocked`. The `awaiting_amendment_review` field value
+  pairs with the `amendments/` subfolder.
 - Tier semantics: `points` is 1-6, mapping to the matrix in `README.md`.
 - Manifest schema as defined in `templates/batch_manifest.yaml`.
 - Batch id format: `b<NNN>` zero-padded, counter in `_batches\.counter`.
