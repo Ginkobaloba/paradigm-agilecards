@@ -28,7 +28,7 @@
     Directory to run the test in. Default $env:TEMP\cards-rename-test.
 
 .EXAMPLE
-    cd C:\dev\_meta\skills\cards
+    cd C:\dev\agile_cards
     .\tests\atomic_rename_test.ps1
 
     Prints PASS or FAIL with details. Run once per device before

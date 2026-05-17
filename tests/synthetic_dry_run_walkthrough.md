@@ -19,7 +19,7 @@ claimable (no unmet dependencies) so I can sanity-check the runner's
 claim order without trusting it blindly.
 ```
 
-Project: `C:\dev\_meta\skills\cards\` (we'll eat our own dog food)
+Project: `C:\dev\agile_cards\` (we'll eat our own dog food)
 Mode: full (no .cards-config.yaml exists -> defaults)
 
 ---
@@ -55,7 +55,7 @@ Mode: full (no .cards-config.yaml exists -> defaults)
 ## Expected dry-run summary (rendered to Drew)
 
 ```
-/cards proposed batch b001 for C:\dev\_meta\skills\cards (mode: full)
+/cards proposed batch b001 for C:\dev\agile_cards (mode: full)
 
 5 cards.
 Points histogram:
