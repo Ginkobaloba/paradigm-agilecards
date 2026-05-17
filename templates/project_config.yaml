@@ -74,3 +74,34 @@ orphan_timeout_minutes: 120
 # Optional. Where the runner posts status updates back to (Slack, file,
 # etc). This is a runner concern; the /cards skill ignores it.
 # runner_callback: file://C:/dev/todo/_runner.log
+
+# AC amendment approval. When true, a sibling reviewer agent is
+# permitted to approve a card's change_request without a human standup
+# pass. When false (default), every amendment requires a human in the
+# approval path. SKILL.md section 11 spells out the amendment pattern;
+# RUNNER_CONTRACT.md "AC amendment protocol" documents how the runner
+# records the approval against either a human or a delegated agent.
+# Flip to true only on projects where you have explicit appetite for
+# fully-agent-managed amendment review.
+reviewer_delegation: false
+
+# Cold-read verifier knobs (see RUNNER_CONTRACT.md "Cold-read
+# verification"). The runner reads these to decide when the verifier
+# may be skipped on a high-confidence cascade-clean run.
+#   verifier_skip_confidence_threshold: minimum executor self-reported
+#     confidence (0-1) required to skip the verifier. Default 0.9.
+#     Projects MAY tighten (raise) this floor; they MUST NOT relax it
+#     below 0.9.
+verifier_skip_confidence_threshold: 0.9
+
+# Cascade-on-confidence knobs (see RUNNER_CONTRACT.md
+# "Cascade-on-confidence routing"). The runner reads these to decide
+# when to escalate the executor mid-card.
+#   cascade_escalation_threshold: combined confidence (0-1) below which
+#     the runner escalates one tier. Default 0.6.
+#   cascade_max_escalations: ceiling on how many tiers above
+#     card.points the runner can climb. Default 2; v1.2 contract caps
+#     this at 2. Set to 0 to opt out of cascade entirely (cards then
+#     always run at planned tier and the verifier is always required).
+cascade_escalation_threshold: 0.6
+cascade_max_escalations: 2

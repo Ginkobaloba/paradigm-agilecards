@@ -40,7 +40,9 @@ itself does not change; only its parent directory changes.
 ## Card status transitions
 
 ```
-backlog --claim--> active --finish + merge_status=merged--> done
+backlog --claim--> active --executor marks finish + verifier pass--> done
+                       \--executor marks finish + verifier fail--> active (verifier_notes)
+                       \--executor marks finish + verifier skipped (high confidence)--> done
                        \--finish + merge_status!=merged--> blocked
                        \--dependency unmet (re-check)--> backlog
                        \--change_request written--> amendments
@@ -48,7 +50,14 @@ amendments --amendment approved--> active
 amendments --amendment denied--> active (against original) or blocked
 backlog --dependency permanently blocked--> blocked
 blocked --unblocked--> backlog or active (runner choice)
+done --run_verifier(card_id) manual override--> done (if pass) or active (if fail)
 ```
+
+The "executor marks finish" arrow is split: a verifier pass (or a
+legitimate verifier skip) is what moves the file to `done/`. A verifier
+fail moves the card back to `active/` with `verifier_notes` written
+into the body for the next executor pass. See "Cold-read verification"
+below.
 
 Allowed `status` (subfolder / field) values:
 
@@ -306,6 +315,208 @@ relaxation. High-stakes cards always go through human review.
 
 ---
 
+## Cold-read verification
+
+Required in v1.2. After the executor marks a card finished and the
+acceptance checks pass, the runner spawns a fresh verifier agent
+before the file moves to `done/`. The verifier reads the card cold:
+no executor conversation history, no planner context, no sibling
+chatter. Its input is the card body, the executor's recorded outputs
+(completion notes, `actual_tokens`), and access to the project repo.
+
+The verifier re-runs every `acceptance_checks:` item from scratch and
+returns one of three results:
+
+- **pass.** All checks pass. The runner stamps `verified_at`,
+  `verified_by`, sets `verifier_skipped_reason: null`, and moves the
+  card from `active/` to `done/`.
+- **fail.** At least one check fails OR the verifier judges the
+  executor's claimed work doesn't match what the card actually asked
+  for. The runner appends a `verifier_notes:` block to the card body
+  (machine-readable list of failed checks plus the verifier's prose
+  reasoning), moves the card back to `active/`, and clears
+  `claimed_by`, `started_at`, `last_heartbeat`. The next claim picks
+  it up with the verifier's notes in hand.
+- **error.** The verifier itself crashed or timed out. The runner
+  records the error in the runner log and retries the verifier up to
+  two times. After two failed retries, the card moves to `blocked/`
+  with a marker; do not auto-move to `done/` on verifier error.
+
+### When the verifier MAY be skipped
+
+The runner MAY skip the verifier (auto-pass to `done/`) only when ALL
+of the following hold:
+
+1. `cascade_history` is empty (executor did not escalate during the
+   card; see "Cascade-on-confidence routing" below).
+2. The executor's final self-reported confidence is at least the
+   project's `verifier_skip_confidence_threshold` (default `0.9` on a
+   0-1 scale; the project config MAY tighten this but MUST NOT relax
+   it below `0.9`).
+3. Every acceptance check passed on first run (no retries recorded in
+   the runner's per-card log).
+
+If all three hold, the runner stamps:
+
+- `verified_at: null`
+- `verified_by: null`
+- `verifier_skipped_reason: "high-confidence cascade-clean run"`
+  (or another short string the runner picks)
+
+Cards in `done/` with both `verified_at: null` AND
+`verifier_skipped_reason: null` are a contract violation. The
+`/cards validate` subcommand flags them.
+
+### Manual override entry point
+
+The runner MUST expose:
+
+```
+run_verifier(card_id: str) -> verifier_result
+```
+
+Input is a card id (the runner resolves the file location regardless
+of subfolder). Output is a structured result:
+
+```yaml
+result: pass | fail | error
+reasons: [list of strings; per-check or per-error explanations]
+at: 2026-05-17T14:32:00Z
+agent_id: verifier-agent-id-or-label
+```
+
+Behavior:
+
+- The override runs against the card in its current subfolder. It does
+  not require the card to be in `done/`.
+- Result handling matches the auto-verifier above: pass updates the
+  card's verifier provenance fields and (if the card was in `active/`)
+  moves it to `done/`; fail appends `verifier_notes` and (if the card
+  was in `done/`) moves it back to `active/`; error retries twice
+  then surfaces.
+- A manual override NEVER deletes prior verifier state. New
+  `verified_at` / `verified_by` values are pushed onto a
+  `verifier_history:` list in the card body so the audit trail is
+  complete. The top-level frontmatter fields always reflect the most
+  recent verification.
+
+This is the contract the dashboard "Run Cold Read Now" button hits.
+Any external trigger (CLI, scheduled re-audit, webhook) uses the same
+entry point.
+
+### Provenance field schema
+
+Top-level frontmatter fields the runner owns:
+
+- `verified_at` -- ISO 8601 UTC. Null until first verification.
+- `verified_by` -- string (agent id or label). Null until first
+  verification.
+- `verifier_skipped_reason` -- nullable string. Mutually exclusive
+  with `verified_at` being non-null.
+
+Body-level audit fields the runner appends:
+
+- `verifier_notes:` -- written on fail. Lists failed checks and prose
+  reasoning from the verifier.
+- `verifier_history:` -- list of prior verifications when manual
+  overrides have run; each entry carries `verified_at`, `verified_by`,
+  `result`, and `reasons`.
+
+The skill commits to these field names and shapes. The runner owns
+the lifecycle.
+
+---
+
+## Cascade-on-confidence routing
+
+Required runner behavior in v1.2. The planner sets `points` (tier
+1-6) at card creation; the runner is permitted to escalate the
+executor up to two tiers above that planned value when confidence
+falls low at runtime.
+
+### Protocol
+
+1. The executor starts at the planned tier (model and
+   `extended_thinking` from `tier_map_claude.yaml` keyed by
+   `card.points`).
+2. After each meaningful step (the runner defines "step"; suggested:
+   per acceptance-check attempt, or per executor self-checkpoint), the
+   executor runs a **confidence probe**. The probe is at minimum a
+   model self-report scored 0-1. A project MAY layer additional
+   signals (test pass count, lint clean status, a domain-specific
+   marker flagged in the project's SKILL.md additions); the runner
+   combines them per the project config and produces a single
+   confidence value.
+3. If the combined confidence falls below
+   `cascade_escalation_threshold` (default `0.6` on a 0-1 scale,
+   tunable per project), the runner escalates one tier (move from
+   `card.points` to `card.points + 1`) and re-attempts the step that
+   triggered the low confidence.
+4. **Maximum escalations: 2.** A card can climb at most two tiers
+   above its planned value. After the second escalation, if confidence
+   still falls below threshold, the runner halts execution and moves
+   the card to `blocked/` with the cascade history attached to
+   Completion notes. Do not climb past tier 6; tier 6 is the ceiling
+   regardless of where the card started.
+5. Each escalation appends to the card's `cascade_history:` field.
+
+### `cascade_history` shape
+
+Top-level frontmatter field, list-typed. Each entry:
+
+```yaml
+cascade_history:
+  - from_tier: 3
+    to_tier: 4
+    reason: "low confidence on step 'add rate-limit middleware'"
+    confidence_at_escalation: 0.42
+    at: 2026-05-17T14:32:00Z
+  - from_tier: 4
+    to_tier: 5
+    reason: "second probe still below threshold after retry"
+    confidence_at_escalation: 0.51
+    at: 2026-05-17T14:47:00Z
+```
+
+The list is append-only within a single card lifetime. If the card is
+returned to `backlog/` and re-claimed (e.g., after a verifier fail or
+orphan reclaim), the prior `cascade_history` is retained; the next
+attempt's escalations append to the same list. The runner does NOT
+reset `cascade_history` on re-claim; the history is forensic across
+the card's entire run.
+
+### Interactions with other contract surfaces
+
+- **Cold-read verifier.** A non-empty `cascade_history` disqualifies
+  the card from verifier-skip. The card always gets a cold read when
+  it had to climb.
+- **Cost cap.** Escalation can blow past `cost_cap_usd` because higher
+  tiers cost more per token. The runner MUST re-evaluate the cap
+  immediately after each escalation against the projected remaining
+  spend at the new tier. If the projection exceeds the cap, halt and
+  move to `blocked/` per the existing cost-cap protocol rather than
+  silently overspending mid-escalation.
+- **`pin_required`.** Pinning forces the merge gate but does not
+  prevent escalation. A pinned tier-3 card may still escalate to
+  tier-4 or tier-5 at runtime; the pin still routes to Drew at merge.
+- **Model floor.** Escalation only moves UP. The runner never escalates
+  below `model_floor`; escalation by definition picks a more capable
+  model.
+
+### Configuration
+
+`templates/project_config.yaml` carries the per-project knobs:
+
+- `cascade_escalation_threshold` (default 0.6)
+- `verifier_skip_confidence_threshold` (default 0.9)
+- `cascade_max_escalations` (default 2, MUST NOT exceed 2 in v1.2)
+
+A project with no entries uses the defaults. A project that opts out
+of cascade entirely sets `cascade_max_escalations: 0`; cards then run
+strictly at planned tier with verifier always required.
+
+---
+
 ## Acceptance check execution
 
 Before a card transitions to `done/`, the runner parses the fenced
@@ -479,6 +690,18 @@ recorded them.
 - Cards are the system's state. Any orchestrator (this skill, a
   runner, future coordinators) reads card state from disk per query
   and holds no in-memory mirror.
+- Cold-read verifier provenance fields are present on every card:
+  `verified_at` (nullable ISO 8601 UTC), `verified_by` (nullable
+  string), `verifier_skipped_reason` (nullable string). The runner
+  owns the lifecycle; the skill commits to the names and shapes.
+- `cascade_history` is a list-typed frontmatter field present on every
+  card; planner stamps it as `[]` at creation, runner appends one
+  entry per escalation. Entry shape is `{from_tier, to_tier, reason,
+  confidence_at_escalation, at}`.
+- `subjective: true` is a permitted per-item flag inside
+  `acceptance_checks:` for tier 5 / 6 cards. The runner does not
+  attempt to execute items so marked; they route to the human merge
+  gate instead.
 
 ---
 

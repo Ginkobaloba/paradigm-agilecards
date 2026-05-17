@@ -124,6 +124,15 @@ tier assignment, stage 3 opus or sonnet+ET adversarial review. Not a
 v1.1 change. Flagged here so the data the system collects can inform
 the decision later instead of vibes.
 
+**Cascade-on-confidence is a runtime concern, not a planning concern.**
+The planner sets `points` (tier) per the matrix in section 3. At
+execution time, the runner is permitted to escalate the executor up to
+two tiers above that planned value when the executor's self-reported
+confidence falls below a configurable threshold. The full protocol
+(probe shape, threshold, escalation limit, `cascade_history` field)
+lives in `RUNNER_CONTRACT.md`. The planner does not need to predict
+escalation; it only needs to set the best initial tier it can.
+
 ---
 
 ## 3. Tier assignment
@@ -424,6 +433,75 @@ restarts; cards are durable state; orphan reclaim handles executor
 crashes) it does. Where the system requires human judgment (contract
 amendments, sprint scoping, high-stakes review) it asks. The
 distinction is deliberate, not a transitional state.
+
+---
+
+## 13. Cold-read verification
+
+Every card that leaves `active/` for `done/` is, by default, signed off
+by a cold-read verifier agent before the move. The verifier is a fresh
+agent invocation: no executor conversation history, no planner context,
+no sibling chatter. It receives only the card body, the executor's
+recorded outputs (`actual_tokens`, completion notes), and access to the
+project repo. It runs the `acceptance_checks:` block from scratch and
+either signs the card off or sends it back.
+
+This is owned by the runner; the skill commits to the schema and the
+contract. The full executor / runner / verifier protocol lives in
+`RUNNER_CONTRACT.md` under "Cold-read verification". This section
+documents the planner-side commitments and the user-visible behavior.
+
+### What the skill commits to
+
+The card schema reserves three fields the verifier owns:
+
+- `verified_at` -- ISO 8601 UTC timestamp the verifier completed. Null
+  while no verification has run.
+- `verified_by` -- agent id or label. Null while no verification has
+  run.
+- `verifier_skipped_reason` -- nullable string. When the verifier was
+  legitimately skipped (see below), the reason is recorded here. When
+  the verifier ran, this field is null. Never both populated.
+
+These fields are appended to `templates/card.md`. They are write-once
+per terminal transition: the runner sets them when moving the card to
+`done/`, and any future re-verification (manual override) writes a new
+trio of values, preserving the prior values as a stacked audit trail
+(see RUNNER_CONTRACT.md for the stack shape).
+
+### When the verifier may be skipped
+
+The verifier MAY be skipped only when the executor's run satisfies all
+of the following:
+
+1. The executor did not escalate via cascade-on-confidence during the
+   card (i.e., `cascade_history` is empty). A card whose runtime had to
+   climb tiers is a card whose initial confidence was wrong, which is
+   the exact situation a cold read is for.
+2. The executor's final self-reported confidence is "very high." The
+   default threshold is `>0.9` on a 0-1 scale; a project may tighten
+   but not relax that floor via `project_config.yaml`.
+3. Every acceptance check passed on first run, with no retry attempts
+   recorded in the runner's per-card log.
+
+When skipped, the runner MUST populate `verifier_skipped_reason` with
+a short human-readable string. The default value is
+`"high-confidence cascade-clean run"`. Cards in `done/` with a null
+`verifier_skipped_reason` AND null `verified_at` are a contract
+violation; the validator (`/cards validate`) flags them.
+
+### Manual override
+
+The runner contract defines a `run_verifier(card_id)` entry point so
+external triggers (dashboard "Run Cold Read Now" button, a CLI, a
+scheduled re-audit) can force a verification pass on any card in any
+state. The result shape is fixed: `{result: pass | fail | error,
+reasons: [...], at: timestamp, agent_id: ...}`. The full contract for
+the entry point lives in RUNNER_CONTRACT.md.
+
+A manual override never deletes prior verifier state; it appends. This
+makes "we re-verified this card 30 days later when an audit asked"
+auditable forever.
 
 ---
 

@@ -9,7 +9,9 @@ title: Replace me with an action-verb title
 project: C:\dev\project-example
 
 # Mirrors the canonical subfolder. Keep in sync with the file's location.
-# One of: backlog, active, done, blocked.
+# One of: backlog, active, awaiting_amendment_review, done, blocked.
+# (The awaiting_amendment_review field value pairs with the amendments/
+# subfolder. See RUNNER_CONTRACT.md "Card status transitions".)
 status: backlog
 
 # Tier 1-6. Derived from stakes + difficulty per the README matrix.
@@ -116,6 +118,24 @@ base_branch: main
 # One of: pending, open, merged, requires_review, conflict, blocked.
 merge_status: pending
 
+# Cold-read verifier provenance. The runner owns these fields. They are
+# null until a verifier pass runs OR until the verifier is legitimately
+# skipped (high-confidence cascade-clean run; see RUNNER_CONTRACT.md
+# "Cold-read verification"). On a manual run_verifier(card_id) override,
+# the runner pushes the prior values onto a verifier_history: list in
+# the body and updates these fields to the latest pass.
+verified_at: null            # ISO 8601 UTC, nullable
+verified_by: null            # agent id / label, nullable
+verifier_skipped_reason: null  # nullable string; mutually exclusive
+                               # with verified_at being non-null
+
+# Cascade-on-confidence history. Append-only list across the card's
+# entire run (including re-claims after verifier fail or orphan
+# reclaim). Each entry: {from_tier, to_tier, reason,
+# confidence_at_escalation, at}. Empty list at creation. See
+# RUNNER_CONTRACT.md "Cascade-on-confidence routing".
+cascade_history: []
+
 ---
 
 ## Context
@@ -161,6 +181,11 @@ Drew's approval, so subjective AC lands where humans look anyway.
 
 ```yaml
 # Replace the items below. Every check needs a description + a check spec.
+# Optional per-item flag:
+#   subjective: true  -- only permitted on tier 5 / 6 cards, and at most
+#     one such item per card. The runner does not execute subjective
+#     items; they route to the human merge gate. See SKILL.md section 4
+#     ("AC machinability check") and RUNNER_CONTRACT.md.
 acceptance_checks:
   - description: "Lint passes"
     check: { type: shell, cmd: "make lint" }
@@ -170,6 +195,10 @@ acceptance_checks:
     check: { type: file_exists, path: "src/example.py" }
   - description: "New function is referenced from the entry point"
     check: { type: grep_match, file: "src/app.py", pattern: "example_function" }
+  # Example of a tier-5/6-only subjective item (do not include on lower
+  # tiers; the validator will refuse the batch):
+  # - description: "API surface reads cleanly to a senior reviewer"
+  #   subjective: true
 ```
 
 ## Pointers
