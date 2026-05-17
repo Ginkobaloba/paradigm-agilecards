@@ -75,8 +75,6 @@ tier_pricing.yaml       Token prices used to derive USD at display time
 templates/              card.md, batch_manifest.yaml, project_config.yaml
 examples/               One worked example card
 tests/                  Synthetic dry-run + atomic-rename verifier
-docs/history/           Original planning artifacts (Phase 1 overview,
-                        SKILL.md outline) kept for context
 docs/handoffs/          Migration + version handoffs
 ```
 
