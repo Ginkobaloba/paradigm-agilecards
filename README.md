@@ -17,6 +17,19 @@ contract is in [`RUNNER_CONTRACT.md`](./RUNNER_CONTRACT.md). The repo is the
 authoritative source for both. The runtime data folder is intentionally a
 separate directory and not part of this repo.
 
+## Live dashboard
+
+A web UI for the cards lives in
+[`agile-cards-board`](https://github.com/Ginkobaloba/agile-cards-board)
+(React + Express + SQLite, the production-grade companion to the
+single-file `dashboard/v0/index.html` prototype in this repo).
+
+The hosted instance runs at
+[`https://app.projectnexuscode.org`](https://app.projectnexuscode.org).
+Access is gated by Cloudflare Access (invite-only) and a per-user
+bearer token. The marketing landing for the project lives at
+[`https://projectnexuscode.org`](https://projectnexuscode.org).
+
 ## Who it's for
 
 Anyone running multiple Claude (or other LLM) agents in parallel against a
