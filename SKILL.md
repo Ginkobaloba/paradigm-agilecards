@@ -56,9 +56,9 @@ Flags:
    or lean), `orphan_timeout_minutes`, `story_source_path`,
    `hot_paths`, and merge-gate overrides.
 5. Ensure `C:\dev\todo\` and its subfolders exist. Create
-   `backlog/`, `active/`, `done/`, `blocked/`, and `_batches/` if any
-   are missing. Touch `_batches\.counter` and seed it to `0` if
-   absent.
+   `backlog/`, `active/`, `amendments/`, `awaiting_standup_review/`,
+   `done/`, `blocked/`, and `_batches/` if any are missing. Touch
+   `_batches\.counter` and seed it to `0` if absent.
 
 ---
 
@@ -98,22 +98,26 @@ average; Drew triages from the manifest.
 
 **Done definition is a planner output, machine-verifiable, no
 interpretation allowed.** One of the planner's required outputs for
-every card is its Done definition: the `acceptance_checks:` YAML block
-inside the body's Acceptance criteria section. Every item in that
-block MUST be a runnable assertion (`shell`, `file_exists`,
-`file_absent`, `grep_match`, `grep_absent`, `http_status`), not prose.
-A card whose "done" cannot be expressed as runnable assertions either
-needs to be split until its sub-cards can, or marked tier 5 / 6 so the
-high-stakes path puts a human at the merge gate where subjective
-review belongs. The validation pass in section 4 enforces this.
+every card is its Done definition: the `acceptance_criteria:` YAML
+block inside the body's Acceptance criteria section. Every item in
+that block MUST declare a `type:` matching one of the canonical
+values from `lib/verifier/types.py`. The canonical list at v1.3 is
+`file_exists`, `file_absent`, `file_contains`, `file_absent_content`,
+`command`, `python_assert`, `http_status`, `http_contains`,
+`subjective`. A card whose "done" cannot be expressed via the
+deterministic types belongs at tier 5 / 6, where one or more items
+may be declared `type: subjective`. The validation pass in section 4
+calls into `verifier.schema.validate_ac_items` and refuses the batch
+on any malformed item.
 
 **AC is immutable post-creation.** Once a batch is written, the
-`acceptance_checks:` block of a card cannot be edited by the executor
-agent. If the executor needs to argue for an amendment (e.g., a test
-turns out to be wrong, an assumption was off), the mechanism is the
-standup amendment pattern (see section 11). The executor's voice is
-preserved because they are closest to the work; the immutability is
-the guard against an agent rewriting the goalposts mid-run.
+`acceptance_criteria:` block of a card cannot be edited by the
+executor agent. If the executor needs to argue for an amendment
+(e.g., a test turns out to be wrong, an assumption was off), the
+mechanism is the standup amendment pattern (see section 11). The
+executor's voice is preserved because they are closest to the work;
+the immutability is the guard against an agent rewriting the
+goalposts mid-run.
 
 **Future optimization note (not committed for v1.1).** Planning is
 multi-agent by default: Planner + adversarial Reviewer, both at opus
@@ -182,16 +186,19 @@ failure and abort. No half-written state in `C:\dev\todo\`.
 4. **Hot-paths cross-check.** For any card whose `touches:` matches a
    project-config `hot_paths:` glob, raise the card's parallel
    sensitivity. Surface in the dry-run summary.
-5. **AC machinability check.** For each card, parse the
-   `acceptance_checks:` YAML block. Every item must have a `check:`
-   field whose `type` is one of the supported runnable types (`shell`,
-   `file_exists`, `file_absent`, `grep_match`, `grep_absent`,
-   `http_status`). Prose-only AC items cause an abort with the
-   offending card id and item index. The exception is tier 5 / 6
-   cards, which may carry up to one subjective item per card because
-   the merge gate already routes through a human; the planner must
-   mark that item with `subjective: true` so the runner does not
-   attempt to execute it.
+5. **AC machinability check.** For each card, call
+   `verifier.schema.validate_ac_items` on the parsed
+   `acceptance_criteria:` block. Every item must declare `type:` from
+   the canonical registry in `lib/verifier/types.py` and carry the
+   per-type required fields (e.g., `path` for filesystem types,
+   `command` for `command`, `url` and `expected_status` for
+   `http_status`). The validator refuses unknown fields, malformed
+   xor of `pattern`/`literal`, and tier-1-through-4 cards carrying
+   `type: subjective` items (subjective is permitted on tier 5 / 6
+   only). Failures abort the batch with the offending card id and
+   item index attached. Defense in depth (locked answer 8 in the
+   v1.3 design doc): the verifier re-runs the same validator at
+   execution time so a hand-edited card cannot sneak past.
 
 ---
 
@@ -513,6 +520,13 @@ auditable forever.
   used to derive USD figures from token counts at display / cap-check
   time. Cards never store USD; tokens are immutable, USD is derived.
 - `RUNNER_CONTRACT.md` -- contract surface for the runner
+- `lib/verifier/` -- reference Python implementation of the v1.3
+  verifier (handlers per AC type, schema validator, orchestrator,
+  cascade-on-confidence subjective evaluator). The planner imports
+  `verifier.schema.validate_ac_items` at AC machinability check time;
+  the runner imports `verifier.runner.verify_card` for cold-read
+  verification. `lib/verifier/types.py` is the canonical AC type
+  registry.
 - `templates/card.md` -- card frontmatter + body template
 - `templates/batch_manifest.yaml` -- manifest template
 - `templates/project_config.yaml` -- per-project config template

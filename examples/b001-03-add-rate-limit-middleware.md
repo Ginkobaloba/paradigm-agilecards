@@ -1,4 +1,5 @@
 ---
+verifier_schema_version: "1.3"
 id: b001-03-add-rate-limit-middleware
 title: Add rate-limit middleware to public API
 project: C:\dev\project-example
@@ -37,6 +38,9 @@ last_heartbeat: null
 branch: card/b001-03-add-rate-limit-middleware
 base_branch: main
 merge_status: pending
+cascade_history: []
+verifier_cascade_history: []
+standup_reason: null
 ---
 
 ## Context
@@ -81,23 +85,33 @@ All checks below are machine-verifiable. The executor runs each, records
 pass/fail, and the card moves to `done/` only if every check passes.
 
 ```yaml
-acceptance_checks:
+acceptance_criteria:
   - description: "Lint passes"
-    check: { type: shell, cmd: "make lint" }
+    type: command
+    command: "make lint"
   - description: "Under-limit requests pass through unchanged"
-    check: { type: shell, cmd: "pytest tests/api/middleware/test_rate_limit.py::test_under_limit -q" }
+    type: command
+    command: "pytest tests/api/middleware/test_rate_limit.py::test_under_limit -q"
   - description: "At-limit boundary correct (Nth ok, N+1th 429)"
-    check: { type: shell, cmd: "pytest tests/api/middleware/test_rate_limit.py::test_at_limit_boundary -q" }
+    type: command
+    command: "pytest tests/api/middleware/test_rate_limit.py::test_at_limit_boundary -q"
   - description: "429 carries a valid Retry-After header"
-    check: { type: shell, cmd: "pytest tests/api/middleware/test_rate_limit.py::test_retry_after_header -q" }
+    type: command
+    command: "pytest tests/api/middleware/test_rate_limit.py::test_retry_after_header -q"
   - description: "Per-key isolation"
-    check: { type: shell, cmd: "pytest tests/api/middleware/test_rate_limit.py::test_per_key_isolation -q" }
+    type: command
+    command: "pytest tests/api/middleware/test_rate_limit.py::test_per_key_isolation -q"
   - description: "Middleware file created"
-    check: { type: file_exists, path: "src/api/middleware/rate_limit.py" }
+    type: file_exists
+    path: "src/api/middleware/rate_limit.py"
   - description: "Middleware registered in app entry point"
-    check: { type: grep_match, file: "src/api/app.py", pattern: "rate_limit" }
+    type: file_contains
+    path: "src/api/app.py"
+    pattern: "rate_limit"
   - description: "Full api test suite passes"
-    check: { type: shell, cmd: "make test-api" }
+    type: command
+    command: "make test-api"
+    timeout_sec: 300
 ```
 
 ## Pointers

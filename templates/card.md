@@ -1,4 +1,10 @@
 ---
+# Schema version this card was written against. Required on cards
+# planned by v1.3 or later. The verifier reads this to dispatch to
+# the matching parse path; cards without it are treated as legacy
+# v1.2 and routed through the deprecated-alias table.
+verifier_schema_version: "1.3"
+
 # Stable id. Lowercase, hyphens, ASCII. Format: <batch>-<NN>-<verb-noun>.
 id: b000-00-replace-me
 
@@ -136,6 +142,20 @@ verifier_skipped_reason: null  # nullable string; mutually exclusive
 # RUNNER_CONTRACT.md "Cascade-on-confidence routing".
 cascade_history: []
 
+# Verifier subjective-evaluator cascade history. Append-only list
+# across every subjective verification pass. Each entry:
+# {tier_attempted, model, confidence, result, reasoning, at,
+# item_idx}. Empty list at creation. Mirrors cascade_history's
+# audit-forever stance but for the subjective evaluator instead of
+# the executor. See RUNNER_CONTRACT.md "Cold-read verification".
+verifier_cascade_history: []
+
+# If the subjective cascade exhausts without reaching the confidence
+# threshold, the runner moves the card to awaiting_standup_review/
+# and writes this field naming the AC item(s) that could not be
+# resolved. Null in every other state.
+standup_reason: null
+
 ---
 
 ## Context
@@ -161,44 +181,102 @@ that sound related but belong to other cards.
 
 ## Acceptance criteria
 
-Machine-checkable. The executor runs every item below and the card moves
-to `done/` only if every check passes. Optional prose can sit above or
-below the fenced block; the executor only parses the fenced block.
+Machine-checkable. The verifier dispatches each item to its registered
+handler (see `lib/verifier/types.py` for the canonical list). The card
+moves to `done/` only if every item passes. Subjective items route
+through the cascade evaluator described in RUNNER_CONTRACT.md
+"Cold-read verification".
 
-Check types supported:
+Canonical types (v1.3). The single source of truth is
+`lib/verifier/types.py`; this list is reproduced here for human
+readers but the runner imports from the registry.
 
-- `shell` -- run a command; exit code 0 means pass.
-- `file_exists` -- path exists at repo root (or absolute).
-- `file_absent` -- path does not exist.
-- `grep_match` -- pattern found in file (or set of files via glob).
-- `grep_absent` -- pattern not found.
-- `http_status` -- url returns expected status (only when the project
-  config opts into network checks).
+Filesystem family:
 
-If a card genuinely needs subjective review that can't be expressed as a
-check, mark it tier 5 or 6. The high-stakes path already routes through
-Drew's approval, so subjective AC lands where humans look anyway.
+- `file_exists` -- path exists at worktree root (relative) or
+  absolute. Required: `path`.
+- `file_absent` -- path does not exist. Required: `path`.
+- `file_contains` -- file contains a regex or substring. Required:
+  `path` and exactly one of `pattern` (regex) or `literal`
+  (substring). Optional: `case_sensitive` (default true).
+- `file_absent_content` -- file does NOT contain a regex or
+  substring. Same shape as `file_contains`. Missing files pass.
+
+Process family:
+
+- `command` -- run a shell command. Required: `command` (str or
+  list[str]). Optional: `expected_exit_code` (default 0), `cwd`,
+  `env`, `timeout_sec` (default 60s). Runs `shell=False` with a
+  scrubbed env baseline; see `lib/verifier/handlers/command.py`.
+- `python_assert` -- evaluate a Python expression that must return
+  truthy. Required: `expression`. Optional: `timeout_sec` (default 5).
+  Namespace is restricted to `os` (read-only), `json`, `pathlib`
+  (read-only), `re`, `sys`; write-mode `open`, `subprocess`, network
+  modules, etc., are blocked at AST inspection time.
+
+Network family. Project must opt in via `network_checks_allowed: true`:
+
+- `http_status` -- url returns expected status. Required: `url`,
+  `expected_status` (int or list[int]). Optional: `method`, `headers`,
+  `body`, `timeout_sec` (default 10), `retries` (default 2; backoff
+  is exponential 1s, 2s, fixed schedule).
+- `http_contains` -- response body matches a pattern or literal. Same
+  fields as `http_status` plus `pattern` or `literal` (one of), and
+  optional `case_sensitive`.
+
+Human-judgment family. Tier 5 / 6 cards only:
+
+- `subjective` -- evaluator returns strict pass/fail with a
+  confidence score; the orchestrator cascades haiku -> sonnet -> opus
+  if confidence falls below threshold. Required: `description`,
+  `evidence_required` (string telling the executor what to paste into
+  the `subjective_evidence:` block).
 
 ```yaml
-# Replace the items below. Every check needs a description + a check spec.
-# Optional per-item flag:
-#   subjective: true  -- only permitted on tier 5 / 6 cards, and at most
-#     one such item per card. The runner does not execute subjective
-#     items; they route to the human merge gate. See SKILL.md section 4
-#     ("AC machinability check") and RUNNER_CONTRACT.md.
-acceptance_checks:
+# Replace the items below. Every item needs `description` and `type`
+# plus the type-specific fields. The schema validator refuses a batch
+# where any item is malformed.
+acceptance_criteria:
   - description: "Lint passes"
-    check: { type: shell, cmd: "make lint" }
+    type: command
+    command: "make lint"
   - description: "Unit tests pass"
-    check: { type: shell, cmd: "make test" }
+    type: command
+    command: "make test"
+    timeout_sec: 120
   - description: "Expected file was created"
-    check: { type: file_exists, path: "src/example.py" }
+    type: file_exists
+    path: "src/example.py"
   - description: "New function is referenced from the entry point"
-    check: { type: grep_match, file: "src/app.py", pattern: "example_function" }
-  # Example of a tier-5/6-only subjective item (do not include on lower
-  # tiers; the validator will refuse the batch):
-  # - description: "API surface reads cleanly to a senior reviewer"
-  #   subjective: true
+    type: file_contains
+    path: "src/app.py"
+    pattern: "example_function"
+  - description: "No leaked api keys remain"
+    type: file_absent_content
+    path: "src/config.py"
+    pattern: "api_key\\s*=\\s*['\"][^'\"]+['\"]"
+  # Tier 5 / 6 only. Executor populates the matching entry in the
+  # subjective_evidence: block below.
+  # - description: "Error response reads cleanly to a senior reviewer"
+  #   type: subjective
+  #   evidence_required: "paste a rendered error response from the new path"
+```
+
+## Subjective evidence
+
+Executors completing tier 5 / 6 cards with `subjective` AC items
+populate a structured `subjective_evidence:` block in their completion
+notes, keyed by the AC item's index in `acceptance_criteria`. The
+evaluator reads this verbatim. Free-form prose alongside the
+structured block is fine; only the structured block is parsed.
+
+```yaml
+subjective_evidence:
+  index_5: |
+    Rendered error response from POST /v1/foo with empty body:
+      HTTP/1.1 400 Bad Request
+      {"error": {"code": "missing_field", "field": "name",
+                 "hint": "name is required and must be 1-64 chars"}}
 ```
 
 ## Pointers

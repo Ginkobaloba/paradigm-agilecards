@@ -15,11 +15,14 @@ deliberately a description, not an implementation.
 
 ```
 C:\dev\todo\
-  backlog\       cards that have not been claimed
-  active\        cards an executor is currently working on
-  amendments\    cards awaiting review of an executor change_request
-  done\          cards whose work merged successfully
-  blocked\       cards finished but unmerged, or paused on a dependency
+  backlog\                    cards that have not been claimed
+  active\                     cards an executor is currently working on
+  amendments\                 cards awaiting review of an executor change_request
+  awaiting_standup_review\    cards where the verifier subjective cascade
+                              could not reach the confidence threshold and
+                              human review is required (v1.3)
+  done\                       cards whose work merged successfully
+  blocked\                    cards finished but unmerged, or paused on a dependency
   _batches\
     .counter
     b<NNN>-manifest.yaml
@@ -40,14 +43,16 @@ itself does not change; only its parent directory changes.
 ## Card status transitions
 
 ```
-backlog --claim--> active --executor marks finish + verifier pass--> done
-                       \--executor marks finish + verifier fail--> active (verifier_notes)
-                       \--executor marks finish + verifier skipped (high confidence)--> done
+backlog --claim--> active --executor finish + verifier pass--> done
+                       \--executor finish + verifier fail--> active (verifier_notes)
+                       \--executor finish + verifier skipped (high confidence)--> done
+                       \--executor finish + verifier needs_standup_review--> awaiting_standup_review
                        \--finish + merge_status!=merged--> blocked
                        \--dependency unmet (re-check)--> backlog
                        \--change_request written--> amendments
 amendments --amendment approved--> active
 amendments --amendment denied--> active (against original) or blocked
+awaiting_standup_review --human resolves subjective items--> active or done or blocked
 backlog --dependency permanently blocked--> blocked
 blocked --unblocked--> backlog or active (runner choice)
 done --run_verifier(card_id) manual override--> done (if pass) or active (if fail)
@@ -64,13 +69,20 @@ Allowed `status` (subfolder / field) values:
 - `backlog`
 - `active`
 - `amendments` (field value: `awaiting_amendment_review`)
+- `awaiting_standup_review` (v1.3; subfolder and field both spell out
+  the full name because grep traffic dominates filesystem ergonomics
+  on this state)
 - `done`
 - `blocked`
 
 The `awaiting_amendment_review` field value pairs with the
-`amendments/` subfolder. Naming asymmetry is deliberate: the
-subfolder is short for filesystem ergonomics, the field is explicit
-for human readers grepping for state.
+`amendments/` subfolder. Naming asymmetry is deliberate for that
+state: the subfolder is short for filesystem ergonomics, the field
+is explicit for human readers grepping for state. The new
+`awaiting_standup_review` state intentionally drops that asymmetry
+because the field value and the subfolder name carry exactly the
+same human meaning ("waiting on Drew") and the cost of one
+five-letter difference is not worth the cognitive overhead.
 
 Allowed `merge_status` values:
 
@@ -317,30 +329,96 @@ relaxation. High-stakes cards always go through human review.
 
 ## Cold-read verification
 
-Required in v1.2. After the executor marks a card finished and the
-acceptance checks pass, the runner spawns a fresh verifier agent
-before the file moves to `done/`. The verifier reads the card cold:
-no executor conversation history, no planner context, no sibling
-chatter. Its input is the card body, the executor's recorded outputs
-(completion notes, `actual_tokens`), and access to the project repo.
+Rewritten in v1.3. The verifier is no longer a single per-card
+reasoning agent; it is a structured runner that dispatches per AC
+item type. Deterministic items execute via the library handlers in
+`lib/verifier/handlers/` and cost zero LLM tokens. Subjective items
+batch into a single cascading evaluator call that escalates
+haiku -> sonnet -> opus on confidence below threshold. The runner
+imports `verifier.runner.verify_card` and consumes the
+`VerifierResult` it returns.
 
-The verifier re-runs every `acceptance_checks:` item from scratch and
-returns one of three results:
+### Two-path model
 
-- **pass.** All checks pass. The runner stamps `verified_at`,
-  `verified_by`, sets `verifier_skipped_reason: null`, and moves the
-  card from `active/` to `done/`.
-- **fail.** At least one check fails OR the verifier judges the
-  executor's claimed work doesn't match what the card actually asked
-  for. The runner appends a `verifier_notes:` block to the card body
-  (machine-readable list of failed checks plus the verifier's prose
-  reasoning), moves the card back to `active/`, and clears
-  `claimed_by`, `started_at`, `last_heartbeat`. The next claim picks
-  it up with the verifier's notes in hand.
-- **error.** The verifier itself crashed or timed out. The runner
-  records the error in the runner log and retries the verifier up to
-  two times. After two failed retries, the card moves to `blocked/`
-  with a marker; do not auto-move to `done/` on verifier error.
+Verification runs in two phases per card:
+
+1. **Deterministic phase.** Every AC item whose `type:` is not
+   `subjective` is dispatched to the matching handler in
+   `lib/verifier/handlers/`. Pure Python; no network, no LLM. Each
+   handler returns `(passed: bool, evidence: dict)`; the evidence
+   becomes the failing item's entry in `verifier_notes:` if the item
+   fails.
+2. **Subjective phase.** If and only if the card has at least one
+   `type: subjective` item, the verifier issues a cascading call to
+   a Haiku-class model with all subjective items batched in one
+   prompt. The evaluator returns strict pass/fail per item plus a
+   confidence (0.0-1.0). When confidence falls below
+   `subjective_confidence_threshold` (default 0.85), the orchestrator
+   re-attempts the same item at the next tier
+   (haiku -> sonnet -> opus, capped at `subjective_max_tier`). One
+   call per tier visited per batch, not per item per tier.
+
+A card with no subjective items therefore spends zero LLM tokens at
+verification. A card with subjective items spends at most one Haiku
+call (worst case opus call) regardless of how many subjective items
+it carries.
+
+### Library requirement
+
+The runner MUST provide an implementation for every type in
+`lib/verifier/types.CANONICAL_TYPES`. Custom project-extension types
+are not supported in v1.3. A card declaring a type the runner does
+not implement lands in `blocked/` with the schema-validation error
+written to completion notes (see `verifier.schema.SchemaError`).
+
+The single source of truth is `lib/verifier/types.py`. Planner-side
+validation (the AC machinability check in `SKILL.md` section 4) and
+runner-side dispatch both read from the same registry, which makes
+drift between the two sides a Python import error rather than a
+runtime surprise.
+
+### Result shape
+
+`verifier.runner.verify_card` returns a `VerifierResult` with:
+
+- `overall_status`: one of `pass`, `fail`, `needs_standup_review`.
+- `items`: tuple of `ItemResult`, one per AC item, in declaration
+  order, each carrying the item dict, the handler's `HandlerResult`
+  (`passed`, `evidence`), and the `phase` (`deterministic` or
+  `subjective`).
+- `cascade_history_appendix`: list of dicts to append (NOT replace)
+  to the card's `verifier_cascade_history` frontmatter field. Each
+  dict carries `tier_attempted`, `model`, `confidence`, `result`,
+  `reasoning`, `at`, `item_idx`.
+- `standup_reason_items`: tuple of item indices whose subjective
+  cascade exhausted without reaching threshold. Empty unless
+  `overall_status == "needs_standup_review"`.
+
+The runner uses the result like this:
+
+- `pass`: stamp `verified_at`, `verified_by`, set
+  `verifier_skipped_reason: null`, append the
+  `cascade_history_appendix` (if any) to `verifier_cascade_history`,
+  and move the card from `active/` to `done/`.
+- `fail`: append a `verifier_notes:` block to the card body
+  (machine-readable list of failed items plus each item's evidence
+  dict), append the `cascade_history_appendix`, move the card back
+  to `active/`, and clear `claimed_by`, `started_at`,
+  `last_heartbeat`. The next claim picks it up with the verifier's
+  notes in hand.
+- `needs_standup_review`: append the `cascade_history_appendix`, set
+  the `standup_reason` frontmatter field to a comma-separated list
+  of the item indices in `standup_reason_items` plus a one-line
+  reason from each item's final cascade attempt, and move the card
+  from `active/` to `awaiting_standup_review/`. Do NOT clear
+  `claimed_by` etc.; the card carries forward its history while
+  awaiting a human verdict.
+- **error.** The verifier itself crashed or timed out (handlers
+  catch their own exceptions and convert to `fail`; this case is for
+  the orchestrator itself raising). The runner records the error in
+  the runner log and retries the verifier up to two times. After two
+  failed retries, the card moves to `blocked/` with a marker; do not
+  auto-move to `done/` on verifier error.
 
 ### When the verifier MAY be skipped
 
@@ -355,17 +433,57 @@ of the following hold:
    it below `0.9`).
 3. Every acceptance check passed on first run (no retries recorded in
    the runner's per-card log).
+4. The card has no `type: subjective` AC items. Subjective items
+   always run, even on otherwise skip-eligible cards. Drew's
+   explicit directive: subjective items on high-stakes cards are
+   exactly the spots where humans expect a second look, even when
+   the executor was confident. Cheap insurance at Haiku prices.
 
-If all three hold, the runner stamps:
+If all four hold, the runner stamps:
 
 - `verified_at: null`
 - `verified_by: null`
 - `verifier_skipped_reason: "high-confidence cascade-clean run"`
   (or another short string the runner picks)
 
+Cards with at least one subjective item but otherwise skip-eligible
+get a partial-skip: the deterministic phase is bookkept as skipped,
+but the subjective phase still runs. The
+`verifier_skipped_reason` field becomes
+`"deterministic phase only; subjective items ran"` in that case.
+
 Cards in `done/` with both `verified_at: null` AND
 `verifier_skipped_reason: null` are a contract violation. The
 `/cards validate` subcommand flags them.
+
+### Subjective cascade behavior
+
+The cascade follows the locked v1.3 contract:
+
+1. Start at `subjective_starting_tier` (default `haiku` ->
+   `claude-haiku-4-5-20251001`).
+2. Issue one call per tier with the card body, the AC items declared
+   `type: subjective`, and the `subjective_evidence:` block keyed by
+   item index. The model returns `{result: pass|fail, confidence:
+   0.0-1.0, reasoning}` per item.
+3. Items reaching confidence >= `subjective_confidence_threshold`
+   (default 0.85) settle at that tier with the returned verdict.
+   Items below threshold escalate to the next tier.
+4. Tier order: `haiku -> sonnet -> opus`. The cap is
+   `subjective_max_tier` (default `opus`).
+5. After the cap tier, any item still below threshold causes the
+   card to move to `awaiting_standup_review/`. The card does NOT
+   auto-pass and does NOT auto-fail. Drew's directive: AC is the
+   last line of defense before deployment; a verifier that cannot
+   reach a verdict surfaces the question.
+6. Every attempt at every tier appends one entry to
+   `verifier_cascade_history` on the card. Append-only across the
+   card's full lifetime, never reset.
+
+A project may opt out entirely via
+`subjective_cascade_disabled: true` in the project config. With
+cascade disabled, every subjective item routes straight to
+`awaiting_standup_review/` without any model call.
 
 ### Manual override entry point
 
@@ -520,24 +638,24 @@ strictly at planned tier with verifier always required.
 ## Acceptance check execution
 
 Before a card transitions to `done/`, the runner parses the fenced
-`acceptance_checks:` YAML block under the card body's "## Acceptance
-criteria" section. Every check in the list must pass.
+`acceptance_criteria:` YAML block under the card body's "##
+Acceptance criteria" section, then dispatches each item through
+`verifier.runner.verify_card`. The canonical type list lives in
+`lib/verifier/types.py`; see "Cold-read verification" above for the
+two-path flow.
 
-Check types:
+In v1.3 the legacy single-block name `acceptance_checks:` is
+retained as a deprecated alias and the legacy type names (`shell`,
+`grep_match`, `grep_absent`) are accepted by the runner via the
+alias table in `lib/verifier/runner.HANDLER_REGISTRY`. The alias
+table emits a deprecation warning per card on use. Hard removal
+lands in v1.4 along with `/cards migrate-ac-schema` for a single
+explicit rewrite pass over a project's existing cards.
 
-- `shell` -- run `cmd` in the project root; exit code 0 = pass.
-- `file_exists` -- `path` exists at repo root (or absolute).
-- `file_absent` -- `path` does not exist.
-- `grep_match` -- pattern found in `file` (or files matched by glob).
-- `grep_absent` -- pattern not found.
-- `http_status` -- url returns expected status; only honored when the
-  project config explicitly opts into network checks. Disabled by
-  default.
-
-Per-check pass/fail is recorded in the runner-appended Completion
-notes section. If any check fails, the card moves to `blocked/` and
-the failures land in Completion notes for the next executor (or human)
-to investigate.
+Per-item pass/fail is recorded in the runner-appended Completion
+notes section. If any check fails, the card moves back to `active/`
+with the failures and structured evidence dicts in
+`verifier_notes:` for the next executor (or human) to investigate.
 
 ---
 
@@ -701,7 +819,19 @@ recorded them.
 - `subjective: true` is a permitted per-item flag inside
   `acceptance_checks:` for tier 5 / 6 cards. The runner does not
   attempt to execute items so marked; they route to the human merge
-  gate instead.
+  gate instead. (v1.2 form; v1.3 supersedes with `type: subjective`
+  and the cascading evaluator. The v1.2 flag is preserved as a
+  deprecated alias through v1.3.)
+- `verifier_schema_version: "1.3"` (string) is required on every card
+  written by a v1.3 or later planner. The runner reads this to
+  dispatch to the matching parse path. Cards without it are treated
+  as v1.2 schema and routed through the deprecated-alias table.
+- `verifier_cascade_history` is a list-typed frontmatter field on
+  every v1.3 card. Empty at creation. Append-only by the runner; each
+  entry shape is `{tier_attempted, model, confidence, result,
+  reasoning, at, item_idx}`.
+- `standup_reason` is a nullable string. Non-null exactly when the
+  card is in `awaiting_standup_review/`; null in every other state.
 
 ---
 

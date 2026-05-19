@@ -105,3 +105,38 @@ verifier_skip_confidence_threshold: 0.9
 #     always run at planned tier and the verifier is always required).
 cascade_escalation_threshold: 0.6
 cascade_max_escalations: 2
+
+# Verifier subjective-evaluator cascade (v1.3, see RUNNER_CONTRACT.md
+# "Cold-read verification"). The runner uses these to drive the
+# haiku -> sonnet -> opus escalation for subjective AC items. A
+# subjective item that cannot reach the confidence floor at the cap
+# tier moves the card to awaiting_standup_review/ instead of
+# auto-passing or auto-failing.
+#
+#   subjective_starting_tier: name of the model family the cascade
+#     starts at. One of haiku, sonnet, opus. Default haiku.
+#   subjective_max_tier: cap tier. The cascade does not climb past
+#     this. Default opus.
+#   subjective_confidence_threshold: minimum confidence (0.0-1.0)
+#     the evaluator must report to settle a verdict at the current
+#     tier. Default 0.85.
+#   subjective_cascade_disabled: when true, subjective items
+#     auto-route to awaiting_standup_review/ without consulting any
+#     model. Default false. Useful in cost-sensitive projects that
+#     want every subjective item to land in a human's lap.
+subjective_starting_tier: haiku
+subjective_max_tier: opus
+subjective_confidence_threshold: 0.85
+subjective_cascade_disabled: false
+
+# Network gating for v1.3 verifier http_status / http_contains AC
+# types. Disabled by default; opt in only when CI has the routes the
+# verifier will hit.
+# network_checks_allowed: false
+
+# Per-type timeout overrides (project-wide). Item-level timeout_sec
+# wins over this; this wins over the per-type default. Keys are the
+# canonical type strings from lib/verifier/types.py.
+# type_timeout_overrides_sec:
+#   command: 120
+#   python_assert: 10

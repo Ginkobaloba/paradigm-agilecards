@@ -87,17 +87,36 @@ SKILL.md                The skill (planner spec, agent rules, schema)
 RUNNER_CONTRACT.md      What an executor + runner are required to honor
 tier_map_claude.yaml    Tier -> Claude model + extended-thinking
 tier_pricing.yaml       Token prices used to derive USD at display time
+lib/verifier/           Reference Python verifier library (v1.3+):
+                        per-type handlers, schema validator, cascade
+                        orchestrator. Importable by any runner.
 templates/              card.md, batch_manifest.yaml, project_config.yaml
 examples/               One worked example card
 tests/                  Synthetic dry-run + atomic-rename verifier
 docs/handoffs/          Migration + version handoffs
+docs/design/            Design docs for in-flight version work
 ```
+
+## v1.3 verifier (token cost)
+
+In v1.2 the cold-read verifier was a per-card reasoning agent
+invocation costing 1.5k to 5k tokens average per card (Sonnet plus
+extended thinking, weighted by the cascade-clean skip rate). In v1.3
+the verifier splits into a deterministic path (zero LLM tokens) and a
+cascading subjective path that fires only on cards with `type:
+subjective` AC items. Expected average drops to roughly 100 to 500
+tokens per card on disciplined batches. The latency win is bigger
+than the dollar win: deterministic checks finish in seconds rather
+than the 30-90 seconds an LLM round-trip takes. See
+[`docs/design/v1.3_verifier_refactor.md`](./docs/design/v1.3_verifier_refactor.md)
+for the full token math.
 
 ## Status
 
-Spec is at v1.1. No executor or runner ships with this repo yet; the
-contract is here, the implementation is not. The runner lives downstream
-(or doesn't exist yet, depending on when you're reading this).
+Spec is at v1.3. v1.3 lands the verifier-as-structured-runner refactor:
+the reference Python verifier in `lib/verifier/` is the first
+executable piece in this repo. Card writing and orchestration still
+live downstream.
 
 The sprint scheduler / dashboard is enumerated as future work in
 `SKILL.md`. When that ships it will live as a git submodule of this repo,
