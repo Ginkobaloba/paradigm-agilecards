@@ -66,7 +66,11 @@ from ..store import (
 from ..store.projection import ProjectionError, parse_card_text, project_card_file
 from ..verifier import VerifierError, VerifierResult, verify_card
 from ..verifier.runner import VERDICT_FAIL, VERDICT_PASS, VERDICT_STANDUP
+from .eligibility import EligibilityResult, evaluate_eligibility
+from .merge_gate import MergeGate, MergeOutcome, build_default_gh_runner
 from .orphan import reclaim, scan_for_orphans
+from .pr_lifecycle import GhRunner
+from .reaper import reap_forensic_run_dirs
 from .spawner import spawn_worker
 from .worktree import WorktreeCreateError, prepare_worktree
 
@@ -105,7 +109,11 @@ class Daemon:
     """
 
     def __init__(
-        self, cfg: DaemonConfig, *, repo: CardRepository | None = None
+        self,
+        cfg: DaemonConfig,
+        *,
+        repo: CardRepository | None = None,
+        gh: GhRunner | None = None,
     ) -> None:
         self.cfg = cfg
         self.paths = RuntimePaths.from_root(cfg.todo_root)
@@ -118,6 +126,11 @@ class Daemon:
         self._owns_repo = repo is None
         self._last_tick_at: float = 0.0
         self._last_tick_summary: dict[str, int] = {}
+        # Merge gate. Tests pass a `FakeGhRunner`; production builds use
+        # the default subprocess wrapper. When `pr_gate_enabled=False`
+        # both the gate and the runner are no-ops by design.
+        self._gh: GhRunner = gh if gh is not None else build_default_gh_runner(cfg)
+        self._merge_gate = MergeGate(cfg=cfg, gh=self._gh)
 
     # ---- lifecycle ----------------------------------------------------
 
@@ -260,6 +273,62 @@ class Daemon:
             except Exception as exc:  # noqa: BLE001
                 log.error("boot reclaim failed for %s: %s", card_id, exc)
 
+        # Chunk 4 boot-time worker-alive check. The orphan scan above
+        # only catches stale heartbeats; a daemon that crashed and
+        # restarted quickly can leave `active` cards with fresh
+        # heartbeats and no live worker behind them. The alive check
+        # walks each active card, looks up its recorded worker pid in
+        # `_runs/<attempt>/worker.pid`, and reclaims any whose pid is
+        # no longer alive -- without waiting for the heartbeat to age.
+        if self.cfg.boot_worker_alive_check:
+            self._boot_alive_check()
+
+    def _boot_alive_check(self) -> None:
+        """Reclaim active cards whose worker pid is no longer alive.
+
+        Reads `_runs/<attempt>/worker.pid` for each card; missing
+        pidfile is logged but NOT treated as dead (a daemon restart
+        immediately after a worker spawn might race the spawner's
+        pidfile write). A pidfile whose pid is unparseable is treated
+        as dead and reclaims the card.
+        """
+        for record in self.repo.query_cards(
+            tenant_id=self.tenant_id, status=CardStatus.ACTIVE.value
+        ):
+            attempt_id = record.attempt_trace_id
+            if not attempt_id:
+                continue
+            pidfile = self.paths.runs / attempt_id / "worker.pid"
+            if not pidfile.is_file():
+                log.debug(
+                    "no worker.pid for active card %s (attempt %s); "
+                    "deferring to heartbeat path",
+                    record.card_id, attempt_id,
+                )
+                continue
+            try:
+                pid = int(pidfile.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                log.warning(
+                    "worker.pid for %s unparseable; reclaiming card",
+                    record.card_id,
+                )
+                self._safe_reclaim(record.card_id)
+                continue
+            if not pid_alive(pid):
+                log.info(
+                    "boot alive check: worker pid %d for card %s is dead; "
+                    "reclaiming early",
+                    pid, record.card_id,
+                )
+                self._safe_reclaim(record.card_id)
+
+    def _safe_reclaim(self, card_id: str) -> None:
+        try:
+            reclaim(self.repo, card_id, tenant_id=self.tenant_id)
+        except Exception as exc:  # noqa: BLE001
+            log.error("safe reclaim failed for %s: %s", card_id, exc)
+
     # ---- polling loop -------------------------------------------------
 
     def _loop(self) -> None:
@@ -282,7 +351,24 @@ class Daemon:
             "orphans_reclaimed": 0,
             "claims": 0,
             "worker_exits": 0,
+            "run_dirs_reaped": 0,
         }
+        # 0. Reap forensic run-dirs whose TTL has expired. Cheap; runs
+        #    every tick because the cost of a missed sweep is unbounded
+        #    disk growth. Skip silently when the TTL is non-positive.
+        try:
+            for decision in reap_forensic_run_dirs(
+                repo=self.repo,
+                cfg=self.cfg,
+                paths=self.paths,
+                in_flight_attempts=set(self._workers.keys()),
+                tenant_id=self.tenant_id,
+            ):
+                if decision.action == "reaped":
+                    summary["run_dirs_reaped"] += 1
+        except Exception:  # noqa: BLE001
+            log.exception("forensic reaper failed; continuing")
+
         # 1. Reap exited workers; this frees parallelism slots and
         #    lands their results in the store.
         self._reap_workers(summary)
@@ -335,16 +421,80 @@ class Daemon:
         self._last_tick_summary = summary
 
     def _is_eligible(self, record: CardRecord) -> bool:
-        """Claim eligibility. The chunk 2b cutover keeps this simple.
+        """Real claim eligibility (chunk 4).
 
-        `query_cards(status="backlog")` already filters to backlog
-        cards. Dependency gating (`depends_on`), story-drift checks,
-        and the pre-approval gate are chunks 3-4 and will read from
-        the store's `dependencies` table and signal markers. For now
-        every backlog card is eligible.
+        Delegates to `eligibility.evaluate_eligibility`, which encodes
+        RUNNER_CONTRACT.md's claim protocol:
+
+        1. Every entry in the card's `depends_on` must be in `done`
+           with `merge_status: merged` (the contract's "every
+           dependency must be in `done/` with `merge_status: merged`").
+        2. If a story source path is reachable, the file's current
+           sha256 must match the card's `story_hash`. A mismatch
+           transitions the card to `blocked` ("On mismatch, refuses
+           the claim and moves the card to `blocked/`") and is logged.
+
+        The pre-approval gate (`requires_pre_approval: true`) reads a
+        signal marker. Chunk 4 implements the same marker scheme the
+        contract suggests: `signals_dir/preapproval/<card_id>.ok`. The
+        card is held in `backlog` until the marker exists.
         """
-        del record
-        return True
+        outcome = evaluate_eligibility(
+            record,
+            repo=self.repo,
+            cfg=self.cfg,
+            paths=self.paths,
+            tenant_id=self.tenant_id,
+        )
+        if outcome.action == "claim":
+            return True
+        if outcome.action == "block":
+            self._route_eligibility_block(record, outcome)
+            return False
+        if outcome.reason:
+            log.debug(
+                "card %s not eligible: %s", record.card_id, outcome.reason
+            )
+        return False
+
+    def _route_eligibility_block(
+        self, record: CardRecord, outcome: EligibilityResult
+    ) -> None:
+        """Transition a backlog card to `blocked` for an eligibility reason.
+
+        Today only story drift triggers this path; the dependency-gating
+        and pre-approval checks defer (the card stays in backlog and is
+        re-evaluated next tick, since `depends_on` and approval markers
+        are transient by nature). Story drift, however, is permanent
+        until a `/cards` re-triage; routing to blocked stops the runner
+        from re-checking it every tick.
+        """
+        log.warning(
+            "routing card_id=%s to blocked (eligibility): %s",
+            record.card_id, outcome.reason,
+        )
+        try:
+            self.repo.transition(
+                record.card_id,
+                to_status=CardStatus.BLOCKED.value,
+                tenant_id=self.tenant_id,
+                fields={
+                    "merge_status": "blocked",
+                },
+                actor_id=f"cards-runner-daemon@pid{os.getpid()}",
+                actor_type=ActorType.RUNNER.value,
+                event_type=EventType.BLOCKED.value,
+                payload={
+                    "reason": outcome.reason,
+                    "kind": outcome.kind,
+                    "detail": outcome.detail or {},
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "could not route %s to blocked on eligibility: %s",
+                record.card_id, exc,
+            )
 
     def _try_claim(self, record: CardRecord) -> ClaimedCard | None:
         attempt_trace_id = os.urandom(16).hex()
@@ -520,6 +670,7 @@ class Daemon:
         claim = handle.claim
         body_md: str | None = None
         fields: dict[str, Any] = {}
+        worker_status: str | None = None
         if claim.card_file.is_file():
             try:
                 parsed = parse_card_text(
@@ -527,6 +678,13 @@ class Daemon:
                 )
                 body_md = parsed.body_md
                 fm = parsed.frontmatter
+                # Capture the worker's view of `status` separately --
+                # the contract reserves the `awaiting_amendment_review`
+                # value as the executor-side amendment signal. We do not
+                # promote it into `fields` because the daemon owns
+                # status transitions.
+                if "status" in fm and fm["status"] is not None:
+                    worker_status = str(fm["status"])
                 for key in (
                     "finished_at",
                     "last_heartbeat",
@@ -593,6 +751,12 @@ class Daemon:
                 "active for orphan reclaim",
                 claim.card_id, rc,
             )
+        elif self._executor_requested_amendment(worker_status, body_md):
+            # Executor wrote a change_request and stamped
+            # status=awaiting_amendment_review. The contract REQUIRES
+            # the runner to honor this rather than running the
+            # verifier (RUNNER_CONTRACT.md "AC amendment protocol").
+            self._route_to_amendments(claim, body_md=body_md, fields=fields)
         else:
             # Clean executor exit: dispatch the verifier.
             self._dispatch_verifier(claim, body_md=body_md, fields=fields, sidecar=sidecar)
@@ -647,6 +811,132 @@ class Daemon:
                     "failed to append escalated event for %s: %s",
                     claim.card_id, exc,
                 )
+
+    @staticmethod
+    def _executor_requested_amendment(
+        worker_status: str | None, body_md: str | None
+    ) -> bool:
+        """Detect the executor's AC-amendment signal.
+
+        Primary signal: the worker stamped `status:` in the projected
+        card's frontmatter to `awaiting_amendment_review` (the long
+        form the contract names) or `amendments` (the short form some
+        executor implementations may emit). Secondary signal: a
+        `change_request:` block in the body. Either is sufficient; we
+        require the status field as the authoritative trigger so an
+        executor that only annotated the body never accidentally
+        skips verification.
+        """
+        if worker_status is None:
+            return False
+        value = worker_status.strip().lower()
+        if value in {"awaiting_amendment_review", "amendments"}:
+            return True
+        # Fallback: the body has a change_request block. Surface the
+        # mismatch so an executor that forgot to update status is
+        # logged for human attention but still routed correctly.
+        if body_md and "change_request:" in body_md and value not in {
+            "active", "backlog", "done", "blocked",
+            "awaiting_standup_review",
+        }:
+            log.warning(
+                "executor wrote change_request but status=%r; routing "
+                "to amendments anyway",
+                worker_status,
+            )
+            return True
+        return False
+
+    def _route_to_amendments(
+        self,
+        claim: ClaimedCard,
+        *,
+        body_md: str | None,
+        fields: dict[str, Any],
+    ) -> None:
+        """Move a card to the amendments status and notify the human path.
+
+        Per RUNNER_CONTRACT.md "AC amendment protocol":
+
+        - Atomic move (subfolder change only in v1; status column flip
+          here in chunk 2b+).
+        - Clear `claimed_by`, `started_at`, `last_heartbeat`,
+          `attempt_trace_id`.
+        - Branch is left alone -- partial work on the executor's branch
+          is preserved.
+        - Notify the human review path (a marker file at
+          `signals/amendments/<card_id>.todo` is chunk 4's mechanism;
+          the contract leaves the choice to the runner).
+        - The runner MUST never amend AC on its own initiative; this
+          method only routes, never edits the `acceptance_criteria:`
+          block.
+        """
+        # Persist the worker's body (which carries the change_request
+        # block the human reviewer needs to read) before transitioning.
+        if body_md is not None:
+            try:
+                self.repo.apply_executor_result(
+                    claim.card_id,
+                    tenant_id=self.tenant_id,
+                    body_md=body_md,
+                    fields=fields or None,
+                    event=None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.error(
+                    "could not write amendment body for %s: %s",
+                    claim.card_id, exc,
+                )
+
+        amend_fields: dict[str, Any] = {
+            "claimed_by": None,
+            "started_at": None,
+            "last_heartbeat": None,
+            "attempt_trace_id": None,
+            # The merge_status field is left alone; an amendment-routed
+            # card was never merged and the field still says "pending".
+        }
+        try:
+            self.repo.transition(
+                claim.card_id,
+                to_status=CardStatus.AMENDMENTS.value,
+                tenant_id=self.tenant_id,
+                fields=amend_fields,
+                actor_id=claim.attempt_trace_id,
+                actor_type=ActorType.RUNNER.value,
+                event_type=EventType.AMENDED.value,
+                payload={
+                    "reason": (
+                        "executor wrote change_request and requested "
+                        "amendment review"
+                    ),
+                    "attempt_trace_id": claim.attempt_trace_id,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "amendment transition failed for %s: %s",
+                claim.card_id, exc,
+            )
+            return
+
+        # Drop a marker for any human-review tooling watching the
+        # signals dir. Best-effort; the canonical state is the card
+        # row in the store.
+        try:
+            marker_dir = self.paths.signals / "amendments"
+            marker_dir.mkdir(parents=True, exist_ok=True)
+            (marker_dir / f"{claim.card_id}.todo").write_text(
+                f"awaiting amendment review for {claim.card_id}\n"
+                f"attempt: {claim.attempt_trace_id}\n"
+                f"at: {now_utc_iso()}\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            log.warning(
+                "could not drop amendment marker for %s: %s",
+                claim.card_id, exc,
+            )
 
     def _route_halt_to_blocked(
         self, claim: ClaimedCard, rc: int, sidecar: dict[str, Any]
@@ -831,8 +1121,26 @@ class Daemon:
         result: VerifierResult | None,
         skip_reason: str | None,
     ) -> None:
+        """Stamp verifier provenance, then route through the merge gate.
+
+        Chunk 4 changes the transition target: instead of immediately
+        moving a passed card to `done`, the verifier provenance is
+        written and then the merge gate decides the final transition.
+        Tier 1-2 (non-pinned) auto-merge and land `done`; tier 3-6 or
+        pinned cards open a PR and route to `blocked` with the
+        appropriate `merge_status` so the operator (sibling reviewer or
+        Drew) can finish the merge. RUNNER_CONTRACT.md "Merge gates"
+        defines the routing; "Status transitions" defines `blocked` as
+        "cards finished but unmerged, or paused on a dependency", which
+        is exactly the state an awaiting-merge card lives in.
+
+        When `pr_gate_enabled=False` (the chunk-3 default and every
+        test that hasn't opted in) the merge gate is a no-op that
+        returns the auto-merge outcome directly -- the card lands
+        `done` with `merge_status=merged` just like chunk 3.
+        """
         now = now_utc_iso()
-        fields: dict[str, Any] = {
+        verifier_fields: dict[str, Any] = {
             "verified_at": now,
             "verified_by": (
                 "runner-verifier" if skip_reason is None else None
@@ -840,23 +1148,114 @@ class Daemon:
             "verifier_skipped_reason": skip_reason,
         }
         if result is not None and result.cascade_history_appendix:
-            fields["verifier_cascade_history"] = self._merge_appendix(
+            verifier_fields["verifier_cascade_history"] = self._merge_appendix(
                 claim, result.cascade_history_appendix
             )
-        payload = self._verifier_payload(result, skip_reason=skip_reason)
+
+        # Persist the verifier provenance up front. The merge gate may
+        # take a while (gh push + create + merge) and we want the
+        # verified-at stamp landed before the gate runs in case it
+        # fails midway -- the card's verifier history should reflect
+        # that the verifier itself succeeded.
+        try:
+            self.repo.update_card_fields(
+                claim.card_id,
+                verifier_fields,
+                tenant_id=self.tenant_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "could not stamp verifier provenance on %s: %s",
+                claim.card_id, exc,
+            )
+            return
+
+        # Emit a `verified` event for the audit log. The transition
+        # that follows (driven by the merge gate) emits `merged` or
+        # another verifier-event depending on the outcome.
+        verified_payload = self._verifier_payload(result, skip_reason=skip_reason)
+        try:
+            self.repo.append_event(
+                CardEvent(
+                    card_id=claim.card_id,
+                    tenant_id=self.tenant_id,
+                    type=EventType.VERIFIED.value,
+                    actor_id=claim.attempt_trace_id,
+                    actor_type=ActorType.VERIFIER.value,
+                    at=now,
+                    payload=verified_payload,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "could not append verified event for %s: %s",
+                claim.card_id, exc,
+            )
+
+        record = self.repo.get_card(claim.card_id, tenant_id=self.tenant_id)
+        if record is None:  # pragma: no cover - just updated it.
+            log.error("card %s vanished before merge gate", claim.card_id)
+            return
+
+        outcome = self._merge_gate.apply(claim, record, verified_at=now)
+        self._apply_merge_outcome(
+            claim,
+            outcome,
+            verifier_result=result,
+            skip_reason=skip_reason,
+        )
+
+    def _apply_merge_outcome(
+        self,
+        claim: ClaimedCard,
+        outcome: MergeOutcome,
+        *,
+        verifier_result: VerifierResult | None,
+        skip_reason: str | None,
+    ) -> None:
+        """Land the merge gate's decision as a card transition + event."""
+        fields: dict[str, Any] = {"merge_status": outcome.merge_status}
+        # Clear the claim provenance once the card leaves `active`. The
+        # next reclaim (or future re-attempt after a blocked-on-merge
+        # card unblocks) should be clean.
+        if outcome.to_status != CardStatus.ACTIVE.value:
+            fields.update({
+                "claimed_by": None,
+                "started_at": None,
+                "last_heartbeat": None,
+                "attempt_trace_id": None,
+            })
+
+        payload = self._verifier_payload(verifier_result, skip_reason=skip_reason)
+        payload["merge_decision"] = outcome.decision
+        payload["merge_status"] = outcome.merge_status
+        payload["merge_reason"] = outcome.reason
+        if outcome.pr_url:
+            payload["pr_url"] = outcome.pr_url
+        if outcome.extra_payload:
+            payload.update(outcome.extra_payload)
+
+        event_type = (
+            EventType.MERGED.value
+            if outcome.to_status == CardStatus.DONE.value
+            else EventType.VERIFIED.value
+        )
         try:
             self.repo.transition(
                 claim.card_id,
-                to_status=CardStatus.DONE.value,
+                to_status=outcome.to_status,
                 tenant_id=self.tenant_id,
                 fields=fields,
                 actor_id=claim.attempt_trace_id,
-                actor_type=ActorType.VERIFIER.value,
-                event_type=EventType.VERIFIED.value,
+                actor_type=ActorType.RUNNER.value,
+                event_type=event_type,
                 payload=payload,
             )
         except Exception as exc:  # noqa: BLE001
-            log.error("verifier PASS transition failed for %s: %s", claim.card_id, exc)
+            log.error(
+                "merge-gate transition failed for %s -> %s: %s",
+                claim.card_id, outcome.to_status, exc,
+            )
 
     def _verifier_apply_fail(
         self, claim: ClaimedCard, result: VerifierResult

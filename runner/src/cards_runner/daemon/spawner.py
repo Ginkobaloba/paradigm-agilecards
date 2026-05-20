@@ -137,7 +137,7 @@ def spawn_worker(
     stdout = open(log_path, "ab", buffering=0)
     stderr = open(err_path, "ab", buffering=0)
     try:
-        return spawn_in_job(
+        process = spawn_in_job(
             args,
             cwd=str(claim.worktree_path),
             env=env,
@@ -149,3 +149,14 @@ def spawn_worker(
         # after we close ours.
         stdout.close()
         stderr.close()
+    # Drop a worker.pid file the boot-time alive check (chunk 4) and any
+    # external troubleshooter can consult. The file's presence is not
+    # load-bearing; the alive check tolerates a missing pid file by
+    # falling back to the heartbeat-age heuristic.
+    try:
+        pid = getattr(process, "pid", None)
+        if pid is not None:
+            (run_dir / "worker.pid").write_text(str(int(pid)), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not write worker.pid for %s: %s", claim.card_id, exc)
+    return process

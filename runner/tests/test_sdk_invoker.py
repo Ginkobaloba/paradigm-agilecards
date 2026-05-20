@@ -197,10 +197,12 @@ def test_model_floor_clamps_the_starting_tier() -> None:
     client = _FakeClient([_FakeMessage("done\nCONFIDENCE: 0.99")])
     inv = SdkInvoker(client=client, api_key="fake")
     # points=1 would start at haiku, but an opus floor forces the
-    # start up to the opus band.
+    # start up to the opus band. The chunk 4 canonical tier_map_claude.yaml
+    # pegs the opus tier at the 4.7 model id; chunk 3's embedded stand-in
+    # used the older 4.6 id, which the canonical wiring corrected.
     result = inv.invoke(_request(points=1, model_floor="opus"))
-    assert client.messages.calls[0]["model"] == "claude-opus-4-6"
-    assert result.model_used == "claude-opus-4-6"
+    assert client.messages.calls[0]["model"] == "claude-opus-4-7"
+    assert result.model_used == "claude-opus-4-7"
 
 
 def test_escalation_cap_is_hard_two() -> None:

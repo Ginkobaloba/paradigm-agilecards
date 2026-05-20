@@ -22,18 +22,35 @@ This is a **4-chunk build** per the runner design and
   `_winapi.CreateProcess` suspended-spawn Job Object refinement, and
   the confidence cascade. The daemon routes the worker's exit code
   (cost-cap / cascade-exhausted halts go to `blocked`).
-- **Chunk 3** (this state) ships the **verifier and the executor tool
-  belt**. A two-path cold-read verifier (deterministic handlers plus
-  a cascading subjective evaluator) gates the `done` transition: PASS
-  -> `done`, FAIL -> `backlog` with `verifier_notes`, NEEDS_STANDUP
-  -> `awaiting_standup_review`, internal crash -> `blocked` after two
-  retries. The `SdkInvoker` grows a sandboxed file/shell/git tool
-  belt (rooted at the per-card worktree, push/pull/fetch refused)
-  driven by the SDK's tool-use loop. Run it with `cards-runner start
-  --invoker sdk-tools`.
-- **Chunk 4** wires merge orchestration (tier-aware gates, the PR
-  lifecycle, sibling-review for tiers 3-4, human approval for 5-6)
-  and the forensic-worktree reaper.
+- **Chunk 3** ships the **verifier and the executor tool belt**. A
+  two-path cold-read verifier (deterministic handlers plus a cascading
+  subjective evaluator) gates the `done` transition: PASS -> `done`,
+  FAIL -> `backlog` with `verifier_notes`, NEEDS_STANDUP ->
+  `awaiting_standup_review`, internal crash -> `blocked` after two
+  retries. The `SdkInvoker` grows a sandboxed file/shell/git tool belt
+  (rooted at the per-card worktree, push/pull/fetch refused) driven by
+  the SDK's tool-use loop. Run it with `cards-runner start --invoker
+  sdk-tools`.
+- **Chunk 4** (this state) wires the **merge gates, PR lifecycle,
+  canonical config, eligibility, reaper, alive check, and amendment
+  protocol**. The verifier-PASS transition now routes through a
+  tier-aware merge gate: tier 1-2 auto-merge via `gh pr merge --auto`,
+  tier 3-4 open a PR for sibling review, tier 5-6 / pinned cards open
+  a PR for human merge. `_is_eligible` enforces dependency-gating
+  (`depends_on` -> `done`/`merged`), story-drift detection (sha256 of
+  `story_source_path` vs `story_hash`, drift -> `blocked`), and a
+  pre-approval marker check. The tier map and pricing tables now load
+  from the canonical `tier_map_claude.yaml` and `tier_pricing.yaml`
+  (env / ancestor-walk / embedded fallback). The forensic-worktree
+  reaper deletes `_runs/<attempt>/` past `worktree_forensic_ttl_hours`
+  for terminal cards. A boot-time worker-alive check reads
+  `_runs/<attempt>/worker.pid` and reclaims `active` cards whose
+  worker pid is no longer alive, skipping the orphan-timeout wait. The
+  AC-amendment protocol routes executor-stamped
+  `awaiting_amendment_review` cards to `amendments` with a marker
+  drop; the runner never edits AC on its own initiative. `pr_gate_
+  enabled` defaults to `False` so chunk-3 callers retain the
+  "verifier PASS -> done" behavior.
 
 ## How card state works after the cutover
 
@@ -86,9 +103,12 @@ runner/
   pyproject.toml
   src/cards_runner/
     cli/              command surface (start, stop, status, reclaim)
-    common/           card I/O, atomic ops, env scrub, locks, Job Object
+    common/           card I/O, atomic ops, env scrub, locks, Job
+                      Object, canonical_config (chunk 4 YAML loader)
     daemon/           polling loop, store-backed claim, worktree,
-                      orphan reclaim, verifier dispatch (chunk 3)
+                      orphan reclaim, verifier dispatch (chunk 3),
+                      eligibility / merge_gate / pr_lifecycle /
+                      reaper (chunk 4)
     store/            CardRepository interface + SQLite/Dolt stores
     verifier/         cold-read verifier (chunk 3): canonical AC
                       types, deterministic handlers, cascading

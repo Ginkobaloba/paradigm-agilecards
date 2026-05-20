@@ -164,6 +164,22 @@ class DaemonConfig:
     subjective_confidence_threshold: float = 0.85
     subjective_starting_tier: str = "haiku"
     subjective_max_tier: str = "opus"
+    # Chunk 4 merge gate. Default OFF so the chunk-3 tests (and any
+    # caller that hasn't wired GitHub yet) keep their existing
+    # "verifier pass -> done" behavior. When enabled, the verifier-pass
+    # transition routes through the tier-aware gate: tier 1-2 + no pin
+    # auto-merge via `gh pr merge --auto`, tier 3-4 open a PR awaiting
+    # sibling review, tier 5-6 / pinned open a PR awaiting human merge.
+    pr_gate_enabled: bool = False
+    gh_path: str = "gh"
+    git_path: str = "git"
+    auto_merge_strategy: str = "squash"
+    pr_base_branch_default: str = "main"
+    # Boot-time worker-alive check (chunk 4). When True the daemon does
+    # an os-level liveness check on the recorded PIDs for active cards
+    # at boot and reclaims any whose process is no longer alive --
+    # faster than waiting for the orphan timeout.
+    boot_worker_alive_check: bool = True
     log_dir: Path | None = None
 
     @property

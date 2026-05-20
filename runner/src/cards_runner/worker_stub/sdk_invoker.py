@@ -38,6 +38,7 @@ from typing import Any
 
 from pathlib import Path
 
+from ..common.canonical_config import TierMap, load_tier_map
 from ..common.types import now_utc_iso
 from .cost import CostCapExceeded, CostGovernor, Pricing, model_tier
 from .invoker import InvokeRequest, InvokeResult
@@ -47,23 +48,31 @@ from .tools import TOOL_DESCRIPTORS, ToolBelt, ToolError, ToolResult
 log = logging.getLogger(__name__)
 
 
-# Points -> model tier. A stand-in for the /cards skill's
-# `tier_map_claude.yaml`, which is not vendored into the runner repo.
-# RUNNER_CONTRACT.md keys the executor's planned tier on `card.points`
-# (1-6); this is the runner-side default mapping until the canonical
-# file is wired in (chunk 3+).
-_POINTS_TO_TIER: dict[int, str] = {1: "haiku", 2: "haiku", 3: "sonnet",
-                                   4: "sonnet", 5: "opus", 6: "opus"}
-
-# Tier -> concrete model id used for the API call.
-_TIER_MODEL: dict[str, str] = {
-    "haiku": "claude-haiku-4-5-20251001",
-    "sonnet": "claude-sonnet-4-6",
-    "opus": "claude-opus-4-6",
-}
-
-# The lowest `points` value whose tier is >= a given model floor.
+# The lowest `points` value whose tier is >= a given model floor. The
+# floor mapping is a property of the cascade ladder (`haiku < sonnet <
+# opus`), not of the canonical tier YAML, so it stays embedded.
 _FLOOR_MIN_POINTS: dict[str, int] = {"haiku": 1, "sonnet": 3, "opus": 5}
+
+# Lazy module-level cache of the canonical tier map. Loaded on first
+# access via `_get_tier_map()`. Tests that want a specific map can
+# rebuild one through `load_tier_map(path=...)` and inject it into a
+# specific `SdkInvoker` instance.
+_TIER_MAP_CACHE: TierMap | None = None
+
+
+def _get_tier_map() -> TierMap:
+    global _TIER_MAP_CACHE
+    if _TIER_MAP_CACHE is None:
+        _TIER_MAP_CACHE = load_tier_map()
+    return _TIER_MAP_CACHE
+
+
+def _points_to_tier(points: int) -> str:
+    return _get_tier_map().tier_name_for(points)
+
+
+def _tier_model(points: int) -> str:
+    return _get_tier_map().model_for(points)
 
 # RUNNER_CONTRACT.md "Cascade-on-confidence routing": the escalation
 # cap is 2 and MUST NOT exceed 2 in v1.2.
@@ -321,12 +330,12 @@ class SdkInvoker:
         points = start_points
         transcript = ""
         confidence: float | None = None
-        final_model = _TIER_MODEL[_POINTS_TO_TIER[points]]
+        final_model = _tier_model(points)
         tool_log: list[dict[str, Any]] = []
 
         try:
             for step in range(self.max_escalations + 1):
-                model = _TIER_MODEL[_POINTS_TO_TIER[points]]
+                model = _tier_model(points)
                 final_model = model
                 if self.use_tools:
                     transcript, confidence, step_tool_log = self._run_tool_loop(
@@ -656,8 +665,8 @@ class SdkInvoker:
         return {
             "from_tier": from_points,
             "to_tier": to_points,
-            "from_model": _TIER_MODEL[_POINTS_TO_TIER[from_points]],
-            "to_model": _TIER_MODEL[_POINTS_TO_TIER[to_points]],
+            "from_model": _tier_model(from_points),
+            "to_model": _tier_model(to_points),
             "reason": (
                 f"executor confidence {confidence:.2f} below threshold "
                 f"{self.cascade_threshold:.2f}"
