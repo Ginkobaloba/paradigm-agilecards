@@ -31,7 +31,7 @@ This is a **4-chunk build** per the runner design and
   (rooted at the per-card worktree, push/pull/fetch refused) driven by
   the SDK's tool-use loop. Run it with `cards-runner start --invoker
   sdk-tools`.
-- **Chunk 4** (this state) wires the **merge gates, PR lifecycle,
+- **Chunk 4** wires the **merge gates, PR lifecycle,
   canonical config, eligibility, reaper, alive check, and amendment
   protocol**. The verifier-PASS transition now routes through a
   tier-aware merge gate: tier 1-2 auto-merge via `gh pr merge --auto`,
@@ -51,6 +51,29 @@ This is a **4-chunk build** per the runner design and
   drop; the runner never edits AC on its own initiative. `pr_gate_
   enabled` defaults to `False` so chunk-3 callers retain the
   "verifier PASS -> done" behavior.
+- **Chunk 5** (this state) wires the **poll-for-merged unblocker,
+  sibling-agent reviewer, AC-amendment review automation,
+  project-config plumbing, CLI flags for the new knobs, `pr_url`
+  promoted column, and the git-worktree-prune sweep**. The unblocker
+  polls `gh pr view --json state,mergedAt` for blocked-on-merge cards
+  and promotes them to `done` when GitHub reports MERGED. The sibling
+  reviewer (tier 3-4) reads the PR diff plus the card body, calls a
+  pluggable reviewer client (the Anthropic SDK by default), posts
+  `gh pr review` with the verdict, and fires `gh pr merge --auto` on
+  approve. The amendment reviewer walks `amendments` cards: approve
+  routes to `blocked/amendment_approved` for a human or follow-on
+  auto-edit pass, deny appends a `change_request_decision:` block to
+  the body and routes back to `active`. Project configuration lives in
+  `<todo_root>/project.yaml` (mtime-polled hot reload, since Windows
+  lacks SIGHUP) and threads through to the merge gate (tier-3/4
+  auto-merge relaxation, alt base branch), eligibility
+  (story_source_path fallback), and both reviewers (identity,
+  cost-cap, prompt_extra). The `pr_url` column is promoted from the
+  event payload so the dashboard reads it directly. Every chunk-4 +
+  chunk-5 knob now has a CLI flag (`--pr-gate`, `--pr-unblock`,
+  `--sibling-reviewer`, `--amendment-reviewer`, `--gh`,
+  `--auto-merge-strategy`, `--no-boot-alive-check`,
+  `--forensic-ttl-hours`, `--worktree-prune`, `--project-config`).
 
 ## How card state works after the cutover
 
@@ -102,13 +125,17 @@ e.g. `--store dolt:C:\dev\todo-store`.
 runner/
   pyproject.toml
   src/cards_runner/
-    cli/              command surface (start, stop, status, reclaim)
+    cli/              command surface (start, stop, status, reclaim;
+                      chunk 5 added the merge-gate / reviewer flags)
     common/           card I/O, atomic ops, env scrub, locks, Job
-                      Object, canonical_config (chunk 4 YAML loader)
+                      Object, canonical_config (chunk 4 YAML loader),
+                      project_config (chunk 5 project.yaml + reload)
     daemon/           polling loop, store-backed claim, worktree,
                       orphan reclaim, verifier dispatch (chunk 3),
                       eligibility / merge_gate / pr_lifecycle /
-                      reaper (chunk 4)
+                      reaper (chunk 4), unblocker /
+                      sibling_reviewer / amendment_reviewer +
+                      worktree prune (chunk 5)
     store/            CardRepository interface + SQLite/Dolt stores
     verifier/         cold-read verifier (chunk 3): canonical AC
                       types, deterministic handlers, cascading
