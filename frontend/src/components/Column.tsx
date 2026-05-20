@@ -2,6 +2,7 @@ import { useDroppable } from "@dnd-kit/core";
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 
 import type { CardSummary, StatusId } from "../lib/api";
+import { statusDotClass } from "../lib/tierBadge";
 import { CardTile } from "./CardTile";
 
 interface Props {
@@ -22,24 +23,38 @@ export function Column({ id, label, cards, onOpenCard }: Props) {
     <div
       ref={setNodeRef}
       className={[
-        "flex flex-col surface min-h-[calc(100vh-120px)]",
-        isOver ? "border-accent" : "",
+        "flex flex-col surface min-h-[calc(100vh-120px)] transition-colors",
+        isOver ? "border-accent bg-accent/[0.04]" : "",
       ].join(" ")}
     >
-      <div className="flex items-center justify-between px-3 py-2 border-b border-border">
-        <span className="text-xs font-semibold tracking-wide text-text uppercase">
-          {label}
+      <div className="flex items-center justify-between gap-2 px-3 py-2.5 border-b border-border">
+        <span className="flex items-center gap-2 min-w-0">
+          <span
+            className={`h-1.5 w-1.5 shrink-0 rounded-full ${statusDotClass(id)}`}
+          />
+          <span className="truncate text-[11px] font-semibold uppercase tracking-wider text-text">
+            {label}
+          </span>
         </span>
-        <span className="text-[11px] text-muted">{cards.length}</span>
+        <span className="shrink-0 rounded-full border border-border bg-panel2 px-1.5 py-0.5 text-[11px] tabular-nums text-muted">
+          {cards.length}
+        </span>
       </div>
-      <div className="flex-1 p-2 flex flex-col gap-2 overflow-y-auto">
+      <div className="flex flex-1 flex-col gap-2 overflow-y-auto p-2">
         <SortableContext
           items={cards.map((c) => c.id)}
           strategy={verticalListSortingStrategy}
         >
           {cards.length === 0 ? (
-            <div className="text-[11px] text-muted italic px-2 py-3">
-              empty
+            <div
+              className={[
+                "m-1 rounded border border-dashed py-10 text-center text-[11px]",
+                isOver
+                  ? "border-accent/60 text-accent"
+                  : "border-border/70 text-muted",
+              ].join(" ")}
+            >
+              {isOver ? "Drop to move here" : "No cards"}
             </div>
           ) : (
             cards.map((c) => (

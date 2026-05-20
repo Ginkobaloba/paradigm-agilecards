@@ -98,10 +98,19 @@ function FrontmatterTable({
 }
 
 function Row({ k, v }: { k: string; v: unknown }) {
+  // Dim empty values (null / undefined / []) so the eye skips straight
+  // to the fields that actually carry information.
+  const isEmpty =
+    v === null || v === undefined || (Array.isArray(v) && v.length === 0);
   return (
-    <div className="flex gap-2 py-0.5">
+    <div className="flex gap-2 py-0.5 hover:bg-panel/60">
       <span className="text-accent shrink-0 w-40">{k}</span>
-      <span className="text-text whitespace-pre-wrap break-words">
+      <span
+        className={[
+          "whitespace-pre-wrap break-words",
+          isEmpty ? "text-muted/50" : "text-text",
+        ].join(" ")}
+      >
         {renderValue(v)}
       </span>
     </div>

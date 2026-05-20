@@ -11,6 +11,17 @@ export function cardTitle(c: CardSummary): string {
   return c.id;
 }
 
+/**
+ * Short id for dense surfaces -- the `<batch>-<NN>` prefix without the
+ * verb-noun slug. "b042-05-document-cascade-routing" -> "b042-05". The
+ * full id still shows in the card modal.
+ */
+export function cardShortId(c: CardSummary): string {
+  const parts = c.id.split("-");
+  if (parts.length >= 2) return `${parts[0]}-${parts[1]}`;
+  return c.id;
+}
+
 export function cardBatch(c: CardSummary): string | null {
   const b = c.frontmatter["batch"];
   return typeof b === "string" ? b : null;

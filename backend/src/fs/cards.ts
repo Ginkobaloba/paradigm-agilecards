@@ -35,7 +35,7 @@ export const STATUSES = [
   {
     id: "awaiting_amendment_review",
     folder: "amendments",
-    label: "Awaiting Amendment Review",
+    label: "In Review",
   },
   { id: "done", folder: "done", label: "Done" },
   { id: "blocked", folder: "blocked", label: "Blocked" },

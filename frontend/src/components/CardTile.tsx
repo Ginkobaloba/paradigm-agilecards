@@ -3,15 +3,15 @@ import { CSS } from "@dnd-kit/utilities";
 
 import type { CardSummary } from "../lib/api";
 import {
-  cardBatch,
   cardExtendedThinking,
   cardModel,
   cardPinRequired,
   cardPoints,
+  cardShortId,
   cardStakes,
   cardTitle,
 } from "../lib/parseCard";
-import { tierBadgeClass } from "../lib/tierBadge";
+import { stakesBadgeClass, tierBadgeClass } from "../lib/tierBadge";
 
 interface Props {
   card: CardSummary;
@@ -20,8 +20,8 @@ interface Props {
 
 /**
  * A single card on a column. Draggable via dnd-kit. Clicking opens the
- * detail modal. The tile is intentionally information-dense; the bigger
- * picture lives in the modal.
+ * detail modal. Dense by design -- the tile carries just enough to
+ * triage at a glance; the full frontmatter lives in the modal.
  */
 export function CardTile({ card, onOpen }: Props) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
@@ -30,23 +30,15 @@ export function CardTile({ card, onOpen }: Props) {
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
-    opacity: isDragging ? 0.5 : 1,
   };
 
   const title = cardTitle(card);
-  const batch = cardBatch(card);
+  const shortId = cardShortId(card);
   const points = cardPoints(card);
   const extended = cardExtendedThinking(card);
   const stakes = cardStakes(card);
   const model = cardModel(card);
   const pin = cardPinRequired(card);
-  // Tier badge: dark variant when extended thinking is on.
-  const tierForBadge =
-    typeof points === "number"
-      ? extended
-        ? Math.min(points + 0, 6) // keep simple; palette already has shades 1-6
-        : points
-      : null;
 
   return (
     <div
@@ -55,44 +47,73 @@ export function CardTile({ card, onOpen }: Props) {
       {...attributes}
       {...listeners}
       onClick={(e) => {
-        // Don't open on drag-end-click; dnd-kit suppresses listeners during
-        // drag but a quick click should still register.
+        // dnd-kit suppresses listeners mid-drag, so a plain click here
+        // is a real click and not the tail of a drag.
         e.stopPropagation();
         onOpen(card.id);
       }}
-      className="surface-2 p-2.5 cursor-pointer hover:border-accent transition-colors flex flex-col gap-1.5"
+      className={[
+        "surface-2 p-3 cursor-pointer flex flex-col gap-2 transition-all",
+        "hover:border-accent hover:bg-[#20262f]",
+        isDragging
+          ? "opacity-60 border-accent shadow-lg shadow-black/40"
+          : "",
+      ].join(" ")}
     >
-      <div className="flex items-start gap-2">
+      <div className="flex items-start gap-2.5">
         {typeof points === "number" ? (
           <span
             className={[
-              "inline-flex items-center justify-center w-5 h-5 rounded text-[10px] font-semibold text-bg",
-              tierBadgeClass(tierForBadge),
+              "inline-flex shrink-0 items-center justify-center w-6 h-6 rounded-md",
+              "text-[11px] font-semibold text-bg",
+              tierBadgeClass(points),
             ].join(" ")}
-            title={`tier ${points}${extended ? " (extended thinking)" : ""}`}
+            title={`tier ${points}${extended ? " - extended thinking" : ""}`}
           >
             {points}
           </span>
         ) : null}
-        <span className="text-xs text-text leading-snug flex-1">{title}</span>
+        <span className="flex-1 text-[13px] font-medium text-text leading-snug">
+          {title}
+        </span>
         {pin ? (
           <span
-            className="text-[10px] text-warn border border-warn/30 px-1 py-0.5 rounded"
-            title="pin_required: human approval needed to merge"
+            className="shrink-0 rounded border border-warn/40 bg-warn/10 px-1.5 py-0.5 text-[10px] font-medium text-warn"
+            title="pin required: human approval needed to merge"
           >
             pin
           </span>
         ) : null}
       </div>
-      <div className="flex items-center gap-2 text-[10px] text-muted">
-        <span className="font-mono">{card.id}</span>
-        {batch ? <span>· {batch}</span> : null}
-        {stakes ? <span>· {stakes}</span> : null}
+
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="font-mono text-[11px] text-muted">{shortId}</span>
+        {stakes ? (
+          <span
+            className={[
+              "rounded border px-1.5 py-0.5 text-[10px] font-medium capitalize",
+              stakesBadgeClass(stakes),
+            ].join(" ")}
+          >
+            {stakes}
+          </span>
+        ) : null}
+        {extended ? (
+          <span
+            className="rounded border border-accent/30 bg-accent/10 px-1.5 py-0.5 text-[10px] font-medium text-accent"
+            title="extended thinking enabled"
+          >
+            thinking
+          </span>
+        ) : null}
       </div>
+
       {model ? (
-        <div className="text-[10px] text-muted font-mono truncate" title={model}>
+        <div
+          className="truncate font-mono text-[11px] text-muted"
+          title={model}
+        >
           {model}
-          {extended ? " · thinking" : ""}
         </div>
       ) : null}
     </div>

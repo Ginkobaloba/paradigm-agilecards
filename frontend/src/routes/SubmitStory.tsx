@@ -21,6 +21,7 @@ import {
   type DryRunPayload,
   type ProgressEntry,
 } from "../state/submitStore";
+import { tierBadgeClass } from "../lib/tierBadge";
 
 const PLACEHOLDER = [
   "Example:",
@@ -406,14 +407,20 @@ function DryRunReview({
         </span>
       </header>
 
-      <div className="flex gap-1.5">
+      <div className="flex flex-wrap gap-1.5">
         {Object.entries(payload.histogram).map(([tier, count]) => (
           <span
             key={tier}
-            className="text-[11px] bg-panel2 border border-border rounded px-2 py-0.5"
+            className="flex items-center gap-1.5 rounded border border-border bg-panel2 px-2 py-0.5 text-[11px] text-muted"
             title={`tier ${tier}`}
           >
-            t{tier}: {count}
+            <span
+              className={`inline-block h-2.5 w-2.5 rounded-sm ${tierBadgeClass(
+                Number(tier)
+              )}`}
+            />
+            tier {tier}
+            <span className="font-semibold text-text">{count}</span>
           </span>
         ))}
       </div>
@@ -425,14 +432,23 @@ function DryRunReview({
             className="bg-panel2 border border-border rounded px-3 py-2 text-xs"
           >
             <div className="flex items-center gap-2">
-              <span className="font-semibold text-text">{c.title}</span>
               {c.tier !== null ? (
-                <span className="text-[10px] bg-panel border border-border rounded px-1.5 py-0.5 text-muted">
-                  tier {c.tier}
+                <span
+                  className={[
+                    "inline-flex h-5 w-5 shrink-0 items-center justify-center rounded",
+                    "text-[10px] font-semibold text-bg",
+                    tierBadgeClass(c.tier),
+                  ].join(" ")}
+                  title={`tier ${c.tier}`}
+                >
+                  {c.tier}
                 </span>
               ) : null}
+              <span className="font-semibold text-text">{c.title}</span>
               {c.model ? (
-                <span className="text-[10px] text-muted">{c.model}</span>
+                <span className="font-mono text-[10px] text-muted">
+                  {c.model}
+                </span>
               ) : null}
               {c.estimatedTokens !== null ? (
                 <span className="text-[10px] text-muted ml-auto">

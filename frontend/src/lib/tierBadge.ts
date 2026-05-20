@@ -1,9 +1,10 @@
 /**
- * Map a tier number (1-6) to a Tailwind background class. Mirrors the
- * v0 palette: light shade = no extended thinking, dark = extended.
+ * Badge styling helpers. They map card metadata -- tier, stakes, and
+ * column status -- to Tailwind classes so the components stay
+ * declarative and the palette lives in one place.
  */
 
-const CLASSES: Record<number, string> = {
+const TIER_CLASSES: Record<number, string> = {
   1: "bg-tier-1",
   2: "bg-tier-2",
   3: "bg-tier-3",
@@ -12,9 +13,46 @@ const CLASSES: Record<number, string> = {
   6: "bg-tier-6",
 };
 
+/** Tier number (1-6) -> badge background class. */
 export function tierBadgeClass(tier: number | null | undefined): string {
   if (typeof tier !== "number") return "bg-panel2";
-  return CLASSES[tier] ?? "bg-panel2";
+  return TIER_CLASSES[tier] ?? "bg-panel2";
+}
+
+/**
+ * Stakes -> outlined-pill classes. Risk reads as a colour gradient:
+ * low is neutral, medium amber, high red.
+ */
+export function stakesBadgeClass(stakes: string | null | undefined): string {
+  switch (stakes) {
+    case "high":
+      return "text-danger border-danger/40 bg-danger/10";
+    case "medium":
+      return "text-warn border-warn/40 bg-warn/10";
+    case "low":
+    default:
+      return "text-muted border-border bg-panel";
+  }
+}
+
+/**
+ * Column status -> accent-dot colour, so a column is findable by its
+ * colour without reading the label.
+ */
+export function statusDotClass(status: string): string {
+  switch (status) {
+    case "active":
+      return "bg-accent";
+    case "awaiting_amendment_review":
+      return "bg-warn";
+    case "done":
+      return "bg-ok";
+    case "blocked":
+      return "bg-danger";
+    case "backlog":
+    default:
+      return "bg-muted";
+  }
 }
 
 export function tierLabel(
