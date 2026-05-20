@@ -28,6 +28,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..common.canonical_config import load_tier_pricing
+
 
 log = logging.getLogger(__name__)
 
@@ -35,20 +37,6 @@ log = logging.getLogger(__name__)
 # Coarse model tiers, cheapest first. Pricing and the executor
 # cascade both walk this ladder.
 TIER_ORDER: tuple[str, ...] = ("haiku", "sonnet", "opus")
-
-# Per-million-token USD rates keyed by tier: (input $/Mtok, output
-# $/Mtok). These are ESTIMATES. The canonical source is the /cards
-# skill's `tier_pricing.yaml`, which is not vendored into the runner
-# repo; until it is wired in (chunk 3+) the runner uses this table
-# plus any override from the CARDS_RUNNER_PRICING_JSON env var. The
-# cap math is correct regardless of the absolute figures -- a wrong
-# rate only shifts where the cap trips, it does not break the
-# enforcement mechanism.
-_DEFAULT_PRICING: dict[str, tuple[float, float]] = {
-    "haiku": (1.00, 5.00),
-    "sonnet": (3.00, 15.00),
-    "opus": (15.00, 75.00),
-}
 
 
 def model_tier(model_id: str) -> str:
@@ -75,13 +63,26 @@ class Pricing:
 
     @classmethod
     def default(cls) -> "Pricing":
-        """The embedded estimate table, with optional env override.
+        """Load the canonical pricing YAML, with optional env override.
 
-        `CARDS_RUNNER_PRICING_JSON` is a JSON object mapping a tier
-        name to a `[input_rate, output_rate]` pair. A malformed value
-        is ignored with a warning rather than crashing the worker.
+        Order of precedence:
+
+        1. `tier_pricing.yaml` resolved via `canonical_config.load_tier_pricing`
+           (which itself honors `CARDS_RUNNER_TIER_PRICING_YAML` and walks
+           up from the package for the canonical file).
+        2. `CARDS_RUNNER_PRICING_JSON` (kept from chunk 2b-ii so a quick
+           per-call override does not need a file edit). The JSON is a
+           tier-keyed mapping of `[input_rate, output_rate]` pairs. A
+           malformed value is ignored with a warning.
+        3. The loader's embedded fallback values when neither file nor
+           env var is present.
+
+        A wrong rate shifts where the cap trips; it does not break the
+        enforcement mechanism. The loader's degrade-gracefully fallback
+        path is therefore safe to rely on.
         """
-        merged = dict(_DEFAULT_PRICING)
+        canonical = load_tier_pricing()
+        merged = dict(canonical.by_tier)
         raw = os.environ.get("CARDS_RUNNER_PRICING_JSON")
         if raw:
             try:
@@ -93,7 +94,13 @@ class Pricing:
         return cls(table=merged)
 
     def rates(self, model_id: str) -> tuple[float, float]:
-        return self.table.get(model_tier(model_id), self.table["opus"])
+        # Defensive default to "opus" if neither a tier nor an opus
+        # fallback is present (would only happen if the YAML omitted
+        # every tier; the loader's embedded fallback prevents this).
+        return self.table.get(
+            model_tier(model_id),
+            self.table.get("opus", (15.00, 75.00)),
+        )
 
     def call_cost(
         self, model_id: str, input_tokens: int, output_tokens: int
