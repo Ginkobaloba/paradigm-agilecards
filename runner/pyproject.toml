@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cards-runner"
+version = "0.1.0"
+description = "Agile-cards runner: thin daemon plus per-card workers."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "PolyForm-Noncommercial-1.0.0" }
+authors = [{ name = "Drew", email = "dramattick1@gmail.com" }]
+dependencies = [
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-timeout>=2.2",
+    "mypy>=1.10",
+    "ruff>=0.5",
+    "types-PyYAML",
+]
+
+[project.scripts]
+cards-runner = "cards_runner.cli.__main__:main"
+cards-runner-worker = "cards_runner.worker_stub.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"cards_runner" = ["py.typed"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+disallow_untyped_decorators = true
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = "yaml"
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "windows_only: tests that require a Windows host (Job Object, MoveFileEx semantics).",
+    "slow: tests that take more than a couple of seconds.",
+]
