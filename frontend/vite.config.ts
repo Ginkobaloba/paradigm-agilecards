@@ -18,6 +18,17 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
+    // Vite 5.4.12+ blocks unknown Host headers by default, which breaks
+    // access through a Cloudflare quick-tunnel or named tunnel because
+    // those rewrite Host to the public hostname. Allow loopback plus
+    // any *.trycloudflare.com (quick tunnels) and the persistent app
+    // hostname for the named tunnel. Add more entries as needed.
+    allowedHosts: [
+      "localhost",
+      "127.0.0.1",
+      ".trycloudflare.com",
+      "app.projectnexuscode.org",
+    ],
     proxy: {
       "/api": {
         target: "http://localhost:4070",
