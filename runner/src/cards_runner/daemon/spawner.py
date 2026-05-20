@@ -4,8 +4,10 @@ Builds the scrubbed env, wraps the worker process in a Windows Job
 Object (or a POSIX process group), and hands the daemon a
 `ManagedProcess` it can kill cleanly.
 
-Chunk 1 spawns the stub worker. Chunk 2 will swap the entry point
-for the real SDK-in-process worker; the spawn surface stays the same.
+The worker module is always `cards_runner.worker_stub`; which
+executor it runs (stub vs the chunk 2b-ii `SdkInvoker`) is decided
+inside the worker from the `CARDS_RUNNER_INVOKER` env var the spawner
+injects. The spawn surface itself does not change.
 """
 from __future__ import annotations
 
@@ -76,8 +78,35 @@ def spawn_worker(
         "CARDS_RUNNER_HEARTBEAT_INTERVAL_SEC": str(cfg.heartbeat_interval_sec),
         "CARDS_RUNNER_STUB_SLEEP_SEC": str(cfg.stub_sleep_sec),
         "CARDS_RUNNER_RUN_DIR": str(run_dir),
+        "CARDS_RUNNER_INVOKER": cfg.invoker,
         "PYTHONPATH": pythonpath,
     }
+    if cfg.invoker == "sdk":
+        # The SDK executor needs a credential the scrub policy drops
+        # by default. RUNNER_CONTRACT.md "Worktree isolation" item 1
+        # forbids leaking `ANTHROPIC_*` UNLESS the project explicitly
+        # opts in; running `--invoker sdk` IS that explicit opt-in, so
+        # the daemon injects exactly one key (not the whole prefix)
+        # through `scrub_environment(add=...)`.
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if api_key:
+            injected["ANTHROPIC_API_KEY"] = api_key
+        else:
+            log.error(
+                "invoker=sdk but ANTHROPIC_API_KEY is not set in the "
+                "daemon environment; the SDK worker will fail to start"
+            )
+        # Optional executor knobs: pass through only when set, so the
+        # worker's `SdkInvoker.from_env` defaults otherwise apply.
+        for passthrough in (
+            "CARDS_RUNNER_CASCADE_THRESHOLD",
+            "CARDS_RUNNER_MAX_OUTPUT_TOKENS",
+            "CARDS_RUNNER_MAX_ESCALATIONS",
+            "CARDS_RUNNER_PRICING_JSON",
+        ):
+            value = os.environ.get(passthrough)
+            if value:
+                injected[passthrough] = value
     if extra_env:
         injected.update(extra_env)
 
@@ -94,8 +123,8 @@ def spawn_worker(
     ]
 
     log.info(
-        "spawning stub worker card_id=%s attempt=%s pid_parent=%d",
-        claim.card_id, claim.attempt_trace_id, os.getpid(),
+        "spawning %s worker card_id=%s attempt=%s pid_parent=%d",
+        cfg.invoker, claim.card_id, claim.attempt_trace_id, os.getpid(),
     )
 
     log_path = run_dir / "worker.stdout.log"

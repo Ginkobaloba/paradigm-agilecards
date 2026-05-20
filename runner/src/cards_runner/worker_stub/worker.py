@@ -10,20 +10,21 @@ Lifecycle:
 
 1. Read CARDS_RUNNER_CARD_PATH and CARDS_RUNNER_WORKTREE from env.
 2. Parse the projected card frontmatter.
-3. Start a heartbeat thread that:
-   - touches `<worktree>/.cards-heartbeat` every
-     `CARDS_RUNNER_HEARTBEAT_INTERVAL_SEC` seconds (default 30),
-   - updates the projected card's `last_heartbeat` field on each
-     beat.
-4. Call the `Invoker` (the chunk 2b-i stub `StubInvoker`; chunk 2b-ii
-   swaps in the real SDK-backed executor).
-5. On clean return, append completion notes to the card body,
-   stamp `finished_at`, `actual_tokens`, `actual_duration_minutes`,
-   `model_used`, write the projected card back, exit 0.
-6. On exception, write a short error block, exit with EXIT_STUB_ERROR.
+3. Start a heartbeat thread that touches `<worktree>/.cards-heartbeat`
+   and advances the projected card's `last_heartbeat` field.
+4. Call the selected `Invoker`. `CARDS_RUNNER_INVOKER` picks it:
+   `stub` (chunk 1 `StubInvoker`, zero tokens) or `sdk` (chunk 2b-ii
+   `SdkInvoker`, the real Anthropic-SDK-in-process executor).
+5. Stamp the projected card (completion notes, `finished_at`,
+   `actual_tokens`, `actual_duration_minutes`, `model_used`, and any
+   `cascade_history` the executor produced) and write a structured
+   `result.json` sidecar the daemon reads back.
+6. Return an exit code the daemon routes on: 0 clean, 10 invoker
+   error, 11 cost-cap halt, 12 cascade-exhausted halt.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -40,12 +41,15 @@ from ..common.card_io import (
 from ..common.logging_setup import setup_worker_logging
 from ..common.types import (
     EXIT_CLEAN,
+    EXIT_COST_CAP_HALT,
+    EXIT_HALT_SIGNAL,
     EXIT_STUB_ERROR,
     EXIT_UNCAUGHT,
     HEARTBEAT_FILE,
+    WORKER_RESULT_NAME,
     now_utc_iso,
 )
-from .invoker import InvokeRequest, Invoker, StubInvoker
+from .invoker import InvokeRequest, InvokeResult, Invoker, StubInvoker
 
 
 log = logging.getLogger(__name__)
@@ -114,6 +118,21 @@ class _Heartbeat:
             self._stop.set()
 
 
+def _exit_code_for(result: InvokeResult) -> int:
+    """Map an `InvokeResult` to the process exit code the daemon routes.
+
+    A cost-cap or cascade-exhausted halt routes the card to `blocked`
+    in `daemon._post_worker_exit`; a plain failure leaves the card
+    `active` for orphan reclaim, exactly as a stub error did in
+    chunk 1.
+    """
+    if result.halt_kind == "cost_cap":
+        return EXIT_COST_CAP_HALT
+    if result.halt_kind == "cascade_exhausted":
+        return EXIT_HALT_SIGNAL
+    return EXIT_CLEAN if result.success else EXIT_STUB_ERROR
+
+
 def run_worker(
     *,
     card_path: Path,
@@ -124,6 +143,7 @@ def run_worker(
     invoker: Invoker,
 ) -> int:
     """Run one worker lifecycle. Returns the process exit code."""
+    run_dir = card_path.parent
     snap = parse_card_file(card_path)
     request = InvokeRequest(
         snapshot=snap,
@@ -144,56 +164,72 @@ def run_worker(
         log.exception("invoker raised; writing error completion notes")
         heartbeat.cancel()
         _stamp_error(card_path, attempt_trace_id)
+        _write_result_sidecar(run_dir, attempt_trace_id, EXIT_STUB_ERROR, None)
         return EXIT_STUB_ERROR
     heartbeat.cancel()
 
     duration_sec = time.monotonic() - started_at_mono
+    rc = _exit_code_for(result)
     log.info(
-        "worker invoker returned success=%s duration_sec=%.1f tokens=%d model=%s",
-        result.success, duration_sec, result.actual_tokens, result.model_used,
+        "worker invoker returned success=%s halt=%s rc=%d duration_sec=%.1f "
+        "tokens=%d cost=$%.4f model=%s",
+        result.success, result.halt_kind, rc, duration_sec,
+        result.actual_tokens, result.actual_cost_usd, result.model_used,
     )
-    _stamp_success(
+    _stamp_result(
         card_path=card_path,
-        result_notes=result.completion_notes_markdown,
-        actual_tokens=result.actual_tokens,
-        model_used=result.model_used,
+        result=result,
         attempt_trace_id=attempt_trace_id,
         duration_sec=duration_sec,
     )
-    return EXIT_CLEAN if result.success else EXIT_STUB_ERROR
+    _write_result_sidecar(run_dir, attempt_trace_id, rc, result)
+    return rc
 
 
-def _stamp_success(
+def _stamp_result(
     *,
     card_path: Path,
-    result_notes: str,
-    actual_tokens: int,
-    model_used: str | None,
+    result: InvokeResult,
     attempt_trace_id: str,
     duration_sec: float,
 ) -> None:
+    """Write the executor's deltas back into the projected card file.
+
+    Covers a clean finish and a halt alike: a halted run still wrote
+    real partial work and a real token spend, and the card carries
+    that record into `blocked` for the next human or executor.
+    """
     try:
         snap = parse_card_file(card_path)
     except FileNotFoundError:
         log.warning(
-            "card %s vanished before success stamp (probably reclaimed)",
+            "card %s vanished before result stamp (probably reclaimed)",
             card_path,
         )
         return
     now_iso = now_utc_iso()
     snap.frontmatter["finished_at"] = now_iso
     snap.frontmatter["last_heartbeat"] = now_iso
-    if model_used is not None:
-        snap.frontmatter["model_used"] = model_used
+    if result.model_used is not None:
+        snap.frontmatter["model_used"] = result.model_used
     # The projected card file is rewritten whole now, so the worker
     # can set these fields directly -- no allowlist, no no-op for
     # fields the planner did not pre-bake.
-    snap.frontmatter["actual_tokens"] = actual_tokens
+    snap.frontmatter["actual_tokens"] = result.actual_tokens
     snap.frontmatter["actual_duration_minutes"] = round(duration_sec / 60.0, 2)
     snap.frontmatter["attempt_trace_id"] = attempt_trace_id
-    append_completion_notes(snap, result_notes)
+    if result.cascade_history:
+        existing = snap.frontmatter.get("cascade_history")
+        if not isinstance(existing, list):
+            existing = []
+        # Append-only across the card's whole lifetime, per
+        # RUNNER_CONTRACT.md "Cascade-on-confidence routing".
+        snap.frontmatter["cascade_history"] = existing + [
+            dict(entry) for entry in result.cascade_history
+        ]
+    append_completion_notes(snap, result.completion_notes_markdown)
     write_card_file(card_path, snap)
-    log.info("stamped success on %s", card_path)
+    log.info("stamped result on %s", card_path)
 
 
 def _stamp_error(card_path: Path, attempt_trace_id: str) -> None:
@@ -206,7 +242,8 @@ def _stamp_error(card_path: Path, attempt_trace_id: str) -> None:
     snap.frontmatter["attempt_trace_id"] = attempt_trace_id
     append_completion_notes(
         snap,
-        "Stub executor (chunk 1) raised an unexpected exception.\n"
+        "The executor raised an unexpected exception before it could "
+        "report a result.\n"
         "See `_runs/<attempt_trace_id>/worker.log` for the full trace.\n",
     )
     try:
@@ -215,8 +252,59 @@ def _stamp_error(card_path: Path, attempt_trace_id: str) -> None:
         return
 
 
+def _write_result_sidecar(
+    run_dir: Path,
+    attempt_trace_id: str,
+    rc: int,
+    result: InvokeResult | None,
+) -> None:
+    """Write the structured `result.json` the daemon reads on reap.
+
+    Best-effort: a failure here must not change the worker's exit
+    code, so the daemon simply sees a missing sidecar and falls back
+    to the exit code alone.
+    """
+    payload: dict[str, object] = {
+        "attempt_trace_id": attempt_trace_id,
+        "exit_code": rc,
+    }
+    if result is not None:
+        payload.update(
+            success=result.success,
+            halt_kind=result.halt_kind,
+            actual_tokens=result.actual_tokens,
+            actual_cost_usd=result.actual_cost_usd,
+            model_used=result.model_used,
+            escalations=len(result.cascade_history),
+            cost=result.cost_snapshot,
+        )
+    else:
+        payload["success"] = False
+        payload["halt_kind"] = None
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / WORKER_RESULT_NAME).write_text(
+            json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+        )
+    except OSError as exc:
+        log.warning("could not write result sidecar: %s", exc)
+
+
+def _build_invoker() -> Invoker:
+    """Select the executor from `CARDS_RUNNER_INVOKER` (default: stub)."""
+    kind = os.environ.get("CARDS_RUNNER_INVOKER", "stub").strip().lower()
+    if kind == "sdk":
+        from .sdk_invoker import SdkInvoker
+
+        log.info("using SdkInvoker (chunk 2b-ii real executor)")
+        return SdkInvoker.from_env()
+    stub_sleep_sec = float(os.environ.get("CARDS_RUNNER_STUB_SLEEP_SEC", "3"))
+    log.info("using StubInvoker (sleep=%.1fs)", stub_sleep_sec)
+    return StubInvoker(sleep_sec=stub_sleep_sec)
+
+
 def main_from_env() -> int:
-    """Default entry. Pulls paths and ids from env, builds the StubInvoker."""
+    """Default entry. Pulls paths and ids from env, builds the invoker."""
     card_path = Path(os.environ["CARDS_RUNNER_CARD_PATH"])
     worktree = Path(os.environ["CARDS_RUNNER_WORKTREE"])
     attempt_trace_id = os.environ["CARDS_RUNNER_ATTEMPT_TRACE_ID"]
@@ -224,7 +312,6 @@ def main_from_env() -> int:
     heartbeat_interval_sec = float(
         os.environ.get("CARDS_RUNNER_HEARTBEAT_INTERVAL_SEC", "30")
     )
-    stub_sleep_sec = float(os.environ.get("CARDS_RUNNER_STUB_SLEEP_SEC", "3"))
     run_dir = Path(
         os.environ.get(
             "CARDS_RUNNER_RUN_DIR",
@@ -233,12 +320,12 @@ def main_from_env() -> int:
     )
     setup_worker_logging(run_dir)
 
+    invoker = _build_invoker()
     log.info(
-        "stub worker boot card=%s attempt=%s sleep=%.1fs hb=%.1fs",
-        card_path, attempt_trace_id, stub_sleep_sec, heartbeat_interval_sec,
+        "worker boot card=%s attempt=%s hb=%.1fs invoker=%s",
+        card_path, attempt_trace_id, heartbeat_interval_sec,
+        type(invoker).__name__,
     )
-
-    invoker = StubInvoker(sleep_sec=stub_sleep_sec)
     try:
         return run_worker(
             card_path=card_path,

@@ -55,6 +55,14 @@ def main(argv: list[str] | None = None) -> int:
     p_start.add_argument("--heartbeat-interval-sec", type=float, default=30.0)
     p_start.add_argument("--stub-sleep-sec", type=float, default=3.0)
     p_start.add_argument(
+        "--invoker",
+        choices=("stub", "sdk"),
+        default=os.environ.get("CARDS_RUNNER_INVOKER", "stub"),
+        help="executor to run per card: 'stub' (default, zero tokens) "
+        "or 'sdk' (the real Anthropic-SDK executor; needs "
+        "ANTHROPIC_API_KEY in the daemon environment)",
+    )
+    p_start.add_argument(
         "--skip-worktree",
         action="store_true",
         help="skip git worktree creation (for tests against non-git roots)",
@@ -126,8 +134,16 @@ def _cmd_start(args: argparse.Namespace) -> int:
         orphan_timeout_minutes=args.orphan_timeout_minutes,
         heartbeat_interval_sec=args.heartbeat_interval_sec,
         stub_sleep_sec=args.stub_sleep_sec,
+        invoker=args.invoker,
         skip_worktree=args.skip_worktree,
     )
+    if args.invoker == "sdk" and not os.environ.get("ANTHROPIC_API_KEY"):
+        print(
+            "error: --invoker sdk needs ANTHROPIC_API_KEY in the "
+            "environment",
+            file=sys.stderr,
+        )
+        return 2
     try:
         return Daemon(cfg).run()
     except DaemonAlreadyRunning as exc:

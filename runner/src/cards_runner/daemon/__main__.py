@@ -21,6 +21,9 @@ def main() -> int:
     parser.add_argument("--orphan-timeout-minutes", type=int, default=120)
     parser.add_argument("--heartbeat-interval-sec", type=float, default=30.0)
     parser.add_argument("--stub-sleep-sec", type=float, default=3.0)
+    parser.add_argument(
+        "--invoker", choices=("stub", "sdk"), default="stub"
+    )
     parser.add_argument("--skip-worktree", action="store_true")
     args = parser.parse_args()
     cfg = DaemonConfig(
@@ -30,6 +33,7 @@ def main() -> int:
         orphan_timeout_minutes=args.orphan_timeout_minutes,
         heartbeat_interval_sec=args.heartbeat_interval_sec,
         stub_sleep_sec=args.stub_sleep_sec,
+        invoker=args.invoker,
         skip_worktree=args.skip_worktree,
     )
     return Daemon(cfg).run()

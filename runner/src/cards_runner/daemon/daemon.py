@@ -29,6 +29,7 @@ half-succeed the way "move then stamp" could.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -37,13 +38,16 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
-from typing import Optional
+from typing import Any, Optional
 
 from ..common.locks import FileLock, LockHeldError, pid_alive
 from ..common.logging_setup import setup_daemon_logging
 from ..common.process_group import ManagedProcess
 from ..common.types import (
+    EXIT_COST_CAP_HALT,
+    EXIT_HALT_SIGNAL,
     PROJECTED_CARD_NAME,
+    WORKER_RESULT_NAME,
     ClaimedCard,
     DaemonConfig,
     RuntimePaths,
@@ -479,21 +483,31 @@ class Daemon:
         """Land a finished worker's results back into the store.
 
         The worker drove the projected card file: appended completion
-        notes, stamped `finished_at` / `actual_tokens` / `model_used`.
-        The runner parses that file and writes the executor-owned
-        deltas (and only those) into the store, plus one `executed`
-        event. Status is left `active`: a stub or real executor
-        finishing is not itself a transition to `done`; the verifier
-        owns that, which lands in chunk 3.
+        notes and stamped `finished_at` / `actual_tokens` /
+        `model_used` / `cascade_history`. The runner parses that file
+        and writes the executor-owned deltas (and only those) into the
+        store, plus one `executed` event, then routes on the exit
+        code:
 
-        On a non-zero exit we still record what the worker wrote (its
-        error notes) and the exit code in the event, then leave the
-        card `active`; its heartbeat will go stale and orphan reclaim
-        will return it to `backlog` for another attempt.
+        - **0 (clean):** the card is left `active`. A clean executor
+          finish is not itself a transition to `done`; the verifier
+          owns that arrow (chunk 3), and picks the card up from
+          `active`.
+        - **11 / 12 (cost-cap halt / cascade-exhausted halt):** the
+          card is transitioned to `blocked` -- RUNNER_CONTRACT.md's
+          "Cost cap enforcement" and "Cascade-on-confidence routing"
+          both end an exhausted run in `blocked/` with the detail on
+          the card.
+        - **any other non-zero:** the card is left `active`; its
+          heartbeat will go stale and orphan reclaim returns it to
+          `backlog` for another attempt, exactly as in chunk 1.
+
+        Every escalation the executor recorded in `cascade_history`
+        this attempt is also emitted as an `escalated` event.
         """
         claim = handle.claim
         body_md: str | None = None
-        fields: dict[str, object] = {}
+        fields: dict[str, Any] = {}
         if claim.card_file.is_file():
             try:
                 parsed = parse_card_text(
@@ -507,6 +521,7 @@ class Daemon:
                     "actual_tokens",
                     "actual_duration_minutes",
                     "model_used",
+                    "cascade_history",
                 ):
                     if key in fm:
                         fields[key] = fm[key]
@@ -521,6 +536,17 @@ class Daemon:
                 claim.card_file,
             )
 
+        sidecar = self._read_result_sidecar(claim.run_dir)
+        payload: dict[str, Any] = {
+            "exit_code": rc,
+            "ok": rc == 0,
+            "attempt_trace_id": claim.attempt_trace_id,
+        }
+        for key in ("halt_kind", "actual_cost_usd", "model_used",
+                    "escalations", "actual_tokens"):
+            if key in sidecar:
+                payload[key] = sidecar[key]
+
         event = CardEvent(
             card_id=claim.card_id,
             tenant_id=self.tenant_id,
@@ -528,11 +554,7 @@ class Daemon:
             actor_id=claim.attempt_trace_id,
             actor_type=ActorType.EXECUTOR.value,
             at=now_utc_iso(),
-            payload={
-                "exit_code": rc,
-                "ok": rc == 0,
-                "attempt_trace_id": claim.attempt_trace_id,
-            },
+            payload=payload,
         )
         try:
             self.repo.apply_executor_result(
@@ -548,11 +570,99 @@ class Daemon:
                 claim.card_id, exc,
             )
             return
-        if rc != 0:
+
+        self._emit_escalated_events(claim, fields.get("cascade_history"))
+
+        if rc in (EXIT_COST_CAP_HALT, EXIT_HALT_SIGNAL):
+            self._route_halt_to_blocked(claim, rc, sidecar)
+        elif rc != 0:
             log.warning(
                 "worker for card_id=%s exited non-zero (%d); card left "
                 "active for orphan reclaim",
                 claim.card_id, rc,
+            )
+
+    @staticmethod
+    def _read_result_sidecar(run_dir: Path) -> dict[str, Any]:
+        """Best-effort read of the worker's `result.json`.
+
+        A missing or malformed sidecar is not an error -- the daemon
+        falls back to the bare exit code. The stub worker writes a
+        minimal sidecar; the SDK worker writes the full token / cost /
+        cascade record.
+        """
+        path = run_dir / WORKER_RESULT_NAME
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _emit_escalated_events(
+        self, claim: ClaimedCard, cascade_history: Any
+    ) -> None:
+        """Emit one `escalated` event per escalation made THIS attempt.
+
+        `cascade_history` is append-only across a card's whole life,
+        so the daemon filters to entries tagged with this attempt's
+        `attempt_trace_id` -- a re-claimed card does not re-emit its
+        earlier escalations.
+        """
+        if not isinstance(cascade_history, list):
+            return
+        for entry in cascade_history:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("attempt_trace_id") != claim.attempt_trace_id:
+                continue
+            try:
+                self.repo.append_event(
+                    CardEvent(
+                        card_id=claim.card_id,
+                        tenant_id=self.tenant_id,
+                        type=EventType.ESCALATED.value,
+                        actor_id=claim.attempt_trace_id,
+                        actor_type=ActorType.EXECUTOR.value,
+                        at=str(entry.get("at") or now_utc_iso()),
+                        payload=dict(entry),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.error(
+                    "failed to append escalated event for %s: %s",
+                    claim.card_id, exc,
+                )
+
+    def _route_halt_to_blocked(
+        self, claim: ClaimedCard, rc: int, sidecar: dict[str, Any]
+    ) -> None:
+        """Transition a halted card to `blocked` with the halt detail."""
+        if rc == EXIT_COST_CAP_HALT:
+            reason = "executor halted on cost-cap breach"
+        else:
+            reason = (
+                "executor cascade exhausted without reaching the "
+                "confidence threshold"
+            )
+        log.warning("routing card_id=%s to blocked: %s", claim.card_id, reason)
+        try:
+            self.repo.transition(
+                claim.card_id,
+                to_status=CardStatus.BLOCKED.value,
+                tenant_id=self.tenant_id,
+                actor_id=claim.attempt_trace_id,
+                actor_type=ActorType.EXECUTOR.value,
+                event_type=EventType.BLOCKED.value,
+                payload={
+                    "exit_code": rc,
+                    "reason": reason,
+                    "halt_kind": sidecar.get("halt_kind"),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "failed to route halted card %s to blocked: %s",
+                claim.card_id, exc,
             )
 
     def _drain_workers(self) -> None:

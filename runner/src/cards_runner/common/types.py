@@ -51,6 +51,13 @@ HALT_SENTINEL: Final[str] = ".cards-halt"
 # writes that file exactly as v1 workers read a card in `active/`.
 PROJECTED_CARD_NAME: Final[str] = "card.md"
 
+# The worker's structured result sidecar, written into the run dir on
+# exit. The daemon reads it in `_post_worker_exit` to enrich the
+# `executed` event payload with token/cost/cascade detail. It is a
+# transient runtime artifact, not card state -- the card store stays
+# canonical and never carries derived USD (RUNNER_CONTRACT.md).
+WORKER_RESULT_NAME: Final[str] = "result.json"
+
 # Worker-side heartbeat file inside the worktree.
 HEARTBEAT_FILE: Final[str] = ".cards-heartbeat"
 
@@ -141,6 +148,11 @@ class DaemonConfig:
     stub_sleep_sec: float = 3.0  # how long the stub worker sleeps.
     force_kill_after_seconds: int = 90
     skip_worktree: bool = False  # tests bypass git when not on a real repo.
+    # Which executor the spawned worker runs: "stub" (chunk 1 default,
+    # zero tokens) or "sdk" (chunk 2b-ii real SdkInvoker). SDK mode
+    # makes the daemon inject ANTHROPIC_API_KEY into the worker's
+    # scrubbed env block.
+    invoker: str = "stub"
     log_dir: Path | None = None
 
     @property
