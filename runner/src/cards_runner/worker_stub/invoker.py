@@ -17,9 +17,9 @@ client itself, not through this interface.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from ..common.types import CardSnapshot
 
@@ -36,12 +36,29 @@ class InvokeRequest:
 
 @dataclass(frozen=True)
 class InvokeResult:
-    """What the Invoker reports back to the worker runner."""
+    """What the Invoker reports back to the worker runner.
+
+    The first four fields are the chunk 1 contract; the rest are the
+    chunk 2b-ii additions for the real executor. All new fields carry
+    defaults, so `StubInvoker` (and any other chunk 1 caller) is
+    untouched.
+
+    `halt_kind` is `None` on a normal finish, `"cost_cap"` when the
+    card's `cost_cap_usd` was hit, and `"cascade_exhausted"` when the
+    confidence cascade climbed its two permitted tiers without
+    reaching threshold. The worker maps it to an exit code and the
+    daemon routes that exit code (see `worker.run_worker` and
+    `daemon._post_worker_exit`).
+    """
 
     completion_notes_markdown: str
     actual_tokens: int  # 0 in stub mode.
     model_used: str | None
     success: bool
+    actual_cost_usd: float = 0.0
+    halt_kind: str | None = None  # None | "cost_cap" | "cascade_exhausted"
+    cascade_history: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    cost_snapshot: dict[str, Any] = field(default_factory=dict)
 
 
 class Invoker(Protocol):

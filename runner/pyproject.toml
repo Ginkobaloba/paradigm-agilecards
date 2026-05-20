@@ -12,6 +12,12 @@ license = { text = "PolyForm-Noncommercial-1.0.0" }
 authors = [{ name = "Drew", email = "dramattick1@gmail.com" }]
 dependencies = [
     "PyYAML>=6.0",
+    # The chunk 2b-ii SDK executor (`worker_stub.sdk_invoker`) calls
+    # the Anthropic Messages API in-process. A first-party, declared
+    # dependency. The store layer and the stub executor need none of
+    # it; `SdkInvoker` imports it lazily so a stub-only deployment
+    # never loads it.
+    "anthropic>=0.40",
 ]
 
 [project.optional-dependencies]
