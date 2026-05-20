@@ -17,15 +17,23 @@ This is a **4-chunk build** per the runner design and
   the source of truth. The claim is a transactional store `UPDATE`,
   not an atomic file move; folder-as-state is a `status` column; the
   atomic-rename sentinel and the in-place YAML rewriter are deleted.
-- **Chunk 2b-ii** (this state) swaps the stub for the real
-  `SdkInvoker` -- an Anthropic-SDK-in-process executor with cost-cap
-  hooks, the `_winapi.CreateProcess` suspended-spawn Job Object
-  refinement, and the confidence cascade. The daemon routes the
-  worker's exit code (cost-cap / cascade-exhausted halts go to
-  `blocked`). The executor is reasoning-only for now; its tool belt
-  is chunk 3. Run it with `cards-runner start --invoker sdk`.
-- **Chunks 3-4** wire the verifier (and the `done` transition), the
-  executor's tool belt, merge orchestration, and the reaper.
+- **Chunk 2b-ii** swapped the stub for the real `SdkInvoker` -- an
+  Anthropic-SDK-in-process executor with cost-cap hooks, the
+  `_winapi.CreateProcess` suspended-spawn Job Object refinement, and
+  the confidence cascade. The daemon routes the worker's exit code
+  (cost-cap / cascade-exhausted halts go to `blocked`).
+- **Chunk 3** (this state) ships the **verifier and the executor tool
+  belt**. A two-path cold-read verifier (deterministic handlers plus
+  a cascading subjective evaluator) gates the `done` transition: PASS
+  -> `done`, FAIL -> `backlog` with `verifier_notes`, NEEDS_STANDUP
+  -> `awaiting_standup_review`, internal crash -> `blocked` after two
+  retries. The `SdkInvoker` grows a sandboxed file/shell/git tool
+  belt (rooted at the per-card worktree, push/pull/fetch refused)
+  driven by the SDK's tool-use loop. Run it with `cards-runner start
+  --invoker sdk-tools`.
+- **Chunk 4** wires merge orchestration (tier-aware gates, the PR
+  lifecycle, sibling-review for tiers 3-4, human approval for 5-6)
+  and the forensic-worktree reaper.
 
 ## How card state works after the cutover
 
@@ -79,9 +87,14 @@ runner/
   src/cards_runner/
     cli/              command surface (start, stop, status, reclaim)
     common/           card I/O, atomic ops, env scrub, locks, Job Object
-    daemon/           polling loop, store-backed claim, worktree, orphan
+    daemon/           polling loop, store-backed claim, worktree,
+                      orphan reclaim, verifier dispatch (chunk 3)
     store/            CardRepository interface + SQLite/Dolt stores
-    worker_stub/      stub executor + the Invoker seam
+    verifier/         cold-read verifier (chunk 3): canonical AC
+                      types, deterministic handlers, cascading
+                      subjective evaluator, orchestrator
+    worker_stub/      stub + SDK executors, cost governor, tool belt
+                      (chunk 3 file/shell/git tools), Invoker seam
   tests/              pytest suite
 ```
 
