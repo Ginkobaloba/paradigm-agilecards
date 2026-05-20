@@ -21,11 +21,19 @@ dev = [
     "mypy>=1.10",
     "ruff>=0.5",
     "types-PyYAML",
+    "PyMySQL>=1.1",
+]
+# The Dolt store talks to a dolt sql-server over the MySQL wire
+# protocol via PyMySQL. SQLite (the de-risking fallback) and the
+# repository interface itself need none of this.
+dolt = [
+    "PyMySQL>=1.1",
 ]
 
 [project.scripts]
 cards-runner = "cards_runner.cli.__main__:main"
 cards-runner-worker = "cards_runner.worker_stub.__main__:main"
+cards-runner-migrate = "cards_runner.store.migrate_v1:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -42,6 +50,12 @@ files = ["src"]
 
 [[tool.mypy.overrides]]
 module = "yaml"
+ignore_missing_imports = true
+
+# PyMySQL ships no type stubs. The Dolt store is the only consumer
+# and isolates the dependency behind the repository interface.
+[[tool.mypy.overrides]]
+module = ["pymysql", "pymysql.*"]
 ignore_missing_imports = true
 
 [tool.ruff]
