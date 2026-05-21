@@ -87,6 +87,30 @@ class GhRunner(Protocol):
         strategy: str = "squash",
     ) -> GhCallResult: ...
 
+    def view_pr(
+        self,
+        *,
+        identifier: str,
+        fields: tuple[str, ...] = ("state", "mergedAt", "url"),
+        worktree: Path | None = None,
+    ) -> GhCallResult: ...
+
+    def pr_diff(
+        self,
+        *,
+        identifier: str,
+        worktree: Path | None = None,
+    ) -> GhCallResult: ...
+
+    def pr_review(
+        self,
+        *,
+        identifier: str,
+        decision: str,
+        body: str,
+        worktree: Path | None = None,
+    ) -> GhCallResult: ...
+
 
 class NullGhRunner:
     """Refuses every call with a structured `gh disabled` reason.
@@ -125,6 +149,36 @@ class NullGhRunner:
         strategy: str = "squash",
     ) -> GhCallResult:
         del worktree, identifier, strategy
+        return GhCallResult(ok=False, reason="gh disabled")
+
+    def view_pr(
+        self,
+        *,
+        identifier: str,
+        fields: tuple[str, ...] = ("state", "mergedAt", "url"),
+        worktree: Path | None = None,
+    ) -> GhCallResult:
+        del identifier, fields, worktree
+        return GhCallResult(ok=False, reason="gh disabled")
+
+    def pr_diff(
+        self,
+        *,
+        identifier: str,
+        worktree: Path | None = None,
+    ) -> GhCallResult:
+        del identifier, worktree
+        return GhCallResult(ok=False, reason="gh disabled")
+
+    def pr_review(
+        self,
+        *,
+        identifier: str,
+        decision: str,
+        body: str,
+        worktree: Path | None = None,
+    ) -> GhCallResult:
+        del identifier, decision, body, worktree
         return GhCallResult(ok=False, reason="gh disabled")
 
 
@@ -217,14 +271,82 @@ class SubprocessGhRunner:
         ]
         return self._run(args, cwd=worktree)
 
-    def _run(self, args: list[str], *, cwd: Path) -> GhCallResult:
+    def view_pr(
+        self,
+        *,
+        identifier: str,
+        fields: tuple[str, ...] = ("state", "mergedAt", "url"),
+        worktree: Path | None = None,
+    ) -> GhCallResult:
+        """`gh pr view <id> --json state,mergedAt,...`.
+
+        The unblocker (chunk 5) polls this each tick for `blocked` cards
+        whose merge_status is `open` or `requires_review`. A PR URL or
+        a PR number both work as the identifier; gh resolves either.
+        When `worktree` is None we let gh auto-detect the repo from the
+        cwd, which works because the unblocker can also pass a fully
+        qualified URL and skip the repo discovery.
+        """
+        args = [
+            self.gh_path, "pr", "view", identifier,
+            "--json", ",".join(fields),
+        ]
+        result = self._run(args, cwd=worktree)
+        if result.ok and result.stdout:
+            parsed = parse_pr_view_json(result.stdout)
+            return GhCallResult(
+                ok=True,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                exit_code=result.exit_code,
+                parsed=parsed,
+            )
+        return result
+
+    def pr_diff(
+        self,
+        *,
+        identifier: str,
+        worktree: Path | None = None,
+    ) -> GhCallResult:
+        """`gh pr diff <id>`. Used by the sibling reviewer for context."""
+        args = [self.gh_path, "pr", "diff", identifier]
+        return self._run(args, cwd=worktree)
+
+    def pr_review(
+        self,
+        *,
+        identifier: str,
+        decision: str,
+        body: str,
+        worktree: Path | None = None,
+    ) -> GhCallResult:
+        """`gh pr review <id> --approve|--request-changes|--comment`.
+
+        Decisions other than `approve|request_changes|comment` fall back
+        to `--comment` so a reviewer with an unrecognized verdict still
+        produces a visible note on the PR rather than silently no-op.
+        """
+        decision_flag = {
+            "approve": "--approve",
+            "request_changes": "--request-changes",
+            "comment": "--comment",
+        }.get(decision, "--comment")
+        args = [
+            self.gh_path, "pr", "review", identifier,
+            decision_flag,
+            "--body", body,
+        ]
+        return self._run(args, cwd=worktree)
+
+    def _run(self, args: list[str], *, cwd: Path | None) -> GhCallResult:
         env = os.environ.copy()
         if self.env is not None:
             env.update(self.env)
         try:
             cp = subprocess.run(
                 args,
-                cwd=str(cwd),
+                cwd=str(cwd) if cwd is not None else None,
                 env=env,
                 capture_output=True,
                 text=True,

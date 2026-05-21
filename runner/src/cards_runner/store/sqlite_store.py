@@ -87,6 +87,14 @@ class SqliteRepository(_SqlCardRepository):
         del message
         self._conn.commit()
 
+    def _column_exists(self, table: str, column: str) -> bool:
+        # `PRAGMA table_info(...)` is the supported way to read SQLite
+        # column lists without parsing `sqlite_master.sql`. Returns one
+        # row per column with `name` in slot 1.
+        cur = self._conn.execute(f"PRAGMA table_info({table})")
+        names = {row["name"] for row in cur.fetchall()}
+        return column in names
+
     def close(self) -> None:
         self._conn.close()
 

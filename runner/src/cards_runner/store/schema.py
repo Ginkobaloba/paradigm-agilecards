@@ -53,6 +53,7 @@ CARD_COLUMNS: tuple[str, ...] = (
     "actual_tokens",
     "story_hash",
     "trace_id",
+    "pr_url",
     "frontmatter_extra",
     "frontmatter_raw",
     "body_md",
@@ -101,6 +102,39 @@ def ddl_statements(dialect: str) -> list[str]:
     raise ValueError(f"unknown dialect {dialect!r}")
 
 
+# ---- column migrations ---------------------------------------------------
+# Columns added after the initial CREATE TABLE. The repository runs these
+# after every `initialize_schema()` to upgrade an existing database whose
+# CREATE TABLE no-ops because the table already exists. The DDL itself
+# carries the new column, so a freshly-created table never needs the
+# migration; the migration is the upgrade path for existing rows.
+#
+# Each entry is `(table, column, sqlite_type, mysql_type)`. Add new
+# columns by appending to this list. Removing or renaming a column needs
+# a real migration tool -- that's out of scope here.
+ADDED_COLUMNS: tuple[tuple[str, str, str, str], ...] = (
+    # chunk 5: pr_url promoted from event payload to a queryable column.
+    ("cards", "pr_url", "TEXT", "VARCHAR(512)"),
+)
+
+
+def added_column_alters(dialect: str) -> list[str]:
+    """Return ALTER TABLE statements for columns the migration adds.
+
+    These are NOT idempotent at the SQL level (both engines raise when
+    re-adding an existing column). The repository wraps each call with a
+    column-existence check, so calling this list against an up-to-date
+    database is a no-op at runtime.
+    """
+    if dialect not in (DIALECT_SQLITE, DIALECT_MYSQL):
+        raise ValueError(f"unknown dialect {dialect!r}")
+    statements: list[str] = []
+    for table, column, sqlite_type, mysql_type in ADDED_COLUMNS:
+        col_type = sqlite_type if dialect == DIALECT_SQLITE else mysql_type
+        statements.append(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+    return statements
+
+
 # --- SQLite DDL ------------------------------------------------------
 # SQLite is dynamically typed; the type names are advisory. Composite
 # primary keys and partial-free indexes are all supported.
@@ -130,6 +164,7 @@ _SQLITE_DDL: list[str] = [
         actual_tokens    INTEGER,
         story_hash       TEXT,
         trace_id         TEXT,
+        pr_url           TEXT,
         frontmatter_extra TEXT NOT NULL DEFAULT '{}',
         frontmatter_raw  TEXT NOT NULL DEFAULT '',
         body_md          TEXT NOT NULL DEFAULT '',
@@ -213,6 +248,7 @@ _MYSQL_DDL: list[str] = [
         actual_tokens    BIGINT,
         story_hash       VARCHAR(128),
         trace_id         VARCHAR(64),
+        pr_url           VARCHAR(512),
         frontmatter_extra LONGTEXT NOT NULL,
         frontmatter_raw  LONGTEXT NOT NULL,
         body_md          LONGTEXT NOT NULL,
@@ -296,6 +332,7 @@ def card_record_to_row(record: CardRecord) -> dict[str, Any]:
         "actual_tokens": record.actual_tokens,
         "story_hash": record.story_hash,
         "trace_id": record.trace_id,
+        "pr_url": record.pr_url,
         "frontmatter_extra": json.dumps(record.frontmatter_extra, sort_keys=True),
         "frontmatter_raw": record.frontmatter_raw,
         "body_md": record.body_md,
@@ -331,6 +368,7 @@ def row_to_card_record(row: dict[str, Any]) -> CardRecord:
         actual_tokens=_opt_int(row.get("actual_tokens")),
         story_hash=_opt_str(row.get("story_hash")),
         trace_id=_opt_str(row.get("trace_id")),
+        pr_url=_opt_str(row.get("pr_url")),
         frontmatter_extra=extra,
         frontmatter_raw=str(row.get("frontmatter_raw") or ""),
         body_md=str(row.get("body_md") or ""),

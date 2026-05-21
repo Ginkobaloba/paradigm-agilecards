@@ -180,6 +180,19 @@ class DaemonConfig:
     # at boot and reclaims any whose process is no longer alive --
     # faster than waiting for the orphan timeout.
     boot_worker_alive_check: bool = True
+    # Chunk 5 unblocker / reviewer / project-config toggles. Each is
+    # off-by-default so chunk-4 callers see no behavior change; the
+    # operator opts in via the CLI flag once the project is ready.
+    pr_unblock_enabled: bool = False
+    sibling_reviewer_enabled: bool = False
+    amendment_reviewer_enabled: bool = False
+    worktree_prune_enabled: bool = False
+    # How often to run `git worktree prune`, in seconds. Default hourly
+    # because the cost (a couple of subprocess calls) is small but the
+    # benefit (cleaning up dead refs accumulated by chunk-3-era git work)
+    # is rare in steady state.
+    worktree_prune_interval_sec: int = 3600
+    project_config_path: Path | None = None
     log_dir: Path | None = None
 
     @property

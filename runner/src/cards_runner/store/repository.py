@@ -34,8 +34,10 @@ from .models import (
     EventType,
 )
 from .schema import (
+    ADDED_COLUMNS,
     BATCH_COUNTER_NAME,
     CARD_COLUMNS,
+    added_column_alters,
     card_record_to_row,
     ddl_statements,
     row_to_card_record,
@@ -297,7 +299,35 @@ class _SqlCardRepository(CardRepository):
     def initialize_schema(self) -> None:
         for statement in ddl_statements(self._dialect):
             self._run_write(statement)
+        self._apply_added_columns()
         self._durable_commit("initialize schema")
+
+    def _apply_added_columns(self) -> None:
+        """Apply ALTER TABLE ADD COLUMN steps that the initial DDL omits.
+
+        For a fresh database the CREATE TABLE already carries every
+        post-chunk-4 column, so the per-column existence check returns
+        True and the ALTER never runs. For an existing database whose
+        CREATE TABLE no-ops (`IF NOT EXISTS`), this loop is the upgrade
+        path -- it lets the runner pick up a new promoted column without
+        forcing the operator to rebuild the store.
+        """
+        statements = added_column_alters(self._dialect)
+        for (table, column, _stype, _mtype), statement in zip(
+            ADDED_COLUMNS, statements
+        ):
+            if self._column_exists(table, column):
+                continue
+            self._run_write(statement)
+
+    @abc.abstractmethod
+    def _column_exists(self, table: str, column: str) -> bool:
+        """True if `column` is present on `table` in the live database.
+
+        Implemented per-engine (`PRAGMA table_info` for SQLite,
+        `SHOW COLUMNS` for MySQL/Dolt) so the migration helper does not
+        need to special-case the dialect string at the call site.
+        """
 
     # ---- cards --------------------------------------------------------
 

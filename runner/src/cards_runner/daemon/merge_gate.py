@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from ..common.canonical_config import TierMap, load_tier_map
+from ..common.project_config import MergeGateRelaxation, ProjectConfig
 from ..common.types import ClaimedCard, DaemonConfig
 from ..store import CardRecord, CardStatus
 from .pr_lifecycle import GhRunner, NullGhRunner
@@ -72,7 +73,10 @@ class MergeOutcome:
 
 
 def decide_gate(
-    record: CardRecord, *, tier_map: TierMap | None = None
+    record: CardRecord,
+    *,
+    tier_map: TierMap | None = None,
+    relaxation: MergeGateRelaxation | None = None,
 ) -> Decision:
     """Pick the gate purely from card frontmatter.
 
@@ -82,6 +86,9 @@ def decide_gate(
        the card's `points`. Routes to `human_review`.
     2. Otherwise route by `points`:
        1-2 -> `auto`, 3-4 -> `sibling_review`, 5-6 -> `human_review`.
+    3. Chunk 5: a project may opt tier 3-4 cards into auto-merge by
+       setting `merge_gate.auto_merge_tier_3_4: true` in its
+       `project.yaml`. The pin override still wins.
 
     The pin override always wins -- the contract is explicit:
     "pin_required: true (set from stakes=high) overrides any
@@ -96,6 +103,8 @@ def decide_gate(
     if points <= 2:
         return "auto"
     if points <= 4:
+        if relaxation is not None and relaxation.auto_merge_tier_3_4:
+            return "auto"
         return "sibling_review"
     return "human_review"
 
@@ -107,6 +116,10 @@ class MergeGate:
     `gh` is injectable; tests pass a fake. `pr_gate_enabled=False`
     short-circuits to the chunk-3 transition (done, merge_status=merged)
     so chunk-3-era tests keep their semantics unchanged.
+
+    Chunk 5: callers pass the live `ProjectConfig` into `apply()` so a
+    mid-run project.yaml reload takes effect immediately. The daemon
+    reads it from `ProjectConfigLoader.current()` each tick.
     """
 
     cfg: DaemonConfig
@@ -119,8 +132,14 @@ class MergeGate:
         record: CardRecord,
         *,
         verified_at: str,
+        project_config: ProjectConfig | None = None,
     ) -> MergeOutcome:
-        decision = decide_gate(record, tier_map=self.tier_map)
+        relaxation = (
+            project_config.merge_gate if project_config else None
+        )
+        decision = decide_gate(
+            record, tier_map=self.tier_map, relaxation=relaxation
+        )
 
         if not self.cfg.pr_gate_enabled:
             # PR gate not wired (the default until a project opts in).
@@ -135,7 +154,18 @@ class MergeGate:
             )
 
         branch = str(record.field_value("branch") or f"card/{record.card_id}")
-        base = str(record.field_value("base_branch") or self.cfg.pr_base_branch_default)
+        # Base branch precedence: card frontmatter > project.yaml > daemon
+        # default. The card-level field wins so a one-off (e.g., a
+        # back-port to a release branch) is still possible without
+        # editing project.yaml.
+        base_override = (
+            relaxation.pr_base_branch if relaxation is not None else None
+        )
+        base = str(
+            record.field_value("base_branch")
+            or base_override
+            or self.cfg.pr_base_branch_default
+        )
         title = self._pr_title(record)
         body = self._pr_body(record, decision=decision, verified_at=verified_at)
 

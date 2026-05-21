@@ -104,6 +104,45 @@ def prepare_worktree(
     _verify_worktree(project_dir, worktree_path)
 
 
+def prune_git_worktrees(
+    *,
+    project_dir: Path,
+    expire_after: str | None = None,
+) -> subprocess.CompletedProcess[str] | None:
+    """Run `git worktree prune` against a project repo.
+
+    Chunk 5 defensive sweep. The chunk-4 forensic reaper deletes the
+    `_runs/<attempt>/` directory tree; that drops the worktree's
+    filesystem but leaves the administrative `.git/worktrees/<id>/`
+    entries that git tracks. `git worktree prune` is the official
+    cleanup verb for those entries -- it removes any whose worktree
+    directory has gone missing.
+
+    Returns the `CompletedProcess` for the operator's log, or None when
+    the project_dir is not a git repository (a skip-git daemon, or a
+    test against a tmp dir). Failures are NOT raised: this is a
+    defensive sweep, and a transient git error should not crash the
+    tick.
+    """
+    if not (project_dir / ".git").exists():
+        log.debug("prune skipped: %s is not a git repository", project_dir)
+        return None
+    args = ["worktree", "prune", "-v"]
+    if expire_after:
+        args.extend(["--expire", expire_after])
+    try:
+        return _run_powershell_git(project_dir, args)
+    except subprocess.CalledProcessError as exc:
+        log.warning(
+            "git worktree prune failed in %s: rc=%s stderr=%r",
+            project_dir, exc.returncode, exc.stderr,
+        )
+        return None
+    except subprocess.TimeoutExpired as exc:
+        log.warning("git worktree prune timed out in %s: %s", project_dir, exc)
+        return None
+
+
 def teardown_worktree(
     *,
     paths: RuntimePaths,

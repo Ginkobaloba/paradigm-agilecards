@@ -302,6 +302,20 @@ class DoltRepository(_SqlCardRepository):
                     return
                 raise
 
+    def _column_exists(self, table: str, column: str) -> bool:
+        # `INFORMATION_SCHEMA.COLUMNS` works on Dolt (MySQL compat) and
+        # is preferable to `SHOW COLUMNS` because it accepts a real
+        # WHERE clause with placeholders instead of a LIKE pattern.
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE table_schema = DATABASE() "
+                "AND table_name = %s AND column_name = %s",
+                (table, column),
+            )
+            row = cur.fetchone() or {"n": 0}
+            return int(row.get("n", 0)) > 0
+
     def close(self) -> None:
         try:
             self._conn.close()

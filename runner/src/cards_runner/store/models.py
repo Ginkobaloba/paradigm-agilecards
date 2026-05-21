@@ -138,6 +138,11 @@ class CardRecord:
     actual_tokens: int | None = None
     story_hash: str | None = None
     trace_id: str | None = None
+    # The merge gate's PR URL, promoted to a queryable column in chunk 5.
+    # NULL until a verifier-pass card with `pr_gate_enabled=True` opens
+    # a PR; the dashboard reads this so the operator can click straight
+    # to the open PR without grepping the event log.
+    pr_url: str | None = None
 
     # The long tail of the ~40-field frontmatter: every key not
     # promoted above. Stored as JSON. Keeps the schema stable against
@@ -188,6 +193,7 @@ _PROMOTED_FIELD_NAMES: frozenset[str] = frozenset({
     "actual_tokens",
     "story_hash",
     "trace_id",
+    "pr_url",
     "status",
 })
 

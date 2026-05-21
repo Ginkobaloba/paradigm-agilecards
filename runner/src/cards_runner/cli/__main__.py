@@ -75,6 +75,85 @@ def main(argv: list[str] | None = None) -> int:
         "leaves the card active (chunk 2 baseline behavior)",
     )
 
+    # Chunk-4 merge-gate flags (added to the CLI in chunk 5).
+    p_start.add_argument(
+        "--pr-gate",
+        action="store_true",
+        help="enable the tier-aware merge gate: route verifier-pass "
+        "cards through `gh pr create` (and `gh pr merge --auto` for "
+        "tier 1-2). Off by default; chunk-3 behavior leaves cards in "
+        "`done` after a verifier pass.",
+    )
+    p_start.add_argument(
+        "--gh", dest="gh_path", default=None,
+        help="path to the gh binary (default: `gh` on PATH)",
+    )
+    p_start.add_argument(
+        "--git", dest="git_path", default=None,
+        help="path to the git binary (default: `git` on PATH)",
+    )
+    p_start.add_argument(
+        "--auto-merge-strategy",
+        choices=("squash", "merge", "rebase"),
+        default=None,
+        help="auto-merge strategy passed to `gh pr merge` (default squash)",
+    )
+    p_start.add_argument(
+        "--pr-base",
+        dest="pr_base_branch_default",
+        default=None,
+        help="default PR base branch (overridden per-card by "
+        "frontmatter.base_branch or by project.yaml; default `main`)",
+    )
+    p_start.add_argument(
+        "--no-boot-alive-check", action="store_true",
+        help="skip the boot-time worker-alive check; fall back to the "
+        "orphan-timeout window for reclaiming dead-worker active cards",
+    )
+    p_start.add_argument(
+        "--forensic-ttl-hours", type=int, default=None,
+        help="forensic run-dir TTL in hours (default 24). 0 disables "
+        "the reaper entirely.",
+    )
+
+    # Chunk-5 unblocker + reviewer flags.
+    p_start.add_argument(
+        "--pr-unblock", action="store_true",
+        help="poll `gh pr view` once per tick for blocked-on-merge cards "
+        "and promote them to `done` when the PR reports MERGED. Off by "
+        "default; production runs typically set this alongside --pr-gate.",
+    )
+    p_start.add_argument(
+        "--sibling-reviewer", action="store_true",
+        help="run the sibling-agent reviewer for tier-3/4 PRs each tick. "
+        "Reads the PR diff + card body, posts `gh pr review`, and (on "
+        "approve) fires `gh pr merge --auto`. Off by default; requires "
+        "the project's project.yaml to also enable it.",
+    )
+    p_start.add_argument(
+        "--amendment-reviewer", action="store_true",
+        help="run the AC-amendment reviewer each tick. Walks "
+        "`amendments` cards, decides approve/deny/comment via the "
+        "configured reviewer client, and routes accordingly. Off by "
+        "default; the project's project.yaml must also enable it.",
+    )
+    p_start.add_argument(
+        "--worktree-prune", action="store_true",
+        help="enable hourly `git worktree prune` sweeps against each "
+        "project the runner touches. Off by default.",
+    )
+    p_start.add_argument(
+        "--worktree-prune-interval-sec", type=int, default=None,
+        help="how often to run the worktree prune sweep, in seconds "
+        "(default 3600). Ignored when --worktree-prune is off.",
+    )
+    p_start.add_argument(
+        "--project-config",
+        dest="project_config_path", type=Path, default=None,
+        help="path to a project.yaml override (default "
+        "`<todo-root>/project.yaml`). Missing file is OK; defaults apply.",
+    )
+
     p_stop = sub.add_parser("stop", help="signal the daemon to drain and exit")
     _add_common(p_stop)
     p_stop.add_argument("--timeout-sec", type=float, default=60.0)
@@ -133,7 +212,7 @@ def _open_store(args: argparse.Namespace) -> CardRepository:
 
 
 def _cmd_start(args: argparse.Namespace) -> int:
-    cfg = DaemonConfig(
+    cfg_kwargs: dict[str, Any] = dict(
         todo_root=args.todo_root,
         store_spec=args.store,
         poll_interval_sec=args.poll_interval_sec,
@@ -144,7 +223,34 @@ def _cmd_start(args: argparse.Namespace) -> int:
         invoker=args.invoker,
         skip_worktree=args.skip_worktree,
         verifier_enabled=not getattr(args, "no_verifier", False),
+        pr_gate_enabled=bool(getattr(args, "pr_gate", False)),
+        pr_unblock_enabled=bool(getattr(args, "pr_unblock", False)),
+        sibling_reviewer_enabled=bool(
+            getattr(args, "sibling_reviewer", False)
+        ),
+        amendment_reviewer_enabled=bool(
+            getattr(args, "amendment_reviewer", False)
+        ),
+        worktree_prune_enabled=bool(getattr(args, "worktree_prune", False)),
+        boot_worker_alive_check=not bool(
+            getattr(args, "no_boot_alive_check", False)
+        ),
     )
+    # Optional overrides; only thread them through when the user passed
+    # one, otherwise the DaemonConfig default applies.
+    for cli_name, cfg_name in (
+        ("gh_path", "gh_path"),
+        ("git_path", "git_path"),
+        ("auto_merge_strategy", "auto_merge_strategy"),
+        ("pr_base_branch_default", "pr_base_branch_default"),
+        ("forensic_ttl_hours", "worktree_forensic_ttl_hours"),
+        ("worktree_prune_interval_sec", "worktree_prune_interval_sec"),
+        ("project_config_path", "project_config_path"),
+    ):
+        value = getattr(args, cli_name, None)
+        if value is not None:
+            cfg_kwargs[cfg_name] = value
+    cfg = DaemonConfig(**cfg_kwargs)
     if args.invoker in ("sdk", "sdk-tools") and not os.environ.get("ANTHROPIC_API_KEY"):
         print(
             "error: --invoker sdk/sdk-tools needs ANTHROPIC_API_KEY in "

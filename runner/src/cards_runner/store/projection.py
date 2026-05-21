@@ -117,6 +117,7 @@ _CANONICAL_FIELD_ORDER: tuple[str, ...] = (
     "branch",
     "base_branch",
     "merge_status",
+    "pr_url",
     "verified_at",
     "verified_by",
     "verifier_skipped_reason",
@@ -263,6 +264,7 @@ _PROMOTABLE_ATTRS: frozenset[str] = frozenset({
     "actual_tokens",
     "story_hash",
     "trace_id",
+    "pr_url",
 })
 
 

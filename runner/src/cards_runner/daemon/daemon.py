@@ -43,6 +43,11 @@ from typing import Any, Optional
 from ..common.locks import FileLock, LockHeldError, pid_alive
 from ..common.logging_setup import setup_daemon_logging
 from ..common.process_group import ManagedProcess
+from ..common.project_config import (
+    ProjectConfig,
+    ProjectConfigLoader,
+    resolve_project_config_path,
+)
 from ..common.types import (
     EXIT_COST_CAP_HALT,
     EXIT_HALT_SIGNAL,
@@ -68,11 +73,19 @@ from ..verifier import VerifierError, VerifierResult, verify_card
 from ..verifier.runner import VERDICT_FAIL, VERDICT_PASS, VERDICT_STANDUP
 from .eligibility import EligibilityResult, evaluate_eligibility
 from .merge_gate import MergeGate, MergeOutcome, build_default_gh_runner
+from .amendment_reviewer import run_amendment_reviews
 from .orphan import reclaim, scan_for_orphans
 from .pr_lifecycle import GhRunner
 from .reaper import reap_forensic_run_dirs
+from .sibling_reviewer import (
+    AnthropicSiblingReviewerClient,
+    SiblingReviewerClient,
+    StaticSiblingReviewerClient,
+    run_sibling_reviews,
+)
 from .spawner import spawn_worker
-from .worktree import WorktreeCreateError, prepare_worktree
+from .unblocker import unblock_merged_cards
+from .worktree import WorktreeCreateError, prepare_worktree, prune_git_worktrees
 
 
 # How many times the daemon re-runs the verifier on a `VerifierError`
@@ -114,6 +127,9 @@ class Daemon:
         *,
         repo: CardRepository | None = None,
         gh: GhRunner | None = None,
+        project_config_loader: ProjectConfigLoader | None = None,
+        sibling_reviewer_client: SiblingReviewerClient | None = None,
+        amendment_reviewer_client: SiblingReviewerClient | None = None,
     ) -> None:
         self.cfg = cfg
         self.paths = RuntimePaths.from_root(cfg.todo_root)
@@ -126,11 +142,28 @@ class Daemon:
         self._owns_repo = repo is None
         self._last_tick_at: float = 0.0
         self._last_tick_summary: dict[str, int] = {}
+        self._last_prune_at: float = 0.0
         # Merge gate. Tests pass a `FakeGhRunner`; production builds use
         # the default subprocess wrapper. When `pr_gate_enabled=False`
         # both the gate and the runner are no-ops by design.
         self._gh: GhRunner = gh if gh is not None else build_default_gh_runner(cfg)
+        # Project config (chunk 5). Tests pass their own loader for
+        # explicit control; production resolves a default path from
+        # `cfg.project_config_path` or `<todo_root>/project.yaml`.
+        if project_config_loader is not None:
+            self._project_loader = project_config_loader
+        else:
+            resolved = resolve_project_config_path(
+                cfg.project_config_path, todo_root=self.paths.todo_root
+            )
+            self._project_loader = ProjectConfigLoader(resolved)
         self._merge_gate = MergeGate(cfg=cfg, gh=self._gh)
+        self._sibling_reviewer_client = sibling_reviewer_client
+        self._amendment_reviewer_client = amendment_reviewer_client
+
+    @property
+    def project_config(self) -> ProjectConfig:
+        return self._project_loader.current()
 
     # ---- lifecycle ----------------------------------------------------
 
@@ -352,7 +385,15 @@ class Daemon:
             "claims": 0,
             "worker_exits": 0,
             "run_dirs_reaped": 0,
+            "unblocked_to_done": 0,
+            "sibling_reviews": 0,
+            "amendment_reviews": 0,
         }
+        # Chunk 5: reload project.yaml at the top of every tick. A
+        # bumped mtime triggers a re-read; no change is a single
+        # stat() call.
+        self._project_loader.reload_if_changed()
+
         # 0. Reap forensic run-dirs whose TTL has expired. Cheap; runs
         #    every tick because the cost of a missed sweep is unbounded
         #    disk growth. Skip silently when the TTL is non-positive.
@@ -368,6 +409,70 @@ class Daemon:
                     summary["run_dirs_reaped"] += 1
         except Exception:  # noqa: BLE001
             log.exception("forensic reaper failed; continuing")
+
+        # 0a. Chunk 5: unblock cards whose external PR has merged. The
+        #     merge gate parks awaiting-merge cards in `blocked` with a
+        #     pr_url; this poll promotes them to `done` once gh reports
+        #     the PR landed. No-op when `pr_unblock_enabled=False`.
+        try:
+            decisions = unblock_merged_cards(
+                repo=self.repo,
+                gh=self._gh,
+                cfg=self.cfg,
+                actor_id=f"cards-runner-daemon@pid{os.getpid()}",
+                tenant_id=self.tenant_id,
+            )
+            for d in decisions:
+                if d.action == "unblocked":
+                    summary["unblocked_to_done"] += 1
+        except Exception:  # noqa: BLE001
+            log.exception("pr unblocker failed; continuing")
+
+        # 0b. Chunk 5: `git worktree prune` sweep. The chunk-4 reaper
+        #     deletes the `_runs/<attempt>/` tree; this drops the dead
+        #     administrative `.git/worktrees/<id>/` entries that the
+        #     project repo still tracks. Rate-limited by
+        #     `worktree_prune_interval_sec`; off by default.
+        if self.cfg.worktree_prune_enabled:
+            self._maybe_prune_git_worktrees()
+
+        # 0c. Chunk 5: sibling-agent reviewer for tier-3/4 PRs.
+        #     Walks blocked/requires_review cards and posts a gh review.
+        #     No-op when the host knob or the project knob is False.
+        try:
+            outcomes = run_sibling_reviews(
+                repo=self.repo,
+                gh=self._gh,
+                cfg=self.cfg,
+                paths=self.paths,
+                reviewer_client=self._build_sibling_reviewer_client(),
+                reviewer_config=self.project_config.sibling_reviewer,
+                tenant_id=self.tenant_id,
+            )
+            for o in outcomes:
+                if o.action == "reviewed":
+                    summary["sibling_reviews"] += 1
+        except Exception:  # noqa: BLE001
+            log.exception("sibling reviewer sweep failed; continuing")
+
+        # 0d. Chunk 5: AC-amendment reviewer for `amendments` cards.
+        #     Walks amendments-status cards, reviews their change_request
+        #     blocks, and routes approve/deny/comment. No-op when both
+        #     toggles are off.
+        try:
+            amend_outcomes = run_amendment_reviews(
+                repo=self.repo,
+                cfg=self.cfg,
+                paths=self.paths,
+                reviewer_client=self._build_amendment_reviewer_client(),
+                reviewer_config=self.project_config.amendment_reviewer,
+                tenant_id=self.tenant_id,
+            )
+            for o in amend_outcomes:
+                if o.action.startswith("reviewed_"):
+                    summary["amendment_reviews"] += 1
+        except Exception:  # noqa: BLE001
+            log.exception("amendment reviewer sweep failed; continuing")
 
         # 1. Reap exited workers; this frees parallelism slots and
         #    lands their results in the store.
@@ -445,6 +550,7 @@ class Daemon:
             cfg=self.cfg,
             paths=self.paths,
             tenant_id=self.tenant_id,
+            project_config=self.project_config,
         )
         if outcome.action == "claim":
             return True
@@ -1197,7 +1303,9 @@ class Daemon:
             log.error("card %s vanished before merge gate", claim.card_id)
             return
 
-        outcome = self._merge_gate.apply(claim, record, verified_at=now)
+        outcome = self._merge_gate.apply(
+            claim, record, verified_at=now, project_config=self.project_config
+        )
         self._apply_merge_outcome(
             claim,
             outcome,
@@ -1215,6 +1323,11 @@ class Daemon:
     ) -> None:
         """Land the merge gate's decision as a card transition + event."""
         fields: dict[str, Any] = {"merge_status": outcome.merge_status}
+        if outcome.pr_url:
+            # Chunk 5: promote the PR URL to a queryable column on the
+            # card row so the dashboard and the unblocker can read it
+            # without grepping the event log.
+            fields["pr_url"] = outcome.pr_url
         # Clear the claim provenance once the card leaves `active`. The
         # next reclaim (or future re-attempt after a blocked-on-merge
         # card unblocks) should be clean.
@@ -1467,3 +1580,81 @@ class Daemon:
             if handle.claim.card_id == card_id:
                 return handle
         return None
+
+    # ---- chunk 5: sibling-reviewer client builder --------------------
+
+    def _build_sibling_reviewer_client(self) -> SiblingReviewerClient:
+        """Return the live sibling-reviewer client.
+
+        Tests inject an explicit client via the constructor; production
+        defaults to the Anthropic-backed implementation when
+        ANTHROPIC_API_KEY is present, otherwise a static one whose
+        decisions are always `comment` (so the marker still lands but
+        no auto-merge fires).
+        """
+        if self._sibling_reviewer_client is not None:
+            return self._sibling_reviewer_client
+        client = self._build_subjective_client()
+        if client is not None:
+            return AnthropicSiblingReviewerClient(client=client)
+        log.info(
+            "no Anthropic client available; sibling reviewer will use the "
+            "static no-opinion fallback"
+        )
+        return StaticSiblingReviewerClient()
+
+    def _build_amendment_reviewer_client(self) -> SiblingReviewerClient:
+        """Mirror of `_build_sibling_reviewer_client` for the amendments
+        sweep -- the AC amendment reviewer is structurally the same kind
+        of small LLM call against a card + amendment payload."""
+        if self._amendment_reviewer_client is not None:
+            return self._amendment_reviewer_client
+        client = self._build_subjective_client()
+        if client is not None:
+            return AnthropicSiblingReviewerClient(client=client)
+        log.info(
+            "no Anthropic client available; amendment reviewer will use "
+            "the static no-opinion fallback"
+        )
+        return StaticSiblingReviewerClient()
+
+    # ---- chunk 5: git worktree prune sweep ---------------------------
+
+    def _maybe_prune_git_worktrees(self) -> None:
+        """Run `git worktree prune` per project once the interval elapses.
+
+        The runner does not (today) track the set of project repos
+        explicitly; we derive it from the distinct `project` fields on
+        live cards. A project with zero cards in the store contributes
+        nothing -- which is correct, the runner has nothing to clean up
+        there.
+        """
+        if self.cfg.skip_worktree:
+            return  # tests run against tmp dirs, never against a real git repo.
+        if self.cfg.worktree_prune_interval_sec <= 0:
+            return
+        now = time.monotonic()
+        if self._last_prune_at and now - self._last_prune_at < (
+            self.cfg.worktree_prune_interval_sec
+        ):
+            return
+        seen: set[Path] = set()
+        for record in self.repo.query_cards(tenant_id=self.tenant_id):
+            project = record.project
+            if not project:
+                continue
+            try:
+                project_dir = Path(project).resolve()
+            except OSError:
+                continue
+            if project_dir in seen:
+                continue
+            seen.add(project_dir)
+            try:
+                prune_git_worktrees(project_dir=project_dir)
+            except Exception:  # noqa: BLE001 - defensive sweep.
+                log.exception(
+                    "worktree prune sweep failed for %s; continuing",
+                    project_dir,
+                )
+        self._last_prune_at = now

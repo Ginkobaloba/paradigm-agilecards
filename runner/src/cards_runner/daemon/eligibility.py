@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from ..common.project_config import ProjectConfig
 from ..common.types import DaemonConfig, RuntimePaths
 from ..store import DEFAULT_TENANT, CardRecord, CardRepository, CardStatus
 
@@ -72,6 +73,7 @@ def evaluate_eligibility(
     cfg: DaemonConfig,
     paths: RuntimePaths,
     tenant_id: str = DEFAULT_TENANT,
+    project_config: ProjectConfig | None = None,
 ) -> EligibilityResult:
     """Apply the contract's three checks. Returns the resulting action.
 
@@ -81,12 +83,18 @@ def evaluate_eligibility(
     blocked regardless of dependency state; dependencies are checked
     last because they are the most common skip reason and the cheapest
     to re-evaluate next tick.
+
+    Chunk 5: `project_config` is now consulted as the fallback story
+    source path when the card frontmatter omits it. The contract calls
+    this out ("If the project config sets `story_source_path`, the
+    runner ... compares against the card's `story_hash`"); chunk 4 only
+    read the per-card field.
     """
     approval = _check_pre_approval(record, paths=paths)
     if approval is not None:
         return approval
 
-    drift = _check_story_drift(record, cfg=cfg)
+    drift = _check_story_drift(record, cfg=cfg, project_config=project_config)
     if drift is not None:
         return drift
 
@@ -121,9 +129,12 @@ def _check_pre_approval(
 
 
 def _check_story_drift(
-    record: CardRecord, *, cfg: DaemonConfig
+    record: CardRecord,
+    *,
+    cfg: DaemonConfig,
+    project_config: ProjectConfig | None = None,
 ) -> EligibilityResult | None:
-    source_path = _resolve_story_source_path(record, cfg)
+    source_path = _resolve_story_source_path(record, cfg, project_config)
     if source_path is None:
         return None
     declared_hash = record.field_value("story_hash")
@@ -162,34 +173,36 @@ def _check_story_drift(
 
 
 def _resolve_story_source_path(
-    record: CardRecord, cfg: DaemonConfig
+    record: CardRecord,
+    cfg: DaemonConfig,
+    project_config: ProjectConfig | None,
 ) -> Path | None:
     """Resolve where the card's source story lives, if anywhere.
 
     Precedence:
 
     1. `card.story_source_path` in the frontmatter (planner stamped).
-    2. `card.project / story_source_path_relative` when the card carries
-       a relative path plus a project.
+    2. `project_config.story_source_path` (chunk 5 fallback for cards
+       whose planner did not stamp the field).
     3. None.
 
-    The daemon does not (yet) carry a per-project map of story source
-    paths; chunk 5 will add one if it turns out cards routinely omit
-    the field. For now the planner is expected to stamp it -- the
-    /cards skill already writes `story_source_path` when the planner
-    runs against a real file rather than ad-hoc text.
+    Relative paths are resolved against the card's `project` when set;
+    that keeps a `docs/source.md` style entry working without absolute
+    paths in either the card or the project config.
     """
     raw = record.field_value("story_source_path")
-    if raw:
-        try:
-            path = Path(str(raw)).expanduser()
-        except Exception:  # noqa: BLE001
-            return None
-        if not path.is_absolute() and record.project:
-            path = Path(record.project) / path
-        return path
-    del cfg  # reserved for future per-project maps.
-    return None
+    if not raw and project_config is not None:
+        raw = project_config.story_source_path
+    if not raw:
+        del cfg  # reserved for further future per-project maps.
+        return None
+    try:
+        path = Path(str(raw)).expanduser()
+    except Exception:  # noqa: BLE001
+        return None
+    if not path.is_absolute() and record.project:
+        path = Path(record.project) / path
+    return path
 
 
 def _sha256_of_file(path: Path) -> str:
