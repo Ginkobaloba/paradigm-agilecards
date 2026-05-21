@@ -76,6 +76,19 @@ async function request<T>(
   return payload as T;
 }
 
+export interface RankRow {
+  cardId: string;
+  status: StatusId;
+  rank: number;
+}
+
+export interface MoveResponse {
+  id: string;
+  file: string;
+  status: StatusId;
+  rank?: number;
+}
+
 export const api = {
   health: (): Promise<{ ok: boolean; cardsDir: string; version: string }> =>
     request("/healthz"),
@@ -87,11 +100,24 @@ export const api = {
   getCard: (id: string): Promise<CardDetail> =>
     request(`/api/cards/${encodeURIComponent(id)}`),
 
-  moveCard: (id: string, status: StatusId): Promise<CardSummary> =>
+  moveCard: (id: string, status: StatusId): Promise<MoveResponse> =>
     request(`/api/cards/${encodeURIComponent(id)}/move`, {
       method: "POST",
       body: JSON.stringify({ status }),
     }),
 
   listRates: (): Promise<import("./cost").RatesPayload> => request("/api/rates"),
+
+  listRanks: (): Promise<{ ranks: RankRow[] }> => request("/api/ranks"),
+
+  setRank: (
+    id: string,
+    status: StatusId,
+    prevId: string | null,
+    nextId: string | null
+  ): Promise<{ cardId: string; status: StatusId; rank: number }> =>
+    request(`/api/cards/${encodeURIComponent(id)}/rank`, {
+      method: "POST",
+      body: JSON.stringify({ status, prevId, nextId }),
+    }),
 };

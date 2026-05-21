@@ -11,6 +11,7 @@ import { useStore } from "../state/store";
 
 export function useCards(authed: boolean) {
   const setAll = useStore((s) => s.setAll);
+  const setAllRanks = useStore((s) => s.setAllRanks);
   const hydrated = useStore((s) => s.hydrated);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -20,15 +21,21 @@ export function useCards(authed: boolean) {
     setLoading(true);
     setError(null);
     try {
-      const res = await api.listCards();
-      setAll(res.cards);
+      // Cards and ranks are independent endpoints; fetch them in
+      // parallel so the first paint waits on the slower of the two.
+      const [cardsRes, ranksRes] = await Promise.all([
+        api.listCards(),
+        api.listRanks().catch(() => ({ ranks: [] })),
+      ]);
+      setAll(cardsRes.cards);
+      setAllRanks(ranksRes.ranks);
     } catch (err) {
       if (err instanceof ApiError) setError(err.message);
       else setError(String(err));
     } finally {
       setLoading(false);
     }
-  }, [authed, setAll]);
+  }, [authed, setAll, setAllRanks]);
 
   useEffect(() => {
     void refresh();

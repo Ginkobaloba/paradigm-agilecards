@@ -43,6 +43,7 @@ export function getDb(): Db {
 }
 
 function migrate(db: Db): void {
+  // Schema v1: the original tables.
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
       version INTEGER PRIMARY KEY,
@@ -84,9 +85,25 @@ function migrate(db: Db): void {
     CREATE INDEX IF NOT EXISTS idx_tokens_label    ON tokens (label);
     CREATE INDEX IF NOT EXISTS idx_sprint_cards_card ON sprint_cards (card_id);
   `);
-
-  // Mark schema v1 applied. When we change the schema, we add v2 etc.
   db.prepare(
     `INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)`
   ).run(1);
+
+  // Schema v2: per-card manual rank within a column. Disk file remains
+  // the work definition; rank is a presentation concern that lives in
+  // SQLite so a drag-reorder doesn't churn frontmatter or git diffs.
+  // See roadmap fork A.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS card_rank (
+      card_id    TEXT    PRIMARY KEY,
+      status     TEXT    NOT NULL,
+      rank       REAL    NOT NULL,
+      updated_at TEXT    NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_card_rank_status_rank
+      ON card_rank (status, rank);
+  `);
+  db.prepare(
+    `INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)`
+  ).run(2);
 }

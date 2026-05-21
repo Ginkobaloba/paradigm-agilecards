@@ -6,6 +6,7 @@
 
 import { Router, type Request, type Response } from "express";
 
+import { appendRank } from "../db/ranks.js";
 import { getCard, getColumns, listCards, moveCard, STATUSES, type StatusId } from "../fs/cards.js";
 
 const VALID_STATUSES = new Set<string>(STATUSES.map((s) => s.id));
@@ -70,10 +71,16 @@ export function cardsRouter(): Router {
     }
     try {
       const moved = moveCard(id, status);
+      // Cross-column moves drop the old rank and append at the bottom of
+      // the new column. Same-column "moves" don't go through this route
+      // (moveCard returns early on no-op), so we never overwrite an
+      // existing rank with an append from this path.
+      const newRank = appendRank(moved.id, moved.status);
       res.json({
         id: moved.id,
         file: moved.file,
         status: moved.status,
+        rank: newRank,
       });
     } catch (err) {
       res.status(409).json({ error: String(err) });

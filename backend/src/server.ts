@@ -16,6 +16,7 @@ import { getDb } from "./db/sqlite.js";
 import { startWatcher } from "./fs/cards.js";
 import { getAuthContext, requireAuth } from "./routes/auth.js";
 import { cardsRouter } from "./routes/cards.js";
+import { ranksRouter } from "./routes/ranks.js";
 import { ratesRouter } from "./routes/rates.js";
 import { retrosRouter } from "./routes/retros.js";
 import { sprintsRouter } from "./routes/sprints.js";
@@ -74,6 +75,7 @@ function main(): void {
   // Everything below is gated.
   app.use("/api", requireAuth);
   app.use("/api", cardsRouter());
+  app.use("/api", ranksRouter());
   app.use("/api", ratesRouter());
   app.use("/api", sprintsRouter());
   app.use("/api", retrosRouter());

@@ -14,10 +14,18 @@
 
 import { create } from "zustand";
 
-import type { CardSummary, StatusId } from "../lib/api";
+import type { CardSummary, RankRow, StatusId } from "../lib/api";
+
+export interface CardRank {
+  status: StatusId;
+  rank: number;
+}
 
 interface State {
   cards: Record<string, CardSummary>;
+  // Per-card manual rank, keyed by card id. Loaded from /api/ranks at
+  // boot and patched in response to drag-reorder and move calls.
+  ranks: Record<string, CardRank>;
   // ids currently being moved by this client. Used to suppress
   // server-side echoes while the optimistic update is in place.
   inFlight: Set<string>;
@@ -28,10 +36,13 @@ interface State {
   remove: (id: string) => void;
   optimisticMove: (id: string, status: StatusId) => void;
   markInFlight: (id: string, on: boolean) => void;
+  setAllRanks: (rows: RankRow[]) => void;
+  patchRank: (cardId: string, status: StatusId, rank: number) => void;
 }
 
 export const useStore = create<State>((set) => ({
   cards: {},
+  ranks: {},
   inFlight: new Set<string>(),
   hydrated: false,
 
@@ -50,7 +61,11 @@ export const useStore = create<State>((set) => ({
       if (!(id in s.cards)) return s;
       const next = { ...s.cards };
       delete next[id];
-      return { cards: next };
+      // Drop the rank entry too; on re-add the server will append a
+      // fresh rank.
+      const ranks = { ...s.ranks };
+      delete ranks[id];
+      return { cards: next, ranks };
     }),
 
   optimisticMove: (id, status) =>
@@ -69,6 +84,16 @@ export const useStore = create<State>((set) => ({
       else next.delete(id);
       return { inFlight: next };
     }),
+
+  setAllRanks: (rows) =>
+    set(() => {
+      const next: Record<string, CardRank> = {};
+      for (const r of rows) next[r.cardId] = { status: r.status, rank: r.rank };
+      return { ranks: next };
+    }),
+
+  patchRank: (cardId, status, rank) =>
+    set((s) => ({ ranks: { ...s.ranks, [cardId]: { status, rank } } })),
 }));
 
 export function selectCardsByStatus(
@@ -79,7 +104,19 @@ export function selectCardsByStatus(
   for (const c of Object.values(state.cards)) {
     if (c.status === status) out.push(c);
   }
-  out.sort((a, b) => a.id.localeCompare(b.id));
+  // Rank-aware sort: persisted ranks first (ascending), then unranked
+  // cards by id. New cards (no rank yet) fall to the bottom so the
+  // operator sees the curated order until they reorder explicitly.
+  out.sort((a, b) => {
+    const ra = state.ranks[a.id]?.rank;
+    const rb = state.ranks[b.id]?.rank;
+    const hasA = typeof ra === "number";
+    const hasB = typeof rb === "number";
+    if (hasA && hasB) return ra! - rb!;
+    if (hasA) return -1;
+    if (hasB) return 1;
+    return a.id.localeCompare(b.id);
+  });
   return out;
 }
 

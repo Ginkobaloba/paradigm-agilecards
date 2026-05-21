@@ -9,7 +9,13 @@ import { type ReactNode, useEffect, useMemo, useState } from "react";
 
 import { CardModal } from "../components/CardModal";
 import { Column } from "../components/Column";
-import { api, ApiError, type Column as ColumnDef, type StatusId } from "../lib/api";
+import {
+  api,
+  ApiError,
+  type CardSummary,
+  type Column as ColumnDef,
+  type StatusId,
+} from "../lib/api";
 import type { RatesPayload } from "../lib/cost";
 import { selectCardsByStatus, useStore } from "../state/store";
 
@@ -37,6 +43,7 @@ export function Kanban({ loading, error, rates }: Props) {
   const hydrated = useStore((s) => s.hydrated);
   const optimisticMove = useStore((s) => s.optimisticMove);
   const markInFlight = useStore((s) => s.markInFlight);
+  const patchRank = useStore((s) => s.patchRank);
 
   const [columns, setColumns] = useState<ColumnDef[]>(COLUMN_FALLBACK);
   const [openCard, setOpenCard] = useState<string | null>(null);
@@ -52,21 +59,24 @@ export function Kanban({ loading, error, rates }: Props) {
   }, []);
 
   const cardsByStatus = useMemo(() => {
-    const acc: Record<StatusId, ReturnType<typeof selectCardsByStatus>> = {
+    const acc: Record<StatusId, CardSummary[]> = {
       backlog: [],
       active: [],
       awaiting_amendment_review: [],
       done: [],
       blocked: [],
     };
-    for (const c of Object.values(cards)) {
-      acc[c.status].push(c);
-    }
-    for (const k of Object.keys(acc) as StatusId[]) {
-      acc[k].sort((a, b) => a.id.localeCompare(b.id));
+    // Use the store's selector so the rank-aware ordering matches what
+    // the columns render.
+    const state = useStore.getState();
+    for (const s of Object.keys(acc) as StatusId[]) {
+      acc[s] = selectCardsByStatus(state, s);
     }
     return acc;
-  }, [cards]);
+    // `cards` is intentionally a dep so a card change triggers re-sort.
+    // We also re-run on rank state changes via the same channel.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cards, useStore((s) => s.ranks)]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } })
@@ -75,33 +85,85 @@ export function Kanban({ loading, error, rates }: Props) {
   const onDragEnd = async (e: DragEndEvent): Promise<void> => {
     if (!e.over) return;
     const cardId = String(e.active.id);
-    const targetStatus = e.over.id as StatusId;
-    if (!isStatusId(targetStatus)) return;
+    const overId = String(e.over.id);
 
-    const card = cards[cardId];
-    if (!card || card.status === targetStatus) return;
+    const active = cards[cardId];
+    if (!active) return;
 
-    // Optimistic UI: move the card in the store immediately, then call
-    // the API. SSE will echo back the canonical state; the store
-    // reconciles by id.
-    optimisticMove(cardId, targetStatus);
-    markInFlight(cardId, true);
+    // Two arms based on what we dropped *on*:
+    //   - a column id (status) -> empty drop zone in that column
+    //   - a card id            -> dropped on/near another card
+
+    if (isStatusId(overId)) {
+      if (active.status === overId) return; // same-column empty-area: no-op
+      await runMove(active, overId);
+      return;
+    }
+
+    const overCard = cards[overId];
+    if (!overCard) return;
+
+    if (overCard.status !== active.status) {
+      // Cross-column drop onto another card.
+      await runMove(active, overCard.status);
+      return;
+    }
+
+    // Same-column reorder. Work out the new neighbor ids and POST a
+    // rank update. Determine direction by comparing original indices in
+    // the sorted column.
+    const column = cardsByStatus[active.status];
+    const activeIdx = column.findIndex((c) => c.id === active.id);
+    const overIdx = column.findIndex((c) => c.id === overCard.id);
+    if (activeIdx < 0 || overIdx < 0 || activeIdx === overIdx) return;
+
+    const movingDown = activeIdx < overIdx;
+    let prevId: string | null;
+    let nextId: string | null;
+    if (movingDown) {
+      // Land after over.
+      prevId = overCard.id;
+      nextId = column[overIdx + 1]?.id ?? null;
+    } else {
+      // Land before over.
+      prevId = column[overIdx - 1]?.id ?? null;
+      nextId = overCard.id;
+    }
+
     try {
-      await api.moveCard(cardId, targetStatus);
+      const res = await api.setRank(active.id, active.status, prevId, nextId);
+      patchRank(active.id, active.status, res.rank);
+      setMoveError(null);
+    } catch (err) {
+      setMoveError(err instanceof ApiError ? err.message : String(err));
+    }
+  };
+
+  const runMove = async (
+    card: CardSummary,
+    targetStatus: StatusId
+  ): Promise<void> => {
+    optimisticMove(card.id, targetStatus);
+    markInFlight(card.id, true);
+    try {
+      const res = await api.moveCard(card.id, targetStatus);
+      if (typeof res.rank === "number") {
+        patchRank(card.id, targetStatus, res.rank);
+      }
       setMoveError(null);
     } catch (err) {
       // Roll back. Refetching the canonical card is the safest path; we
       // could also flip the store back to `card.status`, but the API
       // round-trip removes any ambiguity if the failure was partial.
       try {
-        const fresh = await api.getCard(cardId);
+        const fresh = await api.getCard(card.id);
         useStore.getState().upsert(fresh);
       } catch {
-        optimisticMove(cardId, card.status);
+        optimisticMove(card.id, card.status);
       }
       setMoveError(err instanceof ApiError ? err.message : String(err));
     } finally {
-      markInFlight(cardId, false);
+      markInFlight(card.id, false);
     }
   };
 

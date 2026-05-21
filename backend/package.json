@@ -11,7 +11,7 @@
     "dev": "tsx watch src/server.ts",
     "start": "node dist/server.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --import tsx --test src/routes/stories.test.ts src/cost/rates.test.ts",
+    "test": "node --import tsx --test src/routes/stories.test.ts src/cost/rates.test.ts src/db/ranks.test.ts",
     "create-token": "tsx scripts/create-token.ts",
     "list-tokens": "tsx scripts/list-tokens.ts",
     "revoke-token": "tsx scripts/revoke-token.ts",

@@ -1,8 +1,10 @@
 import { useDroppable } from "@dnd-kit/core";
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { useMemo, useState } from "react";
 
 import type { CardSummary, StatusId } from "../lib/api";
-import { formatCost, type RatesPayload, rollupCost } from "../lib/cost";
+import { cardCost, formatCost, type RatesPayload, rollupCost } from "../lib/cost";
+import { cardPoints } from "../lib/parseCard";
 import { statusDotClass } from "../lib/tierBadge";
 import { CardTile } from "./CardTile";
 
@@ -15,12 +17,57 @@ interface Props {
 }
 
 /**
+ * Sort modes the column header dropdown can pick from. "rank" is the
+ * default and corresponds to the manual drag-to-reorder rank persisted
+ * server-side; the other modes are display-only and don't write back.
+ *
+ * Heartbeat is on the roadmap but defers to the agent-fleet pass --
+ * the dashboard doesn't surface `claimed_by` heartbeats yet.
+ */
+type SortMode = "rank" | "created" | "tier" | "cost";
+
+const SORT_LABELS: Record<SortMode, string> = {
+  rank: "Rank",
+  created: "Created",
+  tier: "Tier",
+  cost: "Cost",
+};
+
+const SORT_ORDER: SortMode[] = ["rank", "created", "tier", "cost"];
+
+/**
  * A column of cards. Droppable via dnd-kit. Children are wrapped in a
  * SortableContext so each card is draggable.
  */
 export function Column({ id, label, cards, onOpenCard, rates }: Props) {
   const { setNodeRef, isOver } = useDroppable({ id });
+  const [sortMode, setSortMode] = useState<SortMode>("rank");
   const rollup = rollupCost(cards, rates.rates, rates.defaultInputRatio);
+
+  const sortedCards = useMemo(() => {
+    if (sortMode === "rank") return cards; // already rank-sorted upstream
+    const arr = [...cards];
+    switch (sortMode) {
+      case "created":
+        arr.sort((a, b) => a.id.localeCompare(b.id));
+        break;
+      case "tier":
+        arr.sort((a, b) => {
+          const ta = cardPoints(a) ?? -Infinity;
+          const tb = cardPoints(b) ?? -Infinity;
+          return tb - ta; // tier descending: higher tier first
+        });
+        break;
+      case "cost":
+        arr.sort((a, b) => {
+          const ca = cardCost(a, rates.rates, rates.defaultInputRatio).usd;
+          const cb = cardCost(b, rates.rates, rates.defaultInputRatio).usd;
+          return cb - ca; // cost descending
+        });
+        break;
+    }
+    return arr;
+  }, [cards, sortMode, rates]);
 
   return (
     <div
@@ -52,14 +99,16 @@ export function Column({ id, label, cards, onOpenCard, rates }: Props) {
           <span className="rounded-full border border-border bg-panel2 px-1.5 py-0.5 text-[11px] tabular-nums text-muted">
             {cards.length}
           </span>
+          <SortPicker mode={sortMode} onChange={setSortMode} />
         </div>
       </div>
       <div className="flex flex-1 flex-col gap-2 overflow-y-auto p-2">
         <SortableContext
-          items={cards.map((c) => c.id)}
+          items={sortedCards.map((c) => c.id)}
           strategy={verticalListSortingStrategy}
+          disabled={sortMode !== "rank"}
         >
-          {cards.length === 0 ? (
+          {sortedCards.length === 0 ? (
             <div
               className={[
                 "m-1 rounded border border-dashed py-10 text-center text-[11px]",
@@ -71,7 +120,7 @@ export function Column({ id, label, cards, onOpenCard, rates }: Props) {
               {isOver ? "Drop to move here" : "No cards"}
             </div>
           ) : (
-            cards.map((c) => (
+            sortedCards.map((c) => (
               <CardTile
                 key={c.id}
                 card={c}
@@ -83,6 +132,35 @@ export function Column({ id, label, cards, onOpenCard, rates }: Props) {
         </SortableContext>
       </div>
     </div>
+  );
+}
+
+function SortPicker({
+  mode,
+  onChange,
+}: {
+  mode: SortMode;
+  onChange: (m: SortMode) => void;
+}) {
+  return (
+    <label
+      className="flex items-center gap-1 rounded border border-border bg-panel2 px-1 py-0.5 text-[10px] text-muted"
+      title="sort cards within this column"
+    >
+      <span className="uppercase tracking-wider opacity-70">sort</span>
+      <select
+        value={mode}
+        onChange={(e) => onChange(e.target.value as SortMode)}
+        className="bg-transparent text-text outline-none focus:outline-none cursor-pointer pr-0.5"
+        aria-label="column sort mode"
+      >
+        {SORT_ORDER.map((m) => (
+          <option key={m} value={m} className="bg-panel2 text-text">
+            {SORT_LABELS[m]}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
 
