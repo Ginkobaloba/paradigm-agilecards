@@ -1,15 +1,17 @@
 """`cards-runner` CLI.
 
-Surfaces the minimal subset the chunk asks for:
+Surfaces:
 
 - `start`   boot the daemon (foreground)
 - `stop`    signal the daemon to drain and exit
 - `status`  print daemon state plus per-status card counts
 - `reclaim` force-reclaim a specific `active` card back to `backlog`
+- `doctor`  diagnostic dump: resolved binaries, project config,
+            schema migration status, knob settings (chunk 6c)
 
-Chunks 3-4 will add `verify`, `approve`, `pause`, `resume`, `doctor`,
-and `pricing reload`. After the chunk 2b cutover `status` and
-`reclaim` read the card store, not a filesystem tree.
+Chunks 7+ may add `verify`, `approve`, `pause`, `resume`, and
+`pricing reload`. After the chunk 2b cutover `status` and `reclaim`
+read the card store, not a filesystem tree.
 """
 from __future__ import annotations
 
@@ -173,6 +175,22 @@ def main(argv: list[str] | None = None) -> int:
         help="skip the interactive confirmation",
     )
 
+    p_doctor = sub.add_parser(
+        "doctor",
+        help="diagnostic dump: resolved binaries, project config, "
+        "schema migration status, knob settings",
+    )
+    _add_common(p_doctor)
+    p_doctor.add_argument(
+        "--json", action="store_true",
+        help="JSON output (default: human-readable text)",
+    )
+    p_doctor.add_argument(
+        "--skip-store", action="store_true",
+        help="skip the card-store schema introspection (does not open "
+        "the store; useful when the store is locked by a running daemon)",
+    )
+
     args = parser.parse_args(argv)
     if args.cmd == "start":
         return _cmd_start(args)
@@ -182,6 +200,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_status(args)
     if args.cmd == "reclaim":
         return _cmd_reclaim(args)
+    if args.cmd == "doctor":
+        return _cmd_doctor(args)
     parser.error(f"unknown subcommand {args.cmd}")
     return 2  # unreachable
 
@@ -367,6 +387,39 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
     finally:
         repo.close()
     print(f"reclaimed: {record.card_id} (status={record.status})")
+    return 0
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    from . import doctor as _doctor
+
+    cfg = DaemonConfig(
+        todo_root=args.todo_root,
+        store_spec=args.store or "",
+    )
+    repo: CardRepository | None = None
+    if not args.skip_store:
+        try:
+            repo = _open_store(args)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"warning: could not open card store ({exc}); "
+                "running doctor with --skip-store semantics",
+                file=sys.stderr,
+            )
+    try:
+        report = _doctor.build_report(
+            cfg,
+            repo=repo,
+            dolt_bin_env=os.environ.get("CARDS_DOLT_BIN"),
+        )
+    finally:
+        if repo is not None:
+            repo.close()
+    if args.json:
+        print(_doctor.render_json(report))
+    else:
+        print(_doctor.render_text(report), end="")
     return 0
 
 
