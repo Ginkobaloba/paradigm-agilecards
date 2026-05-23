@@ -57,6 +57,13 @@ from ..store import (
     EventType,
 )
 from .pr_lifecycle import GhRunner
+from .reviewer_cost import (
+    ReviewerUsage,
+    attribute_to_card,
+    estimate_call_cost_usd,
+    would_exceed_card_cap,
+    would_exceed_reviewer_cap,
+)
 
 
 log = logging.getLogger(__name__)
@@ -73,6 +80,11 @@ class ReviewerDecision:
     scale. The default sibling-reviewer client refuses to emit
     `approve` below 0.7 (it degrades to `comment` with the same
     reasoning); operators can tune that floor via the project config.
+
+    Chunk 6b: `usage` carries the reviewer's token spend for cost
+    attribution. The Anthropic-backed client populates it from
+    `response.usage`; the static test client defaults to None (no
+    observable spend) so existing tests don't change.
     """
 
     decision: Decision
@@ -80,6 +92,7 @@ class ReviewerDecision:
     confidence: float = 0.0
     model_used: str = ""
     actual_cost_usd: float | None = None
+    usage: ReviewerUsage | None = None
 
 
 class SiblingReviewerClient(Protocol):
@@ -142,10 +155,12 @@ class AnthropicSiblingReviewerClient:
 
     `client` is an `anthropic.Anthropic` instance; the daemon
     constructs one in `_build_subjective_client()` for the verifier and
-    we accept the same one here.  This is intentionally a small
-    one-shot reviewer; cost-cap tracking lives in `worker_stub.cost`
-    and is NOT (yet) wired in here -- the reviewer's spend is bounded
-    by Anthropic's max-tokens setting per call.
+    we accept the same one here. Chunk 6b wires the reviewer's spend
+    into the card: every call extracts `response.usage` into a
+    `ReviewerUsage` and the caller threads it through `attribute_to_card`
+    so the card's `actual_tokens` reflects reviewer-side spend. Pre-call
+    cap checking lives in `run_sibling_reviews` (not here) because the
+    card record is available there and not at this layer.
     """
 
     client: Any  # anthropic.Anthropic
@@ -181,6 +196,7 @@ class AnthropicSiblingReviewerClient:
                 reasoning=f"reviewer call failed: {exc}",
                 confidence=0.0,
             )
+        usage = ReviewerUsage.from_response(response, model_id=reviewer.model_id)
         text = _extract_text(response)
         decision = _parse_decision(text)
         if decision.decision == "approve" and decision.confidence < 0.7:
@@ -193,21 +209,34 @@ class AnthropicSiblingReviewerClient:
                 ),
                 confidence=decision.confidence,
                 model_used=reviewer.model_id,
+                actual_cost_usd=usage.cost_usd,
+                usage=usage,
             )
         return ReviewerDecision(
             decision=decision.decision,
             reasoning=decision.reasoning,
             confidence=decision.confidence,
             model_used=reviewer.model_id,
+            actual_cost_usd=usage.cost_usd,
+            usage=usage,
         )
 
 
 @dataclass(frozen=True)
 class ReviewOutcome:
-    """One card's outcome from this sweep. Returned for the tick summary."""
+    """One card's outcome from this sweep. Returned for the tick summary.
+
+    `action="skipped_cost_cap"` is the chunk 6b addition: a card whose
+    `cost_cap_usd` would be breached by the reviewer's projected call,
+    or the reviewer's own `cost_cap_usd` would be breached. The card
+    is left in `blocked/requires_review` for a human to review (no
+    marker is written, so the next tick re-evaluates the cap; a cap
+    raise unblocks it without further intervention).
+    """
 
     card_id: str
-    action: str  # "reviewed", "skipped_existing", "skipped_no_pr", "skipped_gh"
+    action: str  # see docstring; "reviewed", "skipped_existing",
+                  # "skipped_no_pr", "skipped_gh", "skipped_cost_cap"
     decision: Decision | None = None
     reason: str = ""
 
@@ -291,6 +320,22 @@ def _process_card(
             reason=f"gh pr diff failed: {diff_result.reason}",
         )
 
+    # Chunk 6b: pre-call cost-cap projection. We assume the worst-case
+    # call cost (the configured `max_tokens` on the client, plus a
+    # generous input estimate derived from the PR diff and card body
+    # lengths). When either the card's cost_cap_usd or the reviewer's
+    # cost_cap_usd would be breached, skip the call and surface a
+    # `skipped_cost_cap` outcome -- the card stays in
+    # `requires_review` and a human can raise the cap or merge by hand.
+    cap_skip = _check_cost_caps(
+        record=record,
+        reviewer_config=reviewer_config,
+        diff_text=diff_result.stdout or "",
+        max_output_tokens=_client_max_tokens(reviewer_client),
+    )
+    if cap_skip is not None:
+        return cap_skip
+
     decision = reviewer_client.review(
         card_id=record.card_id,
         card_body=record.body_md,
@@ -318,7 +363,7 @@ def _process_card(
             "reason": merge_call.reason,
         }
 
-    marker = {
+    marker: dict[str, Any] = {
         "card_id": record.card_id,
         "pr_url": pr_url,
         "decision": decision.decision,
@@ -335,6 +380,15 @@ def _process_card(
     }
     if merge_call_payload is not None:
         marker["gh_merge_call"] = merge_call_payload
+
+    # Chunk 6b: attribute the reviewer's tokens to the card.
+    new_total = None
+    if decision.usage is not None:
+        new_total = attribute_to_card(
+            repo, record, decision.usage, tenant_id=tenant_id,
+        )
+    marker["cost"] = _usage_marker_payload(decision, new_total)
+
     _write_marker(marker_path, marker)
     _emit_event(repo, record, decision, marker, tenant_id=tenant_id)
     return ReviewOutcome(
@@ -343,6 +397,87 @@ def _process_card(
         decision=decision.decision,
         reason="decision posted and marker written",
     )
+
+
+def _check_cost_caps(
+    *,
+    record: CardRecord,
+    reviewer_config: ReviewerConfig,
+    diff_text: str,
+    max_output_tokens: int,
+) -> ReviewOutcome | None:
+    """Pre-call cost-cap projection. Returns a skip outcome or None.
+
+    Conservative input-token estimate: 1 token ~ 4 chars, with a 1.25x
+    safety multiplier. The cap math is the same one
+    `worker_stub.cost.CostGovernor.before_call` uses; we duplicate the
+    projection here because the reviewer is not a CostGovernor user
+    (it would couple the reviewer's lifetime to a per-card governor).
+    """
+    est_input_tokens = max(1, int((len(diff_text) + 4000) * 1.25 / 4))
+    projected = estimate_call_cost_usd(
+        reviewer_config.model_id,
+        est_input_tokens=est_input_tokens,
+        max_output_tokens=max_output_tokens,
+    )
+    if would_exceed_reviewer_cap(
+        reviewer_config.cost_cap_usd,
+        already_spent_usd=0.0,
+        projected_call_usd=projected,
+    ):
+        return ReviewOutcome(
+            card_id=record.card_id,
+            action="skipped_cost_cap",
+            reason=(
+                f"reviewer cost cap ${reviewer_config.cost_cap_usd:.4f} "
+                f"would be exceeded by projected ${projected:.4f}"
+            ),
+        )
+    breached, cap, total = would_exceed_card_cap(
+        record,
+        projected_call_usd=projected,
+        model_id_hint=reviewer_config.model_id,
+    )
+    if breached and cap is not None:
+        return ReviewOutcome(
+            card_id=record.card_id,
+            action="skipped_cost_cap",
+            reason=(
+                f"card cost_cap_usd ${cap:.4f} would be exceeded by "
+                f"projected total ${total:.4f}"
+            ),
+        )
+    return None
+
+
+def _client_max_tokens(client: SiblingReviewerClient) -> int:
+    """Best-effort lookup of a client's `max_tokens` budget.
+
+    The Static reviewer doesn't have one; the Anthropic client does.
+    Default to 1024 so the projection still produces a useful number
+    when the client doesn't expose the budget.
+    """
+    return int(getattr(client, "max_tokens", 1024))
+
+
+def _usage_marker_payload(
+    decision: ReviewerDecision, new_card_total_tokens: int | None,
+) -> dict[str, Any]:
+    """Compact cost summary for the sibling-review marker."""
+    if decision.usage is None:
+        return {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "actual_cost_usd": 0.0,
+            "card_actual_tokens_after": new_card_total_tokens,
+        }
+    return {
+        "input_tokens": decision.usage.input_tokens,
+        "output_tokens": decision.usage.output_tokens,
+        "actual_cost_usd": round(decision.usage.cost_usd, 6),
+        "card_actual_tokens_after": new_card_total_tokens,
+        "model_used": decision.usage.model_id,
+    }
 
 
 def sibling_review_marker_path(paths: RuntimePaths, card_id: str) -> Path:

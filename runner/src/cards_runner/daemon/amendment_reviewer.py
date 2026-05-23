@@ -58,6 +58,13 @@ from ..store import (
 from ..verifier.parse import parse_acceptance_block
 from .ac_editor import AcEditError, AmendmentEdit, splice_amendment
 from .amendment_editor_client import AmendmentEditorClient
+from .reviewer_cost import (
+    ReviewerUsage,
+    attribute_to_card,
+    estimate_call_cost_usd,
+    would_exceed_card_cap,
+    would_exceed_reviewer_cap,
+)
 from .sibling_reviewer import ReviewerDecision, SiblingReviewerClient
 
 
@@ -71,6 +78,7 @@ AmendmentAction = Literal[
     "reviewed_comment",
     "skipped_existing",
     "skipped_no_change_request",
+    "skipped_cost_cap",
 ]
 
 
@@ -151,12 +159,40 @@ def _process_card(
             reason="body has no change_request: yaml block",
         )
 
+    # Chunk 6b: pre-call cap projection. Estimate the upcoming
+    # reviewer call cost (and, if auto-edit will fire, the editor
+    # call cost too) and skip when either the reviewer's own cap or
+    # the card's cap would be breached.
+    projected_call_usd = _project_reviewer_cost(
+        reviewer_client, change_request, record.body_md, reviewer_config,
+    )
+    if reviewer_config.auto_edit_ac and editor_client is not None:
+        projected_call_usd += _project_editor_cost(
+            editor_client, change_request, record.body_md, reviewer_config,
+        )
+    cap_skip = _check_amendment_cost_caps(
+        record=record,
+        reviewer_config=reviewer_config,
+        projected_call_usd=projected_call_usd,
+    )
+    if cap_skip is not None:
+        return cap_skip
+
     decision = reviewer_client.review(
         card_id=record.card_id,
         card_body=record.body_md,
         pr_diff=change_request,  # the reviewer reads the change request as 'diff'.
         reviewer=reviewer_config,
     )
+
+    # Chunk 6b: attribute the reviewer's tokens to the card before any
+    # downstream decision. The editor (if it fires) will attribute its
+    # own tokens separately so the breakdown is preserved in the marker.
+    card_total_after_review: int | None = None
+    if decision.usage is not None:
+        card_total_after_review = attribute_to_card(
+            repo, record, decision.usage, tenant_id=tenant_id,
+        )
 
     marker: dict[str, Any] = {
         "card_id": record.card_id,
@@ -167,6 +203,7 @@ def _process_card(
         "reviewer_label": reviewer_config.label,
         "at": now_utc_iso(),
         "change_request_present": True,
+        "cost": _usage_marker_payload(decision, card_total_after_review),
     }
 
     if decision.decision == "approve":
@@ -395,6 +432,31 @@ def _try_auto_edit(
                 "reason": "editor returned no edit",
             },
         )
+    # Chunk 6b: attribute the editor's tokens to the card even if the
+    # confidence floor or splice gates fail downstream. The model was
+    # called either way; the spend is real.
+    editor_total_after: int | None = None
+    if edit.input_tokens or edit.output_tokens:
+        editor_total_after = attribute_to_card(
+            repo, record,
+            ReviewerUsage(
+                input_tokens=edit.input_tokens,
+                output_tokens=edit.output_tokens,
+                cost_usd=edit.actual_cost_usd or 0.0,
+                model_id=edit.model_used or reviewer_config.model_id,
+            ),
+            tenant_id=tenant_id,
+        )
+    editor_cost_payload: dict[str, Any] = {
+        "input_tokens": edit.input_tokens,
+        "output_tokens": edit.output_tokens,
+        "actual_cost_usd": (
+            round(edit.actual_cost_usd, 6)
+            if edit.actual_cost_usd is not None else 0.0
+        ),
+        "model_used": edit.model_used or reviewer_config.model_id,
+        "card_actual_tokens_after": editor_total_after,
+    }
     if edit.confidence < reviewer_config.auto_edit_confidence_floor:
         return _AutoEditOutcome(
             applied=False,
@@ -408,6 +470,7 @@ def _try_auto_edit(
                 "confidence": edit.confidence,
                 "floor": reviewer_config.auto_edit_confidence_floor,
                 "model_used": edit.model_used,
+                "cost": editor_cost_payload,
             },
         )
     timestamp = now_utc_iso()
@@ -427,6 +490,7 @@ def _try_auto_edit(
                 "reason": f"splice failed: {exc}",
                 "ac_index": edit.ac_index,
                 "model_used": edit.model_used,
+                "cost": editor_cost_payload,
             },
         )
     try:
@@ -448,6 +512,7 @@ def _try_auto_edit(
                 "applied": False,
                 "reason": f"transition failed: {exc}",
                 "ac_index": edit.ac_index,
+                "cost": editor_cost_payload,
             },
         )
     return _AutoEditOutcome(
@@ -460,6 +525,7 @@ def _try_auto_edit(
             "confidence": edit.confidence,
             "model_used": edit.model_used,
             "amended_at": timestamp,
+            "cost": editor_cost_payload,
         },
     )
 
@@ -670,4 +736,95 @@ def _emit_event(
             record.card_id, exc,
         )
 
+
+# ---- cost helpers (chunk 6b) ----------------------------------------
+
+
+def _project_reviewer_cost(
+    reviewer_client: SiblingReviewerClient,
+    change_request: str,
+    card_body: str,
+    reviewer_config: ReviewerConfig,
+) -> float:
+    """Pre-call worst-case USD estimate for the reviewer LLM call."""
+    max_tokens = int(getattr(reviewer_client, "max_tokens", 1024))
+    est_input = max(1, int((len(change_request) + len(card_body) + 4000) * 1.25 / 4))
+    return estimate_call_cost_usd(
+        reviewer_config.model_id,
+        est_input_tokens=est_input,
+        max_output_tokens=max_tokens,
+    )
+
+
+def _project_editor_cost(
+    editor_client: AmendmentEditorClient,
+    change_request: str,
+    card_body: str,
+    reviewer_config: ReviewerConfig,
+) -> float:
+    """Pre-call worst-case USD estimate for the AC editor LLM call."""
+    max_tokens = int(getattr(editor_client, "max_tokens", 1024))
+    est_input = max(1, int((len(change_request) + len(card_body) + 4000) * 1.25 / 4))
+    return estimate_call_cost_usd(
+        reviewer_config.model_id,
+        est_input_tokens=est_input,
+        max_output_tokens=max_tokens,
+    )
+
+
+def _check_amendment_cost_caps(
+    *,
+    record: CardRecord,
+    reviewer_config: ReviewerConfig,
+    projected_call_usd: float,
+) -> AmendmentOutcome | None:
+    """Skip the amendment review when a cap would be breached."""
+    if would_exceed_reviewer_cap(
+        reviewer_config.cost_cap_usd,
+        already_spent_usd=0.0,
+        projected_call_usd=projected_call_usd,
+    ):
+        return AmendmentOutcome(
+            card_id=record.card_id,
+            action="skipped_cost_cap",
+            reason=(
+                f"reviewer cost cap ${reviewer_config.cost_cap_usd:.4f} "
+                f"would be exceeded by projected ${projected_call_usd:.4f}"
+            ),
+        )
+    breached, cap, total = would_exceed_card_cap(
+        record,
+        projected_call_usd=projected_call_usd,
+        model_id_hint=reviewer_config.model_id,
+    )
+    if breached and cap is not None:
+        return AmendmentOutcome(
+            card_id=record.card_id,
+            action="skipped_cost_cap",
+            reason=(
+                f"card cost_cap_usd ${cap:.4f} would be exceeded by "
+                f"projected total ${total:.4f}"
+            ),
+        )
+    return None
+
+
+def _usage_marker_payload(
+    decision: ReviewerDecision, card_total_after: int | None,
+) -> dict[str, Any]:
+    """Compact reviewer-call cost summary for the marker JSON."""
+    if decision.usage is None:
+        return {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "actual_cost_usd": 0.0,
+            "card_actual_tokens_after": card_total_after,
+        }
+    return {
+        "input_tokens": decision.usage.input_tokens,
+        "output_tokens": decision.usage.output_tokens,
+        "actual_cost_usd": round(decision.usage.cost_usd, 6),
+        "card_actual_tokens_after": card_total_after,
+        "model_used": decision.usage.model_id,
+    }
 

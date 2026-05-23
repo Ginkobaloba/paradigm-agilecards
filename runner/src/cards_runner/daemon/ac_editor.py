@@ -70,6 +70,12 @@ class AmendmentEdit:
     editor's self-reported confidence in this exact replacement (the
     runner thresholds against
     `ReviewerConfig.auto_edit_confidence_floor`).
+
+    Chunk 6b: `usage` carries the editor call's token spend so the
+    amendment_reviewer can attribute it to the card's `actual_tokens`
+    after a successful splice. The static test client leaves it None
+    (no observable spend); the Anthropic client populates it from
+    `response.usage`.
     """
 
     ac_index: int
@@ -80,6 +86,8 @@ class AmendmentEdit:
     confidence: float = 0.0
     model_used: str = ""
     actual_cost_usd: float | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 class AcEditError(Exception):

@@ -31,6 +31,7 @@ from typing import Any, Protocol
 
 from ..common.project_config import ReviewerConfig
 from .ac_editor import AmendmentEdit
+from .reviewer_cost import ReviewerUsage
 
 
 log = logging.getLogger(__name__)
@@ -241,7 +242,8 @@ class AnthropicAmendmentEditorClient:
         except Exception as exc:  # noqa: BLE001
             log.warning("amendment editor SDK call failed for %s: %s", card_id, exc)
             return None
-        return _extract_edit(response, model_id=reviewer.model_id)
+        usage = ReviewerUsage.from_response(response, model_id=reviewer.model_id)
+        return _extract_edit(response, model_id=reviewer.model_id, usage=usage)
 
 
 def _system_prompt(reviewer: ReviewerConfig) -> str:
@@ -278,7 +280,9 @@ def _user_prompt(
     )
 
 
-def _extract_edit(response: Any, *, model_id: str) -> AmendmentEdit | None:
+def _extract_edit(
+    response: Any, *, model_id: str, usage: ReviewerUsage | None = None
+) -> AmendmentEdit | None:
     """Pull the tool_use input off an Anthropic response.
 
     Returns None if the model failed to call the tool (a refusal, a
@@ -295,11 +299,16 @@ def _extract_edit(response: Any, *, model_id: str) -> AmendmentEdit | None:
         payload = getattr(block, "input", None)
         if not isinstance(payload, dict):
             return None
-        return _payload_to_edit(payload, model_id=model_id)
+        return _payload_to_edit(payload, model_id=model_id, usage=usage)
     return None
 
 
-def _payload_to_edit(payload: dict[str, Any], *, model_id: str) -> AmendmentEdit | None:
+def _payload_to_edit(
+    payload: dict[str, Any],
+    *,
+    model_id: str,
+    usage: ReviewerUsage | None = None,
+) -> AmendmentEdit | None:
     """Coerce the tool_use input into a frozen `AmendmentEdit`.
 
     Defensive: a model that violates the schema (returns a string for
@@ -333,4 +342,7 @@ def _payload_to_edit(payload: dict[str, Any], *, model_id: str) -> AmendmentEdit
         amendment_reason=amendment_reason,
         confidence=max(0.0, min(1.0, confidence)),
         model_used=model_id,
+        actual_cost_usd=usage.cost_usd if usage is not None else None,
+        input_tokens=usage.input_tokens if usage is not None else 0,
+        output_tokens=usage.output_tokens if usage is not None else 0,
     )
