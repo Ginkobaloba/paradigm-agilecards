@@ -1,4 +1,4 @@
-"""Poll-for-merged unblocker (chunk 5).
+"""Poll-for-merged unblocker (chunk 5; chunk 6c added worktree pinning).
 
 The chunk-4 merge gate parks awaiting-merge cards in `blocked` with
 `merge_status in {open, requires_review}` after opening the PR. The
@@ -37,6 +37,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable
 
 from ..common.types import DaemonConfig, now_utc_iso
@@ -130,7 +131,11 @@ def _process_card(
             action="skipped_no_url",
             reason="no pr_url on card row",
         )
-    view = gh.view_pr(identifier=pr_url)
+    # Chunk 6c: pin the gh subprocess cwd to the card's project dir when
+    # the project field names a real directory. For multi-remote projects
+    # this disambiguates which repo gh resolves the PR against; for a
+    # bare URL gh works either way, so the worktree is best-effort.
+    view = gh.view_pr(identifier=pr_url, worktree=_project_worktree(record))
     if not view.ok:
         log.info(
             "gh pr view failed for %s (%s): %s",
@@ -211,6 +216,27 @@ def _transition_to_done(
         record.card_id, pr_url, merged_at or now_utc_iso(),
     )
     return True
+
+
+def _project_worktree(record: CardRecord) -> Path | None:
+    """Return the card's project dir as a Path, or None.
+
+    `gh pr view` accepts an optional cwd; pinning it to the project
+    repo makes gh's repo discovery deterministic when the card's
+    pr_url is a relative number (e.g. `#42`). A missing project field
+    or a path that doesn't exist returns None, which falls back to
+    gh's own resolution from the URL.
+    """
+    project = (record.project or "").strip()
+    if not project:
+        return None
+    try:
+        path = Path(project)
+    except (TypeError, ValueError):
+        return None
+    if not path.is_dir():
+        return None
+    return path
 
 
 def _normalize_state(value: Any) -> str | None:
