@@ -7,6 +7,11 @@ import { cardCost, formatCost, type RatesPayload, rollupCost } from "../lib/cost
 import { cardPoints } from "../lib/parseCard";
 import { statusDotClass } from "../lib/tierBadge";
 import { type GroupBy, partitionByProject } from "../state/lens";
+import {
+  DEFAULT_LIMITS,
+  limitStateFor,
+  useWipLimits,
+} from "../state/wipLimits";
 import { CardTile } from "./CardTile";
 
 interface Props {
@@ -45,6 +50,8 @@ export function Column({ id, label, cards, onOpenCard, rates, groupBy }: Props) 
   const { setNodeRef, isOver } = useDroppable({ id });
   const [sortMode, setSortMode] = useState<SortMode>("rank");
   const rollup = rollupCost(cards, rates.rates, rates.defaultInputRatio);
+  const overrides = useWipLimits((s) => s.overrides);
+  const limit = limitStateFor(id, cards.length, overrides);
 
   const sortedCards = useMemo(() => {
     if (sortMode === "rank") return cards; // already rank-sorted upstream
@@ -98,9 +105,11 @@ export function Column({ id, label, cards, onOpenCard, rates, groupBy }: Props) 
               {formatCost(rollup.usd)}
             </span>
           ) : null}
-          <span className="rounded-full border border-border bg-panel2 px-1.5 py-0.5 text-[11px] tabular-nums text-muted">
-            {cards.length}
-          </span>
+          <CountPill
+            status={id}
+            count={cards.length}
+            limit={limit}
+          />
           <SortPicker mode={sortMode} onChange={setSortMode} />
         </div>
       </div>
@@ -136,6 +145,110 @@ export function Column({ id, label, cards, onOpenCard, rates, groupBy }: Props) 
         </SortableContext>
       </div>
     </div>
+  );
+}
+
+function CountPill({
+  status,
+  count,
+  limit,
+}: {
+  status: StatusId;
+  count: number;
+  limit: ReturnType<typeof limitStateFor>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const setLimit = useWipLimits((s) => s.setLimit);
+  const clearOverride = useWipLimits((s) => s.clearOverride);
+  const [draft, setDraft] = useState<string>(
+    limit ? String(limit.limit) : ""
+  );
+
+  const pillClasses = limit?.over
+    ? "border-warn/60 bg-warn/15 text-warn"
+    : limit?.atCap
+      ? "border-accent/40 bg-accent/[0.08] text-accent"
+      : "border-border bg-panel2 text-muted";
+
+  const label = limit
+    ? `${count}/${limit.limit}${limit.over ? " over" : ""}`
+    : String(count);
+  const title = limit
+    ? limit.over
+      ? `WIP limit ${limit.limit} exceeded (currently ${count}). Click to edit.`
+      : `${count} of ${limit.limit} cards. Click to edit limit.`
+    : "Click to set a WIP limit.";
+
+  return (
+    <span className="relative inline-block">
+      <button
+        type="button"
+        className={`rounded-full border px-1.5 py-0.5 text-[11px] tabular-nums ${pillClasses} hover:brightness-110`}
+        title={title}
+        onClick={() => {
+          setDraft(limit ? String(limit.limit) : "");
+          setEditing((v) => !v);
+        }}
+      >
+        {label}
+      </button>
+      {editing ? (
+        <div
+          className="absolute right-0 top-[110%] z-30 mt-1 flex items-center gap-1 rounded border border-border bg-panel2 p-1.5 text-[11px] shadow-lg"
+          role="dialog"
+          aria-label={`${status} WIP limit`}
+        >
+          <input
+            type="number"
+            min={0}
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            className="w-16 rounded border border-border bg-panel px-1 py-0.5 text-text outline-none focus:border-accent"
+            placeholder={
+              DEFAULT_LIMITS[status] !== null
+                ? String(DEFAULT_LIMITS[status])
+                : "none"
+            }
+            aria-label="WIP limit"
+            autoFocus
+          />
+          <button
+            type="button"
+            className="rounded border border-border bg-panel px-1.5 py-0.5 text-text hover:border-accent"
+            onClick={() => {
+              const n = parseInt(draft, 10);
+              if (!Number.isFinite(n) || n <= 0) {
+                setLimit(status, null);
+              } else {
+                setLimit(status, n);
+              }
+              setEditing(false);
+            }}
+          >
+            Set
+          </button>
+          <button
+            type="button"
+            className="rounded border border-border bg-panel px-1.5 py-0.5 text-muted hover:text-text"
+            onClick={() => {
+              clearOverride(status);
+              setEditing(false);
+            }}
+            title="Restore the column default"
+          >
+            Reset
+          </button>
+          <button
+            type="button"
+            className="rounded border border-border bg-panel px-1.5 py-0.5 text-muted hover:text-text"
+            onClick={() => setEditing(false)}
+            aria-label="cancel"
+          >
+            ×
+          </button>
+        </div>
+      ) : null}
+    </span>
   );
 }
 
