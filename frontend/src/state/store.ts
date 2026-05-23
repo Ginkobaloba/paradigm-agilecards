@@ -82,3 +82,33 @@ export function selectCardsByStatus(
   out.sort((a, b) => a.id.localeCompare(b.id));
   return out;
 }
+
+/**
+ * Count the number of `depends_on` entries on a card whose dependency
+ * is *not yet done*. A missing dependency (referenced id not in the
+ * index) does not count as unmet -- it's likely a card that was renamed
+ * or removed, and we don't want to flag the world red over noise.
+ *
+ * Returns 0 if the card has no deps or all deps are done.
+ */
+export function selectUnmetDeps(
+  state: State,
+  card: CardSummary
+): { count: number; firstUnmetId: string | null } {
+  const deps = card.frontmatter["depends_on"];
+  if (!Array.isArray(deps) || deps.length === 0) {
+    return { count: 0, firstUnmetId: null };
+  }
+  let count = 0;
+  let firstUnmetId: string | null = null;
+  for (const d of deps) {
+    if (typeof d !== "string") continue;
+    const target = state.cards[d];
+    if (!target) continue; // unknown id — treat as already-resolved
+    if (target.status !== "done") {
+      count++;
+      if (firstUnmetId === null) firstUnmetId = d;
+    }
+  }
+  return { count, firstUnmetId };
+}

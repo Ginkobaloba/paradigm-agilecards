@@ -1,5 +1,6 @@
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { useState } from "react";
 
 import type { CardSummary } from "../lib/api";
 import {
@@ -17,6 +18,8 @@ import {
   cardStakes,
   cardTitle,
 } from "../lib/parseCard";
+import { relativeTime } from "../lib/relativeTime";
+import { selectUnmetDeps, useStore } from "../state/store";
 import { stakesBadgeClass, tierBadgeClass } from "../lib/tierBadge";
 
 interface Props {
@@ -33,6 +36,8 @@ interface Props {
 export function CardTile({ card, onOpen, rates }: Props) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({ id: card.id });
+  const unmet = useStore((s) => selectUnmetDeps(s, card));
+  const [copied, setCopied] = useState(false);
 
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
@@ -47,6 +52,34 @@ export function CardTile({ card, onOpen, rates }: Props) {
   const model = cardModel(card);
   const pin = cardPinRequired(card);
   const cost = cardCost(card, rates.rates, rates.defaultInputRatio);
+  // Age is only interesting while a card is alive; once it's done we
+  // stop caring how long ago the runner stamped the file.
+  const isActive = card.status === "active";
+  const isDone = card.status === "done";
+  const age = relativeTime(card.mtimeMs, {
+    isStaleEligible: isActive,
+  });
+
+  const handleCopy = async (e: React.PointerEvent | React.MouseEvent): Promise<void> => {
+    // Stop the tile's onClick from opening the modal, and stop the
+    // pointer-down from starting a drag in dnd-kit.
+    e.stopPropagation();
+    e.preventDefault();
+    try {
+      await navigator.clipboard.writeText(card.id);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      // Best-effort: clipboard may be denied in insecure contexts. Fall
+      // through silently; the tooltip still tells the user what would
+      // be copied if it worked.
+    }
+  };
+
+  const handleDepClick = (e: React.MouseEvent): void => {
+    e.stopPropagation();
+    if (unmet.firstUnmetId) onOpen(unmet.firstUnmetId);
+  };
 
   return (
     <div
@@ -95,7 +128,32 @@ export function CardTile({ card, onOpen, rates }: Props) {
       </div>
 
       <div className="flex flex-wrap items-center gap-1.5">
-        <span className="font-mono text-[11px] text-muted">{shortId}</span>
+        <button
+          type="button"
+          onClick={handleCopy}
+          onPointerDown={(e) => e.stopPropagation()}
+          className={[
+            "group flex items-center gap-1 rounded font-mono text-[11px]",
+            "px-1 -mx-1 py-0 transition-colors",
+            copied
+              ? "text-ok"
+              : "text-muted hover:text-text hover:bg-panel2",
+          ].join(" ")}
+          title={copied ? "copied" : `click to copy ${card.id}`}
+          aria-label={`copy card id ${card.id}`}
+        >
+          <span>{shortId}</span>
+          <span
+            className={[
+              "text-[9px] uppercase tracking-wider",
+              copied
+                ? "opacity-100"
+                : "opacity-0 group-hover:opacity-60",
+            ].join(" ")}
+          >
+            {copied ? "copied" : "copy"}
+          </span>
+        </button>
         {stakes ? (
           <span
             className={[
@@ -114,6 +172,20 @@ export function CardTile({ card, onOpen, rates }: Props) {
             thinking
           </span>
         ) : null}
+        {unmet.count > 0 ? (
+          <button
+            type="button"
+            onClick={handleDepClick}
+            onPointerDown={(e) => e.stopPropagation()}
+            className="rounded border border-warn/40 bg-warn/10 px-1.5 py-0.5 text-[10px] font-medium text-warn hover:bg-warn/20"
+            title={`blocked on ${unmet.count} unfinished ${
+              unmet.count === 1 ? "dep" : "deps"
+            }${unmet.firstUnmetId ? ` — click to open ${unmet.firstUnmetId}` : ""}`}
+            aria-label={`blocked on ${unmet.count} dependencies`}
+          >
+            blocked on {unmet.count}
+          </button>
+        ) : null}
         {cost.kind !== "none" ? (
           <span
             className={[
@@ -124,6 +196,17 @@ export function CardTile({ card, onOpen, rates }: Props) {
           >
             {cost.kind === "spent" ? "" : "~"}
             {formatCost(cost.usd)}
+          </span>
+        ) : null}
+        {age && !isDone ? (
+          <span
+            className={[
+              "ml-auto font-mono text-[10px] tabular-nums",
+              age.stale ? "text-warn" : "text-muted",
+            ].join(" ")}
+            title={`updated ${age.label} ago${age.stale ? " — stale" : ""}`}
+          >
+            {age.stale ? `stale ${age.label}` : age.label}
           </span>
         ) : null}
       </div>
