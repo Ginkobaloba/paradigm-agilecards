@@ -55,6 +55,9 @@ from ..store import (
     CardStatus,
     EventType,
 )
+from ..verifier.parse import parse_acceptance_block
+from .ac_editor import AcEditError, AmendmentEdit, splice_amendment
+from .amendment_editor_client import AmendmentEditorClient
 from .sibling_reviewer import ReviewerDecision, SiblingReviewerClient
 
 
@@ -63,6 +66,7 @@ log = logging.getLogger(__name__)
 
 AmendmentAction = Literal[
     "reviewed_approve",
+    "reviewed_approve_edited",
     "reviewed_deny",
     "reviewed_comment",
     "skipped_existing",
@@ -87,9 +91,16 @@ def run_amendment_reviews(
     paths: RuntimePaths,
     reviewer_client: SiblingReviewerClient,
     reviewer_config: ReviewerConfig,
+    editor_client: AmendmentEditorClient | None = None,
     tenant_id: str = DEFAULT_TENANT,
 ) -> list[AmendmentOutcome]:
-    """Process `amendments` cards once per tick."""
+    """Process `amendments` cards once per tick.
+
+    `editor_client` is consulted only when `reviewer_config.auto_edit_ac`
+    is True AND the reviewer decision is `approve`. When None, the
+    runner behaves as in chunk 5 (approve parks the card in
+    `blocked/amendment_approved` for a human to finalize).
+    """
     if not cfg.amendment_reviewer_enabled or not reviewer_config.enabled:
         return []
     outcomes: list[AmendmentOutcome] = []
@@ -104,6 +115,7 @@ def run_amendment_reviews(
                 paths=paths,
                 reviewer_client=reviewer_client,
                 reviewer_config=reviewer_config,
+                editor_client=editor_client,
                 tenant_id=tenant_id,
             )
         )
@@ -117,6 +129,7 @@ def _process_card(
     paths: RuntimePaths,
     reviewer_client: SiblingReviewerClient,
     reviewer_config: ReviewerConfig,
+    editor_client: AmendmentEditorClient | None,
     tenant_id: str,
 ) -> AmendmentOutcome:
     marker_path = amendment_review_marker_path(paths, record.card_id)
@@ -145,7 +158,7 @@ def _process_card(
         reviewer=reviewer_config,
     )
 
-    marker = {
+    marker: dict[str, Any] = {
         "card_id": record.card_id,
         "decision": decision.decision,
         "reasoning": decision.reasoning,
@@ -155,10 +168,55 @@ def _process_card(
         "at": now_utc_iso(),
         "change_request_present": True,
     }
-    _write_marker(marker_path, marker)
-    _emit_event(repo, record, decision, marker, tenant_id=tenant_id)
 
     if decision.decision == "approve":
+        # Auto-edit path (chunk 6a). Only fires when the project has
+        # opted in AND an editor client is wired. The editor's result
+        # (or the reason it was skipped) is recorded in the marker so
+        # the audit trail explains which branch ran.
+        if reviewer_config.auto_edit_ac and editor_client is not None:
+            edit_outcome = _try_auto_edit(
+                record,
+                repo=repo,
+                tenant_id=tenant_id,
+                editor_client=editor_client,
+                reviewer_config=reviewer_config,
+                decision=decision,
+                change_request=change_request,
+            )
+            marker["auto_edit"] = edit_outcome.marker_payload
+            _write_marker(marker_path, marker)
+            _emit_event(repo, record, decision, marker, tenant_id=tenant_id)
+            if edit_outcome.applied:
+                return AmendmentOutcome(
+                    card_id=record.card_id,
+                    action="reviewed_approve_edited",
+                    decision="approve",
+                    reason=(
+                        "amendment approved + auto-edited; "
+                        "routed back to backlog"
+                    ),
+                )
+            # Fell through to the human-finalize path; route as the
+            # chunk 5 approve-without-edit case.
+            _route_approve(
+                record,
+                repo=repo,
+                tenant_id=tenant_id,
+                reviewer_config=reviewer_config,
+                decision=decision,
+            )
+            return AmendmentOutcome(
+                card_id=record.card_id,
+                action="reviewed_approve",
+                decision="approve",
+                reason=(
+                    "amendment approved; auto-edit declined "
+                    f"({edit_outcome.fallback_reason}); routed to blocked"
+                ),
+            )
+        _write_marker(marker_path, marker)
+        _emit_event(repo, record, decision, marker, tenant_id=tenant_id)
         _route_approve(
             record,
             repo=repo,
@@ -172,6 +230,9 @@ def _process_card(
             decision="approve",
             reason="amendment approved; routed to blocked for AC edit",
         )
+
+    _write_marker(marker_path, marker)
+    _emit_event(repo, record, decision, marker, tenant_id=tenant_id)
     if decision.decision == "request_changes":
         # The reviewer is denying the change request: the existing AC
         # stands and the executor resumes.
@@ -251,6 +312,209 @@ def _route_approve(
             "amendment_approve transition failed for %s: %s",
             record.card_id, exc,
         )
+
+
+# ---- auto-edit (chunk 6a) -------------------------------------------
+
+
+@dataclass(frozen=True)
+class _AutoEditOutcome:
+    """Internal result of an `auto_edit_ac` attempt."""
+
+    applied: bool
+    fallback_reason: str
+    marker_payload: dict[str, Any]
+
+
+def _try_auto_edit(
+    record: CardRecord,
+    *,
+    repo: CardRepository,
+    tenant_id: str,
+    editor_client: AmendmentEditorClient,
+    reviewer_config: ReviewerConfig,
+    decision: ReviewerDecision,
+    change_request: str,
+) -> _AutoEditOutcome:
+    """Run the structured-output editor and, on success, splice + route.
+
+    Returns the result for the marker file. The amendment_reviewer's
+    caller decides which `AmendmentOutcome` to surface from this.
+
+    Failure modes (each maps to a `fallback_reason`):
+
+    - editor returned None (refusal / SDK failure)
+    - editor's confidence is below the project's floor
+    - editor named a non-existent ac_index, or the body has no AC block
+    - splice failed for any other reason (malformed YAML, dropped index)
+    - the transition itself failed
+    """
+    try:
+        ac_items = [item.raw for item in parse_acceptance_block(record.body_md)]
+    except Exception as exc:  # noqa: BLE001
+        return _AutoEditOutcome(
+            applied=False,
+            fallback_reason=f"could not parse current AC: {exc}",
+            marker_payload={
+                "applied": False,
+                "reason": f"could not parse current AC: {exc}",
+            },
+        )
+    if not ac_items:
+        return _AutoEditOutcome(
+            applied=False,
+            fallback_reason="card has no acceptance_criteria items to edit",
+            marker_payload={
+                "applied": False,
+                "reason": "card has no acceptance_criteria items to edit",
+            },
+        )
+    try:
+        edit = editor_client.edit(
+            card_id=record.card_id,
+            card_body=record.body_md,
+            change_request=change_request,
+            ac_items=ac_items,
+            reviewer=reviewer_config,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _AutoEditOutcome(
+            applied=False,
+            fallback_reason=f"editor client crashed: {exc}",
+            marker_payload={
+                "applied": False,
+                "reason": f"editor client crashed: {exc}",
+            },
+        )
+    if edit is None:
+        return _AutoEditOutcome(
+            applied=False,
+            fallback_reason="editor declined (returned no edit)",
+            marker_payload={
+                "applied": False,
+                "reason": "editor returned no edit",
+            },
+        )
+    if edit.confidence < reviewer_config.auto_edit_confidence_floor:
+        return _AutoEditOutcome(
+            applied=False,
+            fallback_reason=(
+                f"editor confidence {edit.confidence:.2f} below floor "
+                f"{reviewer_config.auto_edit_confidence_floor:.2f}"
+            ),
+            marker_payload={
+                "applied": False,
+                "reason": "editor confidence below floor",
+                "confidence": edit.confidence,
+                "floor": reviewer_config.auto_edit_confidence_floor,
+                "model_used": edit.model_used,
+            },
+        )
+    timestamp = now_utc_iso()
+    try:
+        new_body = splice_amendment(
+            record.body_md,
+            edit,
+            reviewer_label=reviewer_config.label,
+            timestamp_iso=timestamp,
+        )
+    except AcEditError as exc:
+        return _AutoEditOutcome(
+            applied=False,
+            fallback_reason=f"splice failed: {exc}",
+            marker_payload={
+                "applied": False,
+                "reason": f"splice failed: {exc}",
+                "ac_index": edit.ac_index,
+                "model_used": edit.model_used,
+            },
+        )
+    try:
+        _route_approve_edited(
+            record,
+            repo=repo,
+            tenant_id=tenant_id,
+            reviewer_config=reviewer_config,
+            decision=decision,
+            edit=edit,
+            new_body=new_body,
+            timestamp_iso=timestamp,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _AutoEditOutcome(
+            applied=False,
+            fallback_reason=f"transition failed: {exc}",
+            marker_payload={
+                "applied": False,
+                "reason": f"transition failed: {exc}",
+                "ac_index": edit.ac_index,
+            },
+        )
+    return _AutoEditOutcome(
+        applied=True,
+        fallback_reason="",
+        marker_payload={
+            "applied": True,
+            "ac_index": edit.ac_index,
+            "amendment_reason": edit.amendment_reason,
+            "confidence": edit.confidence,
+            "model_used": edit.model_used,
+            "amended_at": timestamp,
+        },
+    )
+
+
+def _route_approve_edited(
+    record: CardRecord,
+    *,
+    repo: CardRepository,
+    tenant_id: str,
+    reviewer_config: ReviewerConfig,
+    decision: ReviewerDecision,
+    edit: AmendmentEdit,
+    new_body: str,
+    timestamp_iso: str,
+) -> None:
+    """Persist the edited body and transition the card back to `backlog`.
+
+    The contract: "the runner moves the file accordingly. Approve.
+    Edit the relevant item ... Set status back to `backlog` or `active`
+    per runner choice." We pick `backlog` because the executor's prior
+    claim has been cleared (chunk 4 amendment route did that), so the
+    next polling tick picks the card up fresh against the amended AC.
+    """
+    repo.apply_executor_result(
+        record.card_id,
+        tenant_id=tenant_id,
+        body_md=new_body,
+        fields=None,
+        event=None,
+    )
+    repo.transition(
+        record.card_id,
+        to_status=CardStatus.BACKLOG.value,
+        tenant_id=tenant_id,
+        fields={
+            "merge_status": "pending",
+            "claimed_by": None,
+            "started_at": None,
+            "last_heartbeat": None,
+            "attempt_trace_id": None,
+        },
+        actor_id=reviewer_config.label,
+        actor_type=ActorType.RUNNER.value,
+        event_type=EventType.AMENDED.value,
+        payload={
+            "source": "amendment_reviewer",
+            "outcome": "approved_and_edited",
+            "ac_index": edit.ac_index,
+            "amendment_reason": edit.amendment_reason,
+            "confidence": edit.confidence,
+            "model_used": edit.model_used,
+            "reviewer_decision_reason": decision.reasoning,
+            "amended_at": timestamp_iso,
+        },
+    )
 
 
 def _route_deny(

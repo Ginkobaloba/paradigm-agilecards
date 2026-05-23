@@ -58,6 +58,19 @@ class ReviewerConfig:
     is appended to the reviewer's system prompt -- a project that wants
     the reviewer to enforce a project-specific style guide threads its
     text here.
+
+    Chunk 6a adds `auto_edit_ac`. When True (and only on the amendment
+    reviewer config), an `approve` decision triggers a second
+    structured-output call that emits a replacement AC item. The
+    AC editor splices the replacement into the card body with the
+    contract's provenance fields (`amended_at`, `amended_by`,
+    `amendment_reason`, `original:`) and the card transitions back to
+    `backlog`. When False, approve routes to `blocked/amendment_approved`
+    for a human to finalize -- the chunk 5 behavior. The
+    `auto_edit_confidence_floor` is the structured-editor confidence
+    threshold; below it the runner falls back to the human-finalize
+    path. Default 0.85 (higher than the reviewer's approve floor of 0.7
+    because editing AC is more invasive than waving a PR through).
     """
 
     enabled: bool = False
@@ -65,6 +78,8 @@ class ReviewerConfig:
     label: str = "cards-runner-reviewer"
     cost_cap_usd: float | None = 0.50
     prompt_extra: str = ""
+    auto_edit_ac: bool = False
+    auto_edit_confidence_floor: float = 0.85
 
 
 @dataclass(frozen=True)
@@ -185,12 +200,17 @@ def _from_dict(data: dict[str, Any], *, source_path: str) -> ProjectConfig:
 def _reviewer(value: Any) -> ReviewerConfig:
     if not isinstance(value, dict):
         return ReviewerConfig()
+    auto_edit_floor = _opt_float(value.get("auto_edit_confidence_floor"))
     return ReviewerConfig(
         enabled=bool(value.get("enabled", False)),
         model_id=str(value.get("model", "claude-haiku-4-5-20251001")),
         label=str(value.get("label", "cards-runner-reviewer")),
         cost_cap_usd=_opt_float(value.get("cost_cap_usd")) or 0.50,
         prompt_extra=str(value.get("prompt_extra") or ""),
+        auto_edit_ac=bool(value.get("auto_edit_ac", False)),
+        auto_edit_confidence_floor=(
+            auto_edit_floor if auto_edit_floor is not None else 0.85
+        ),
     )
 
 

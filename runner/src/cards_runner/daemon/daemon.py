@@ -73,6 +73,10 @@ from ..verifier import VerifierError, VerifierResult, verify_card
 from ..verifier.runner import VERDICT_FAIL, VERDICT_PASS, VERDICT_STANDUP
 from .eligibility import EligibilityResult, evaluate_eligibility
 from .merge_gate import MergeGate, MergeOutcome, build_default_gh_runner
+from .amendment_editor_client import (
+    AmendmentEditorClient,
+    AnthropicAmendmentEditorClient,
+)
 from .amendment_reviewer import run_amendment_reviews
 from .orphan import reclaim, scan_for_orphans
 from .pr_lifecycle import GhRunner
@@ -130,6 +134,7 @@ class Daemon:
         project_config_loader: ProjectConfigLoader | None = None,
         sibling_reviewer_client: SiblingReviewerClient | None = None,
         amendment_reviewer_client: SiblingReviewerClient | None = None,
+        amendment_editor_client: AmendmentEditorClient | None = None,
     ) -> None:
         self.cfg = cfg
         self.paths = RuntimePaths.from_root(cfg.todo_root)
@@ -160,6 +165,7 @@ class Daemon:
         self._merge_gate = MergeGate(cfg=cfg, gh=self._gh)
         self._sibling_reviewer_client = sibling_reviewer_client
         self._amendment_reviewer_client = amendment_reviewer_client
+        self._amendment_editor_client = amendment_editor_client
 
     @property
     def project_config(self) -> ProjectConfig:
@@ -466,6 +472,7 @@ class Daemon:
                 paths=self.paths,
                 reviewer_client=self._build_amendment_reviewer_client(),
                 reviewer_config=self.project_config.amendment_reviewer,
+                editor_client=self._build_amendment_editor_client(),
                 tenant_id=self.tenant_id,
             )
             for o in amend_outcomes:
@@ -1617,6 +1624,24 @@ class Daemon:
             "the static no-opinion fallback"
         )
         return StaticSiblingReviewerClient()
+
+    def _build_amendment_editor_client(self) -> AmendmentEditorClient | None:
+        """Return the structured-output editor for `auto_edit_ac` mode.
+
+        Chunk 6a: the editor only runs when the project opted in
+        (`amendment_reviewer.auto_edit_ac: true`). We still construct
+        the client unconditionally when an Anthropic SDK is available
+        so a tick that finds an opted-in card has a client to call;
+        the reviewer itself decides whether to invoke it. Returns
+        None when no Anthropic client could be built (tests inject
+        their own static client).
+        """
+        if self._amendment_editor_client is not None:
+            return self._amendment_editor_client
+        client = self._build_subjective_client()
+        if client is None:
+            return None
+        return AnthropicAmendmentEditorClient(client=client)
 
     # ---- chunk 5: git worktree prune sweep ---------------------------
 
