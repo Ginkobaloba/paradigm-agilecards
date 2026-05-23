@@ -6,6 +6,7 @@ import {
   chipOptions,
   useFilters,
 } from "../state/filters";
+import { useLens } from "../state/lens";
 import { FilterChip, TriChip } from "./FilterChip";
 
 /**
@@ -103,6 +104,7 @@ export function FilterBar() {
       ) : null}
 
       <div className="flex-1" />
+      <GroupByToggle />
       {activeCount > 0 ? (
         <button
           type="button"
@@ -113,5 +115,33 @@ export function FilterBar() {
         </button>
       ) : null}
     </div>
+  );
+}
+
+function GroupByToggle() {
+  const groupBy = useLens((s) => s.groupBy);
+  const setGroupBy = useLens((s) => s.setGroupBy);
+  return (
+    <label
+      className="flex items-center gap-1 rounded border border-border bg-panel2 px-1.5 py-0.5 text-[11px] text-muted"
+      title="reshape the board by grouping cards within each column"
+    >
+      <span className="uppercase tracking-wider text-[10px] opacity-70">
+        group
+      </span>
+      <select
+        value={groupBy}
+        onChange={(e) => setGroupBy(e.target.value as "none" | "project")}
+        className="cursor-pointer bg-transparent pr-0.5 text-text outline-none focus:outline-none"
+        aria-label="group-by lens"
+      >
+        <option value="none" className="bg-panel2 text-text">
+          None
+        </option>
+        <option value="project" className="bg-panel2 text-text">
+          Project
+        </option>
+      </select>
+    </label>
   );
 }
