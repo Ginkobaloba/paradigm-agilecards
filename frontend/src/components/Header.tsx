@@ -1,9 +1,11 @@
 import { NavLink } from "react-router-dom";
 
 import { useAuth } from "../hooks/useAuth";
+import { ViewMenu } from "./ViewMenu";
 
 interface Props {
   onRefresh: () => void;
+  onOpenPalette?: () => void;
   cardsDir?: string | undefined;
 }
 
@@ -14,7 +16,7 @@ const NAV: Array<{ to: string; label: string }> = [
   { to: "/retros", label: "Retros" },
 ];
 
-export function Header({ onRefresh, cardsDir }: Props) {
+export function Header({ onRefresh, onOpenPalette, cardsDir }: Props) {
   const { signOut } = useAuth();
 
   return (
@@ -54,6 +56,19 @@ export function Header({ onRefresh, cardsDir }: Props) {
           {cardsDir}
         </span>
       ) : null}
+      {onOpenPalette ? (
+        <button
+          className="btn"
+          onClick={onOpenPalette}
+          title="open command palette (Cmd/Ctrl-K)"
+        >
+          <span className="mr-1">Search</span>
+          <kbd className="rounded border border-border bg-panel px-1 text-[10px] text-muted">
+            ⌘K
+          </kbd>
+        </button>
+      ) : null}
+      <ViewMenu />
       <button className="btn" onClick={onRefresh}>
         Refresh
       </button>

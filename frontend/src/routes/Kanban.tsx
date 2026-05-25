@@ -9,6 +9,7 @@ import { type ReactNode, useEffect, useMemo, useState } from "react";
 
 import { CardModal } from "../components/CardModal";
 import { Column } from "../components/Column";
+import { FilterBar } from "../components/FilterBar";
 import {
   api,
   ApiError,
@@ -17,6 +18,7 @@ import {
   type StatusId,
 } from "../lib/api";
 import type { RatesPayload } from "../lib/cost";
+import { cardMatchesFilters, useFilters } from "../state/filters";
 import { selectCardsByStatus, useStore } from "../state/store";
 
 const COLUMN_FALLBACK: ColumnDef[] = [
@@ -44,6 +46,7 @@ export function Kanban({ loading, error, rates }: Props) {
   const optimisticMove = useStore((s) => s.optimisticMove);
   const markInFlight = useStore((s) => s.markInFlight);
   const patchRank = useStore((s) => s.patchRank);
+  const filters = useFilters();
 
   const [columns, setColumns] = useState<ColumnDef[]>(COLUMN_FALLBACK);
   const [openCard, setOpenCard] = useState<string | null>(null);
@@ -58,6 +61,7 @@ export function Kanban({ loading, error, rates }: Props) {
       });
   }, []);
 
+  const ranks = useStore((s) => s.ranks);
   const cardsByStatus = useMemo(() => {
     const acc: Record<StatusId, CardSummary[]> = {
       backlog: [],
@@ -67,16 +71,16 @@ export function Kanban({ loading, error, rates }: Props) {
       blocked: [],
     };
     // Use the store's selector so the rank-aware ordering matches what
-    // the columns render.
+    // the columns render, then apply filters.
     const state = useStore.getState();
     for (const s of Object.keys(acc) as StatusId[]) {
-      acc[s] = selectCardsByStatus(state, s);
+      const sorted = selectCardsByStatus(state, s);
+      acc[s] = sorted.filter((c) => cardMatchesFilters(c, filters));
     }
     return acc;
-    // `cards` is intentionally a dep so a card change triggers re-sort.
-    // We also re-run on rank state changes via the same channel.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cards, useStore((s) => s.ranks)]);
+    // `cards` and `ranks` are explicit deps; pulling them from useStore
+    // for the selector keeps useMemo notified of changes.
+  }, [cards, ranks, filters]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } })
@@ -175,34 +179,37 @@ export function Kanban({ loading, error, rates }: Props) {
   };
 
   return (
-    <div className="flex flex-col gap-3 px-5 py-4">
-      {hydrated && error ? <Banner>{error}</Banner> : null}
-      {moveError ? <Banner>move failed: {moveError}</Banner> : null}
+    <div className="flex flex-col">
+      <FilterBar />
+      <div className="flex flex-col gap-3 px-5 py-4">
+        {hydrated && error ? <Banner>{error}</Banner> : null}
+        {moveError ? <Banner>move failed: {moveError}</Banner> : null}
 
-      {!hydrated && error ? (
-        <ErrorState message={error} />
-      ) : (
-        <DndContext sensors={sensors} onDragEnd={onDragEnd}>
-          <div className="grid gap-3" style={gridStyle}>
-            {columns.map((c) =>
-              showSkeleton ? (
-                <SkeletonColumn key={c.id} label={c.label} />
-              ) : (
-                <Column
-                  key={c.id}
-                  id={c.id}
-                  label={c.label}
-                  cards={cardsByStatus[c.id] ?? []}
-                  onOpenCard={(id) => setOpenCard(id)}
-                  rates={rates}
-                />
-              )
-            )}
-          </div>
-        </DndContext>
-      )}
+        {!hydrated && error ? (
+          <ErrorState message={error} />
+        ) : (
+          <DndContext sensors={sensors} onDragEnd={onDragEnd}>
+            <div className="grid gap-3" style={gridStyle}>
+              {columns.map((c) =>
+                showSkeleton ? (
+                  <SkeletonColumn key={c.id} label={c.label} />
+                ) : (
+                  <Column
+                    key={c.id}
+                    id={c.id}
+                    label={c.label}
+                    cards={cardsByStatus[c.id] ?? []}
+                    onOpenCard={(id) => setOpenCard(id)}
+                    rates={rates}
+                  />
+                )
+              )}
+            </div>
+          </DndContext>
+        )}
 
-      <CardModal cardId={openCard} onClose={() => setOpenCard(null)} />
+        <CardModal cardId={openCard} onClose={() => setOpenCard(null)} />
+      </div>
     </div>
   );
 }

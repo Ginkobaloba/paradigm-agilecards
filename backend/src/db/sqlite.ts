@@ -106,4 +106,26 @@ function migrate(db: Db): void {
   db.prepare(
     `INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)`
   ).run(2);
+
+  // Schema v3: named saved views per token. A view is
+  // (filters + sort + grouping), serialized as JSON in `payload`. Keyed
+  // by token_id today (the token is our user proxy until proper
+  // accounts land). Views are shareable via URL-encoded payload, which
+  // is separate from this storage path.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS saved_views (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      token_id    INTEGER NOT NULL REFERENCES tokens(id) ON DELETE CASCADE,
+      name        TEXT    NOT NULL,
+      payload     TEXT    NOT NULL,
+      created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+      updated_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (token_id, name)
+    );
+    CREATE INDEX IF NOT EXISTS idx_saved_views_token
+      ON saved_views (token_id);
+  `);
+  db.prepare(
+    `INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)`
+  ).run(3);
 }

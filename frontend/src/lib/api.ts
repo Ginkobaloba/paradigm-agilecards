@@ -121,4 +121,33 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ status, prevId, nextId }),
     }),
+
+  listViews: (): Promise<{ views: SavedView[] }> => request("/api/views"),
+
+  createView: (name: string, payload: unknown): Promise<SavedView> =>
+    request("/api/views", {
+      method: "POST",
+      body: JSON.stringify({ name, payload }),
+    }),
+
+  updateView: (
+    id: number,
+    patch: { name?: string; payload?: unknown }
+  ): Promise<SavedView> =>
+    request(`/api/views/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+
+  deleteView: (id: number): Promise<void> =>
+    request(`/api/views/${id}`, { method: "DELETE" }),
 };
+
+export interface SavedView {
+  id: number;
+  tokenId: number;
+  name: string;
+  payload: unknown;
+  createdAt: string;
+  updatedAt: string;
+}

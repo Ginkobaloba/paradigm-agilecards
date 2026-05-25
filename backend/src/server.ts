@@ -22,6 +22,7 @@ import { retrosRouter } from "./routes/retros.js";
 import { sprintsRouter } from "./routes/sprints.js";
 import { sseRouter } from "./routes/sse.js";
 import { storiesRouter } from "./routes/stories.js";
+import { viewsRouter } from "./routes/views.js";
 import { demoInvoker } from "./stories/demoInvoker.js";
 
 function main(): void {
@@ -83,6 +84,7 @@ function main(): void {
   app.use("/api", ratesRouter());
   app.use("/api", sprintsRouter());
   app.use("/api", retrosRouter());
+  app.use("/api", viewsRouter());
   // STORIES_DEMO_INVOKER swaps the real `claude` CLI planner for an
   // offline demo invoker, so the submit-story flow can be exercised
   // without a live runner. Unset in production -> real invoker.
