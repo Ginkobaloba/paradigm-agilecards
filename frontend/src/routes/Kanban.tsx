@@ -19,6 +19,7 @@ import {
 } from "../lib/api";
 import type { RatesPayload } from "../lib/cost";
 import { cardMatchesFilters, useFilters } from "../state/filters";
+import { useLens } from "../state/lens";
 import { selectCardsByStatus, useStore } from "../state/store";
 
 const COLUMN_FALLBACK: ColumnDef[] = [
@@ -47,6 +48,7 @@ export function Kanban({ loading, error, rates }: Props) {
   const markInFlight = useStore((s) => s.markInFlight);
   const patchRank = useStore((s) => s.patchRank);
   const filters = useFilters();
+  const groupBy = useLens((s) => s.groupBy);
 
   const [columns, setColumns] = useState<ColumnDef[]>(COLUMN_FALLBACK);
   const [openCard, setOpenCard] = useState<string | null>(null);
@@ -201,6 +203,7 @@ export function Kanban({ loading, error, rates }: Props) {
                     cards={cardsByStatus[c.id] ?? []}
                     onOpenCard={(id) => setOpenCard(id)}
                     rates={rates}
+                    groupBy={groupBy}
                   />
                 )
               )}

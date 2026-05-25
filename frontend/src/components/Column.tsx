@@ -6,6 +6,7 @@ import type { CardSummary, StatusId } from "../lib/api";
 import { cardCost, formatCost, type RatesPayload, rollupCost } from "../lib/cost";
 import { cardPoints } from "../lib/parseCard";
 import { statusDotClass } from "../lib/tierBadge";
+import { type GroupBy, partitionByProject } from "../state/lens";
 import { CardTile } from "./CardTile";
 
 interface Props {
@@ -14,6 +15,7 @@ interface Props {
   cards: CardSummary[];
   onOpenCard: (id: string) => void;
   rates: RatesPayload;
+  groupBy: GroupBy;
 }
 
 /**
@@ -39,7 +41,7 @@ const SORT_ORDER: SortMode[] = ["rank", "created", "tier", "cost"];
  * A column of cards. Droppable via dnd-kit. Children are wrapped in a
  * SortableContext so each card is draggable.
  */
-export function Column({ id, label, cards, onOpenCard, rates }: Props) {
+export function Column({ id, label, cards, onOpenCard, rates, groupBy }: Props) {
   const { setNodeRef, isOver } = useDroppable({ id });
   const [sortMode, setSortMode] = useState<SortMode>("rank");
   const rollup = rollupCost(cards, rates.rates, rates.defaultInputRatio);
@@ -119,6 +121,8 @@ export function Column({ id, label, cards, onOpenCard, rates }: Props) {
             >
               {isOver ? "Drop to move here" : "No cards"}
             </div>
+          ) : groupBy === "project" ? (
+            renderGroupedByProject(sortedCards, onOpenCard, rates)
           ) : (
             sortedCards.map((c) => (
               <CardTile
@@ -162,6 +166,33 @@ function SortPicker({
       </select>
     </label>
   );
+}
+
+function renderGroupedByProject(
+  cards: CardSummary[],
+  onOpenCard: (id: string) => void,
+  rates: RatesPayload
+) {
+  const groups = partitionByProject(cards);
+  return groups.map((g, i) => (
+    <div key={g.key} className={i === 0 ? "" : "mt-1"}>
+      <div className="flex items-center gap-1.5 px-1 pb-1 pt-0.5">
+        <span className="h-px flex-1 bg-border/60" aria-hidden />
+        <span className="text-[10px] font-semibold uppercase tracking-wider text-muted">
+          {g.label}
+        </span>
+        <span className="rounded-full border border-border bg-panel2 px-1.5 py-0.5 text-[10px] tabular-nums text-muted">
+          {g.cards.length}
+        </span>
+        <span className="h-px flex-1 bg-border/60" aria-hidden />
+      </div>
+      <div className="flex flex-col gap-2">
+        {g.cards.map((c) => (
+          <CardTile key={c.id} card={c} onOpen={onOpenCard} rates={rates} />
+        ))}
+      </div>
+    </div>
+  ));
 }
 
 function rollupTitle(
