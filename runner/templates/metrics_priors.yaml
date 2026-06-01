@@ -1,0 +1,115 @@
+# Cold-start priors for the throughput-metrics estimator.
+#
+# This file is the global fallback per `docs/design/throughput_metrics_ledger.md`
+# section 8.3. The estimator layers three priors narrowest-to-broadest:
+#
+#   1. Per-(work_type, tier) -- whatever `metric_estimates` currently holds.
+#   2. Per-tier only         -- aggregate across all work_types at the tier.
+#   3. Global cold-start     -- this file. Used only when neither of the above
+#                               has enough data.
+#
+# Numbers here are operator-editable per project. The defaults below are
+# conservative starting guesses; the spec deliberately did not commit to
+# specific values because the empirical-shrinkage formula means they only
+# matter at n=0 and rapidly wash out as real data accrues (50/50 blend at
+# n=5 with k=5; 90% empirical at n=50).
+#
+# Schema: `tiers[<tier>]` carries percentile estimates for that tier's
+# typical work. The estimator reads `agent_wall_seconds_p50`,
+# `agent_wall_seconds_p75`, `agent_wall_seconds_p90` directly into the
+# blend formula; the other fields are reserved for future shrinkage
+# beyond the wall-clock signal.
+
+version: 1
+updated: 2026-05-29
+
+# Shrinkage constant per `docs/design/throughput_metrics_ledger.md` section 8.2.
+# weight_empirical = n / (n + k); at k=5 the crossover (50/50 prior vs
+# empirical) lands at n=5. Tunable per work_type in `overrides:` below
+# when domain knowledge justifies a tighter or looser blend.
+shrinkage_k: 5
+
+# Per-tier global priors. Wall-clock seconds derive from "this tier
+# usually finishes in roughly N minutes for a routine card"; tokens
+# follow the tier_map model assignment scaled by typical session size.
+# Numbers are conservative -- err on overestimating, since the shrinkage
+# formula corrects fast and underestimates create over-confidence in
+# quotes.
+tiers:
+  1:
+    # haiku, no extended thinking -- trivial edits, copy tweaks.
+    agent_wall_seconds_p50: 180
+    agent_wall_seconds_p75: 360
+    agent_wall_seconds_p90: 900
+    executor_tokens_p50: 8000
+    executor_tokens_p90: 24000
+    human_review_wall_seconds_p50: 300
+    human_review_wall_seconds_p90: 1800
+    rework_rate_mean: 0.10
+    contract_survival_rate: 0.90
+
+  2:
+    # haiku + extended thinking -- low-risk work that still needs reasoning.
+    agent_wall_seconds_p50: 360
+    agent_wall_seconds_p75: 720
+    agent_wall_seconds_p90: 1800
+    executor_tokens_p50: 18000
+    executor_tokens_p90: 50000
+    human_review_wall_seconds_p50: 600
+    human_review_wall_seconds_p90: 2400
+    rework_rate_mean: 0.15
+    contract_survival_rate: 0.85
+
+  3:
+    # sonnet -- feature work in a shared module.
+    agent_wall_seconds_p50: 900
+    agent_wall_seconds_p75: 1800
+    agent_wall_seconds_p90: 3600
+    executor_tokens_p50: 40000
+    executor_tokens_p90: 120000
+    human_review_wall_seconds_p50: 1200
+    human_review_wall_seconds_p90: 5400
+    rework_rate_mean: 0.25
+    contract_survival_rate: 0.75
+
+  4:
+    # sonnet + extended thinking -- design-touching, schema migrations.
+    agent_wall_seconds_p50: 1800
+    agent_wall_seconds_p75: 3600
+    agent_wall_seconds_p90: 7200
+    executor_tokens_p50: 80000
+    executor_tokens_p90: 250000
+    human_review_wall_seconds_p50: 2400
+    human_review_wall_seconds_p90: 10800
+    rework_rate_mean: 0.30
+    contract_survival_rate: 0.70
+
+  5:
+    # opus -- production-touching mechanical work.
+    agent_wall_seconds_p50: 2400
+    agent_wall_seconds_p75: 5400
+    agent_wall_seconds_p90: 10800
+    executor_tokens_p50: 60000
+    executor_tokens_p90: 180000
+    human_review_wall_seconds_p50: 3600
+    human_review_wall_seconds_p90: 14400
+    rework_rate_mean: 0.20
+    contract_survival_rate: 0.80
+
+  6:
+    # opus + extended thinking -- architecture, security boundary changes.
+    agent_wall_seconds_p50: 5400
+    agent_wall_seconds_p75: 10800
+    agent_wall_seconds_p90: 21600
+    executor_tokens_p50: 200000
+    executor_tokens_p90: 600000
+    human_review_wall_seconds_p50: 7200
+    human_review_wall_seconds_p90: 28800
+    rework_rate_mean: 0.35
+    contract_survival_rate: 0.65
+
+# Per-work_type shrinkage overrides. Defaults to `shrinkage_k` above;
+# this map lets operators tighten the blend when a work_type has
+# narrower historical variance (docs cards usually take a predictable
+# amount of time; spike cards are wildly variable). Empty by default.
+shrinkage_k_overrides: {}

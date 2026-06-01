@@ -191,6 +191,35 @@ def main(argv: list[str] | None = None) -> int:
         "the store; useful when the store is locked by a running daemon)",
     )
 
+    p_stats = sub.add_parser(
+        "stats",
+        help="throughput-metrics read APIs (ledger chunk 3+)",
+    )
+    stats_sub = p_stats.add_subparsers(dest="stats_cmd", required=True)
+    p_recalibrate = stats_sub.add_parser(
+        "recalibrate",
+        help="recompute `metric_estimates` from `card_metrics`",
+    )
+    _add_common(p_recalibrate)
+    p_recalibrate.add_argument(
+        "--tenant", default="default",
+        help="tenant scope to recalibrate (default: 'default')",
+    )
+    p_recalibrate.add_argument(
+        "--priors", type=Path, default=None,
+        help="path to a custom priors YAML; defaults to the in-tree "
+        "runner/templates/metrics_priors.yaml",
+    )
+    p_recalibrate.add_argument(
+        "--floor-n", type=int, default=10,
+        help="bucket sample count below which the layered prior "
+        "falls through to tier-aggregate (default: 10)",
+    )
+    p_recalibrate.add_argument(
+        "--json", action="store_true",
+        help="JSON output (default: one line per bucket)",
+    )
+
     args = parser.parse_args(argv)
     if args.cmd == "start":
         return _cmd_start(args)
@@ -202,6 +231,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_reclaim(args)
     if args.cmd == "doctor":
         return _cmd_doctor(args)
+    if args.cmd == "stats":
+        if args.stats_cmd == "recalibrate":
+            return _cmd_stats_recalibrate(args)
+        parser.error(f"unknown stats subcommand {args.stats_cmd}")
     parser.error(f"unknown subcommand {args.cmd}")
     return 2  # unreachable
 
@@ -387,6 +420,56 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
     finally:
         repo.close()
     print(f"reclaimed: {record.card_id} (status={record.status})")
+    return 0
+
+
+def _cmd_stats_recalibrate(args: argparse.Namespace) -> int:
+    """`cards-runner stats recalibrate` -- refresh `metric_estimates`.
+
+    Reads every populated `(work_type, tier)` bucket from
+    `card_metrics`, computes per-bucket percentile estimates blended
+    with the cold-start prior, and writes `metric_estimates`.
+    Idempotent: re-running on unchanged data produces the same row.
+    """
+    from ..metrics import load_priors, recalibrate_all
+    from ..metrics.store import MetricsStore
+
+    priors = load_priors(args.priors)
+    repo = _open_store(args)
+    try:
+        store = MetricsStore.from_repository(repo)
+        results = recalibrate_all(
+            store,
+            priors,
+            tenant_id=args.tenant,
+            floor_n=args.floor_n,
+        )
+    finally:
+        repo.close()
+
+    if args.json:
+        payload = [
+            {
+                "work_type": r.work_type,
+                "tier": r.tier,
+                "n_samples": r.n_samples,
+                "prior_weight": round(r.prior_weight, 4),
+                "written": r.written,
+            }
+            for r in results
+        ]
+        print(json.dumps({"tenant": args.tenant, "results": payload}, indent=2))
+    else:
+        if not results:
+            print(
+                f"no populated buckets for tenant '{args.tenant}'; nothing to do"
+            )
+        for r in results:
+            print(
+                f"{r.work_type}/tier{r.tier}: n={r.n_samples} "
+                f"prior_weight={r.prior_weight:.3f} "
+                f"({'written' if r.written else 'skipped'})"
+            )
     return 0
 
 
