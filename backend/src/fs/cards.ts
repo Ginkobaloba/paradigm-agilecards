@@ -23,7 +23,7 @@ import { log } from "../logger.js";
 import { publish } from "../events/bus.js";
 import { deriveEvents } from "../events/derive.js";
 import { appendEvent, countEventsForCard } from "../db/events.js";
-import { parseFrontmatter, rewriteStatus } from "./frontmatter.js";
+import { parseFrontmatter, rewriteField, rewriteStatus } from "./frontmatter.js";
 
 /**
  * Canonical status values, in the order they should render as columns.
@@ -377,4 +377,65 @@ export function moveCard(id: string, newStatus: StatusId): Card {
     status: moved.status,
   });
   return moved;
+}
+
+/**
+ * Patch a whitelisted set of scalar frontmatter fields on a card without
+ * moving it between folders. Same atomic-write discipline as `moveCard`:
+ * apply every rewrite in memory, write to a sibling temp file, rename
+ * over the original.
+ *
+ * The route layer is responsible for validating the patch shape; this
+ * function trusts that values are already coerced to the right scalar
+ * type (string | number | boolean | null). `null` removes a field.
+ *
+ * Returns the freshly re-read card. Publishes a `card-updated` event;
+ * the existing event-derive pipeline runs idempotently on every upsert
+ * so any lifecycle event implied by the change surfaces automatically.
+ *
+ * No-op fast path: if every rewrite leaves the raw text unchanged, the
+ * disk is not touched and the in-memory card is returned as-is.
+ */
+export type FrontmatterScalar = string | number | boolean | null;
+
+export function patchCardFrontmatter(
+  id: string,
+  patch: Record<string, FrontmatterScalar>
+): Card {
+  const card = index.get(id);
+  if (!card) throw new Error(`No card with id=${id}`);
+
+  let next = card.raw;
+  for (const [key, value] of Object.entries(patch)) {
+    next = rewriteField(next, key, value);
+  }
+  if (next === card.raw) return card;
+
+  const tmpFile = `${card.file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmpFile, next, "utf8");
+  try {
+    fs.renameSync(tmpFile, card.file);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch {
+      /* swallow */
+    }
+    throw err;
+  }
+
+  const updated = readCardFromDisk(card.file);
+  if (!updated) {
+    throw new Error(`Patch succeeded but reread failed for ${card.file}`);
+  }
+  index.set(updated.id, updated);
+  fileToId.set(card.file, updated.id);
+
+  publish({
+    type: "card-updated",
+    cardId: updated.id,
+    status: updated.status,
+  });
+  recordDerivedEvents(card, updated);
+  return updated;
 }

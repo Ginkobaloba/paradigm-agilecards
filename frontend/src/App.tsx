@@ -13,6 +13,7 @@ import { useRates } from "./hooks/useRates";
 import { useSSE } from "./hooks/useSSE";
 import { api } from "./lib/api";
 import { filtersFromParams, filtersToParams, useFilters } from "./state/filters";
+import { Grid } from "./routes/Grid";
 import { Kanban } from "./routes/Kanban";
 import { Retros } from "./routes/Retros";
 import { SprintDetail } from "./routes/SprintDetail";
@@ -92,6 +93,7 @@ export function App() {
             element={<Kanban loading={loading} error={error} rates={rates} />}
           />
           <Route path="/submit" element={<SubmitStory />} />
+          <Route path="/grid" element={<Grid rates={rates} />} />
           <Route path="/sprints" element={<SprintPlanner />} />
           <Route path="/sprints/:id" element={<SprintDetail />} />
           <Route path="/retros" element={<Retros />} />

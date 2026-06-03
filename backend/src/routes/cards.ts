@@ -7,7 +7,16 @@
 import { Router, type Request, type Response } from "express";
 
 import { appendRank } from "../db/ranks.js";
-import { getCard, getColumns, listCards, moveCard, STATUSES, type StatusId } from "../fs/cards.js";
+import {
+  getCard,
+  getColumns,
+  listCards,
+  moveCard,
+  patchCardFrontmatter,
+  STATUSES,
+  type FrontmatterScalar,
+  type StatusId,
+} from "../fs/cards.js";
 
 const VALID_STATUSES = new Set<string>(STATUSES.map((s) => s.id));
 
@@ -54,6 +63,40 @@ export function cardsRouter(): Router {
     });
   });
 
+  router.patch("/cards/:id/frontmatter", (req: Request, res: Response) => {
+    const id = req.params["id"];
+    if (typeof id !== "string") {
+      res.status(400).json({ error: "missing id" });
+      return;
+    }
+    if (!getCard(id)) {
+      res.status(404).json({ error: "no such card" });
+      return;
+    }
+    const body = req.body as Record<string, unknown> | undefined;
+    if (!body || typeof body !== "object") {
+      res.status(400).json({ error: "body must be a JSON object" });
+      return;
+    }
+    const validation = validateFrontmatterPatch(body);
+    if (validation.kind === "error") {
+      res.status(400).json({ error: validation.error });
+      return;
+    }
+    try {
+      const updated = patchCardFrontmatter(id, validation.patch);
+      res.json({
+        id: updated.id,
+        file: updated.file,
+        status: updated.status,
+        frontmatter: updated.frontmatter,
+        mtimeMs: updated.mtimeMs,
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   router.post("/cards/:id/move", (req: Request, res: Response) => {
     const id = req.params["id"];
     if (typeof id !== "string") {
@@ -88,4 +131,63 @@ export function cardsRouter(): Router {
   });
 
   return router;
+}
+
+/**
+ * Whitelisted PATCH validator. The grid view writes back a tightly-
+ * scoped set of fields; anything else is rejected so this route can't
+ * be turned into a generic frontmatter editor (which would need a much
+ * broader threat model). Add a key to ALLOWED only after thinking about
+ * what disk-truth invariants it touches.
+ *
+ *   - `stakes`: one of "low" | "medium" | "high" | null (null deletes).
+ *   - `cost_cap_usd`: positive finite number, or null to clear.
+ */
+const ALLOWED_STAKES = new Set(["low", "medium", "high"]);
+
+type PatchValidation =
+  | { kind: "ok"; patch: Record<string, FrontmatterScalar> }
+  | { kind: "error"; error: string };
+
+function validateFrontmatterPatch(
+  body: Record<string, unknown>
+): PatchValidation {
+  const out: Record<string, FrontmatterScalar> = {};
+  for (const key of Object.keys(body)) {
+    if (key === "stakes") {
+      const v = body[key];
+      if (v === null) {
+        out["stakes"] = null;
+        continue;
+      }
+      if (typeof v !== "string" || !ALLOWED_STAKES.has(v)) {
+        return {
+          kind: "error",
+          error: `stakes must be one of low|medium|high|null, got ${JSON.stringify(v)}`,
+        };
+      }
+      out["stakes"] = v;
+      continue;
+    }
+    if (key === "cost_cap_usd") {
+      const v = body[key];
+      if (v === null) {
+        out["cost_cap_usd"] = null;
+        continue;
+      }
+      if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
+        return {
+          kind: "error",
+          error: `cost_cap_usd must be a positive number or null, got ${JSON.stringify(v)}`,
+        };
+      }
+      out["cost_cap_usd"] = v;
+      continue;
+    }
+    return { kind: "error", error: `field not patchable: ${key}` };
+  }
+  if (Object.keys(out).length === 0) {
+    return { kind: "error", error: "empty patch" };
+  }
+  return { kind: "ok", patch: out };
 }

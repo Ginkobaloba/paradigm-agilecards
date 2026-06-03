@@ -98,6 +98,12 @@ export function CommandPalette({ open, onClose, onOpenCard, onRefresh }: Props) 
         run: () => navigate("/"),
       },
       {
+        id: "cmd:grid",
+        label: "Go to Grid (spend-side optimizer)",
+        hint: "/grid",
+        run: () => navigate("/grid"),
+      },
+      {
         id: "cmd:sprints",
         label: "Go to Sprint Planner",
         hint: "/sprints",

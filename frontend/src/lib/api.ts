@@ -115,6 +115,21 @@ export const api = {
       body: JSON.stringify({ status }),
     }),
 
+  /**
+   * Update a whitelisted set of scalar frontmatter fields on a card.
+   * v1 accepts `stakes` and `cost_cap_usd`; the backend rejects
+   * anything else with a 400. The grid's drag-to-restake handler is
+   * the primary caller.
+   */
+  patchCardFrontmatter: (
+    id: string,
+    patch: { stakes?: string | null; cost_cap_usd?: number | null }
+  ): Promise<CardSummary> =>
+    request(`/api/cards/${encodeURIComponent(id)}/frontmatter`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+
   listRates: (): Promise<import("./cost").RatesPayload> => request("/api/rates"),
 
   listRanks: (): Promise<{ ranks: RankRow[] }> => request("/api/ranks"),
