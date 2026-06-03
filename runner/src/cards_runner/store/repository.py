@@ -40,6 +40,7 @@ from .schema import (
     added_column_alters,
     card_record_to_row,
     ddl_statements,
+    post_migration_ddl,
     row_to_card_record,
 )
 
@@ -300,7 +301,27 @@ class _SqlCardRepository(CardRepository):
         for statement in ddl_statements(self._dialect):
             self._run_write(statement)
         self._apply_added_columns()
+        for statement in post_migration_ddl(self._dialect):
+            self._safe_post_migration(statement)
         self._durable_commit("initialize schema")
+
+    def _safe_post_migration(self, statement: str) -> None:
+        """Run a post-migration DDL statement, tolerating idempotency
+        failures the engine can't express natively.
+
+        SQLite uses `CREATE INDEX IF NOT EXISTS` and never raises on
+        re-run. MySQL/Dolt has no idempotent form for `CREATE INDEX`;
+        re-running raises a duplicate-key error. Treat the duplicate
+        as a no-op so `initialize_schema()` stays idempotent for both
+        engines. Any other error propagates.
+        """
+        try:
+            self._run_write(statement)
+        except Exception as exc:  # noqa: BLE001 - dialects differ.
+            text = str(exc).lower()
+            if "duplicate" in text or "already exists" in text:
+                return
+            raise
 
     def _apply_added_columns(self) -> None:
         """Apply ALTER TABLE ADD COLUMN steps that the initial DDL omits.

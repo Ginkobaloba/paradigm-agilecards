@@ -51,7 +51,7 @@ from ..common.project_config import (
 )
 from ..common.types import DaemonConfig, RuntimePaths
 from ..store.repository import CardRepository
-from ..store.schema import ADDED_COLUMNS
+from ..store.schema import ADDED_COLUMNS, EXPECTED_TABLES
 
 
 @dataclass(frozen=True)
@@ -74,6 +74,20 @@ class SchemaReport:
     applied: bool
     sqlite_type: str
     mysql_type: str
+
+
+@dataclass(frozen=True)
+class TableReport:
+    """Per-`EXPECTED_TABLES` entry: present in the live database or not.
+
+    ADDED_COLUMNS only covers post-create migrations on existing tables.
+    Whole new tables (the ledger-chunk-1 `card_metrics` and
+    `metric_estimates`) need their own presence check so an operator can
+    confirm `initialize_schema()` actually ran end-to-end.
+    """
+
+    name: str
+    present: bool
 
 
 @dataclass(frozen=True)
@@ -108,6 +122,7 @@ class DoctorReport:
     binaries: list[BinaryReport]
     project_config: ProjectConfigReport
     schema: list[SchemaReport]
+    tables: list[TableReport]
     knobs: list[KnobReport]
     notes: list[str] = field(default_factory=list)
 
@@ -149,6 +164,7 @@ def build_report(
     binaries = _binary_reports(cfg, dolt_bin_env=dolt_bin_env)
     project = _project_config_report(cfg)
     schema = _schema_report(repo, notes=notes)
+    tables = _table_report(repo, notes=notes)
     knobs = _knob_reports(cfg)
     return DoctorReport(
         todo_root=str(cfg.todo_root),
@@ -156,6 +172,7 @@ def build_report(
         binaries=binaries,
         project_config=project,
         schema=schema,
+        tables=tables,
         knobs=knobs,
         notes=notes,
     )
@@ -200,6 +217,14 @@ def render_text(report: DoctorReport) -> str:
         for s in report.schema:
             status = "applied" if s.applied else "PENDING"
             lines.append(f"  {s.table}.{s.column}: {status}")
+    lines.append("")
+    lines.append("tables:")
+    if not report.tables:
+        lines.append("  (no introspection -- pass --check-store to enable)")
+    else:
+        for t in report.tables:
+            status = "present" if t.present else "MISSING"
+            lines.append(f"  {t.name}: {status}")
     lines.append("")
     lines.append("knobs:")
     for k in report.knobs:
@@ -358,6 +383,54 @@ def _live_card_columns(
         return {row[0] for row in cur.fetchall()}
     except Exception as exc:  # noqa: BLE001 - the store dialect is unsupported.
         notes.append(f"schema introspection failed: {exc}")
+        return set()
+
+
+def _table_report(
+    repo: CardRepository | None, *, notes: list[str],
+) -> list[TableReport]:
+    """Report presence/absence for every table in `EXPECTED_TABLES`."""
+    if repo is None:
+        # `_schema_report` already added the "open the store" note; no
+        # need to duplicate it here.
+        return []
+    live = _live_tables(repo, notes=notes)
+    return [TableReport(name=name, present=name in live) for name in EXPECTED_TABLES]
+
+
+def _live_tables(
+    repo: CardRepository, *, notes: list[str],
+) -> set[str]:
+    """Introspect the database's live table list.
+
+    Same dual-path the column check uses: SQLite via `sqlite_master`,
+    MySQL/Dolt via `information_schema.tables`. A repo without an
+    accessible connection returns the empty set + a note.
+    """
+    conn = getattr(repo, "_conn", None) or getattr(repo, "conn", None)
+    if conn is None:
+        notes.append(
+            "table introspection unavailable: repo has no SQL connection "
+            "handle; all EXPECTED_TABLES reported as MISSING"
+        )
+        return set()
+    try:
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+        names = {row[0] for row in cur.fetchall()}
+        if names:
+            return names
+    except Exception:  # noqa: BLE001 - fall through to MySQL.
+        pass
+    try:
+        cur = conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = DATABASE()"
+        )
+        return {row[0] for row in cur.fetchall()}
+    except Exception as exc:  # noqa: BLE001 - unsupported dialect.
+        notes.append(f"table introspection failed: {exc}")
         return set()
 
 

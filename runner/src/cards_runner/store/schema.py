@@ -54,10 +54,81 @@ CARD_COLUMNS: tuple[str, ...] = (
     "story_hash",
     "trace_id",
     "pr_url",
+    "work_type",
     "frontmatter_extra",
     "frontmatter_raw",
     "body_md",
     "updated_at",
+)
+
+# Ledger chunk 1 (throughput-metrics) tables. Each is a
+# `CREATE TABLE IF NOT EXISTS` so a fresh init runs the full set and a
+# legacy DB picks them up the first time it opens through the chunk-1
+# schema. The columns mirror the spec verbatim:
+#
+# - `card_metrics` is the per-card normalized metrics row written by
+#   chunk 2 (the write surface). Joined one-to-one with `cards` on
+#   (tenant_id, card_id).
+# - `metric_estimates` is the derived percentile cache the read API
+#   serves. Slicing key is (tenant_id, work_type, tier) -- tenant_id
+#   is added to match the system-wide convention even though the spec
+#   showed the pair without it.
+CARD_METRICS_COLUMNS: tuple[str, ...] = (
+    "tenant_id",
+    "card_id",
+    "work_type",
+    "tier",
+    "pin_required",
+    "contract_authored_at",
+    "started_at",
+    "finished_at",
+    "agent_wall_seconds",
+    "agent_attempts",
+    "executor_tokens_total",
+    "executor_cost_usd",
+    "verifier_tokens_total",
+    "reviewer_tokens_total",
+    "human_review_wall_seconds",
+    "rework_cycles",
+    "diff_lines_added",
+    "diff_lines_removed",
+    "merge_gate",
+    "merged_at",
+    "regression_card_ids",
+    "contract_survived",
+    "incomplete_metrics",
+    "updated_at",
+)
+
+METRIC_ESTIMATES_COLUMNS: tuple[str, ...] = (
+    "tenant_id",
+    "work_type",
+    "tier",
+    "n_samples",
+    "agent_wall_seconds_p50",
+    "agent_wall_seconds_p75",
+    "agent_wall_seconds_p90",
+    "executor_tokens_p50",
+    "executor_tokens_p90",
+    "human_review_wall_seconds_p50",
+    "human_review_wall_seconds_p90",
+    "rework_rate_mean",
+    "contract_survival_rate",
+    "last_calibrated_at",
+    "prior_weight",
+)
+
+# Every table the chunk-1 DDL creates. Doctor reports presence/absence
+# of each so an operator can confirm migrations actually applied. Order
+# matches the SQLite + MySQL DDL lists.
+EXPECTED_TABLES: tuple[str, ...] = (
+    "cards",
+    "card_events",
+    "batches",
+    "dependencies",
+    "counters",
+    "card_metrics",
+    "metric_estimates",
 )
 
 CARD_EVENT_COLUMNS: tuple[str, ...] = (
@@ -102,6 +173,26 @@ def ddl_statements(dialect: str) -> list[str]:
     raise ValueError(f"unknown dialect {dialect!r}")
 
 
+def post_migration_ddl(dialect: str) -> list[str]:
+    """DDL statements that must run AFTER `_apply_added_columns`.
+
+    Indexes on columns added via `ADDED_COLUMNS` cannot live in the
+    initial DDL pass: on a legacy database whose CREATE TABLE no-ops,
+    the column doesn't exist yet at index-creation time and the
+    statement raises. The post-migration list runs after the ALTER pass
+    has reconciled the schema.
+
+    Every statement is idempotent (`CREATE INDEX IF NOT EXISTS` for
+    SQLite; MySQL/Dolt does not support the idempotent form, so the
+    repository swallows the duplicate-index error itself).
+    """
+    if dialect == DIALECT_SQLITE:
+        return _SQLITE_POST_MIGRATION_DDL
+    if dialect == DIALECT_MYSQL:
+        return _MYSQL_POST_MIGRATION_DDL
+    raise ValueError(f"unknown dialect {dialect!r}")
+
+
 # ---- column migrations ---------------------------------------------------
 # Columns added after the initial CREATE TABLE. The repository runs these
 # after every `initialize_schema()` to upgrade an existing database whose
@@ -115,6 +206,10 @@ def ddl_statements(dialect: str) -> list[str]:
 ADDED_COLUMNS: tuple[tuple[str, str, str, str], ...] = (
     # chunk 5: pr_url promoted from event payload to a queryable column.
     ("cards", "pr_url", "TEXT", "VARCHAR(512)"),
+    # ledger chunk 1: work_type stamps the planner's taxonomy on every
+    # card row. NULL on legacy / pre-ledger cards; the estimator
+    # excludes those rows from training data via `incomplete_metrics`.
+    ("cards", "work_type", "TEXT", "VARCHAR(32)"),
 )
 
 
@@ -165,6 +260,7 @@ _SQLITE_DDL: list[str] = [
         story_hash       TEXT,
         trace_id         TEXT,
         pr_url           TEXT,
+        work_type        TEXT,
         frontmatter_extra TEXT NOT NULL DEFAULT '{}',
         frontmatter_raw  TEXT NOT NULL DEFAULT '',
         body_md          TEXT NOT NULL DEFAULT '',
@@ -217,7 +313,81 @@ _SQLITE_DDL: list[str] = [
         PRIMARY KEY (tenant_id, name)
     )
     """,
+    # Ledger chunk 1: per-card normalized metrics row. Joined 1:1 with
+    # `cards` on (tenant_id, card_id). All metric fields are nullable
+    # because cards populate them across the lifecycle; the read API
+    # treats NULL as "not yet measured".
+    #
+    # `regression_card_ids` is a JSON-encoded string (TEXT here; LONGTEXT
+    # in MySQL) so the daemon can append/replace the list without a
+    # native JSON column. Matches the same "store owns the bytes"
+    # convention as `frontmatter_extra` and `card_events.payload`.
+    """
+    CREATE TABLE IF NOT EXISTS card_metrics (
+        tenant_id                 TEXT NOT NULL,
+        card_id                   TEXT NOT NULL,
+        work_type                 TEXT,
+        tier                      INTEGER,
+        pin_required              INTEGER,
+        contract_authored_at      TEXT,
+        started_at                TEXT,
+        finished_at               TEXT,
+        agent_wall_seconds        REAL,
+        agent_attempts            INTEGER,
+        executor_tokens_total     INTEGER,
+        executor_cost_usd         REAL,
+        verifier_tokens_total     INTEGER,
+        reviewer_tokens_total     INTEGER,
+        human_review_wall_seconds REAL,
+        rework_cycles             INTEGER,
+        diff_lines_added          INTEGER,
+        diff_lines_removed        INTEGER,
+        merge_gate                TEXT,
+        merged_at                 TEXT,
+        regression_card_ids       TEXT NOT NULL DEFAULT '[]',
+        contract_survived         INTEGER,
+        incomplete_metrics        INTEGER NOT NULL DEFAULT 0,
+        updated_at                TEXT,
+        PRIMARY KEY (tenant_id, card_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_card_metrics_bucket "
+    "ON card_metrics (tenant_id, work_type, tier)",
+    # Ledger chunk 1: derived percentile cache. PK is the slicing key
+    # the estimator queries; rebuildable from `card_metrics` so we
+    # treat the cache as recomputable rather than authoritative.
+    """
+    CREATE TABLE IF NOT EXISTS metric_estimates (
+        tenant_id                       TEXT NOT NULL,
+        work_type                       TEXT NOT NULL,
+        tier                            INTEGER NOT NULL,
+        n_samples                       INTEGER NOT NULL DEFAULT 0,
+        agent_wall_seconds_p50          REAL,
+        agent_wall_seconds_p75          REAL,
+        agent_wall_seconds_p90          REAL,
+        executor_tokens_p50             INTEGER,
+        executor_tokens_p90             INTEGER,
+        human_review_wall_seconds_p50   REAL,
+        human_review_wall_seconds_p90   REAL,
+        rework_rate_mean                REAL,
+        contract_survival_rate          REAL,
+        last_calibrated_at              TEXT,
+        prior_weight                    REAL,
+        PRIMARY KEY (tenant_id, work_type, tier)
+    )
+    """,
 ]
+
+# Statements that depend on a column added via `ADDED_COLUMNS`. The
+# initial DDL pass runs CREATE TABLE IF NOT EXISTS, which no-ops on a
+# legacy DB whose schema predates the column; the column is then added
+# by `_apply_added_columns`; the index lives here so it lands after
+# both. Idempotent.
+_SQLITE_POST_MIGRATION_DDL: list[str] = [
+    "CREATE INDEX IF NOT EXISTS idx_cards_work_type "
+    "ON cards (tenant_id, work_type)",
+]
+
 
 # --- MySQL / Dolt DDL ------------------------------------------------
 # Dolt enforces declared types. VARCHAR lengths are generous but
@@ -249,6 +419,7 @@ _MYSQL_DDL: list[str] = [
         story_hash       VARCHAR(128),
         trace_id         VARCHAR(64),
         pr_url           VARCHAR(512),
+        work_type        VARCHAR(32),
         frontmatter_extra LONGTEXT NOT NULL,
         frontmatter_raw  LONGTEXT NOT NULL,
         body_md          LONGTEXT NOT NULL,
@@ -298,6 +469,63 @@ _MYSQL_DDL: list[str] = [
         PRIMARY KEY (tenant_id, name)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS card_metrics (
+        tenant_id                 VARCHAR(64)  NOT NULL,
+        card_id                   VARCHAR(128) NOT NULL,
+        work_type                 VARCHAR(32),
+        tier                      INT,
+        pin_required              TINYINT,
+        contract_authored_at      VARCHAR(32),
+        started_at                VARCHAR(32),
+        finished_at               VARCHAR(32),
+        agent_wall_seconds        DOUBLE,
+        agent_attempts            INT,
+        executor_tokens_total     BIGINT,
+        executor_cost_usd         DOUBLE,
+        verifier_tokens_total     BIGINT,
+        reviewer_tokens_total     BIGINT,
+        human_review_wall_seconds DOUBLE,
+        rework_cycles             INT,
+        diff_lines_added          INT,
+        diff_lines_removed        INT,
+        merge_gate                VARCHAR(32),
+        merged_at                 VARCHAR(32),
+        regression_card_ids       LONGTEXT NOT NULL,
+        contract_survived         TINYINT,
+        incomplete_metrics        TINYINT NOT NULL DEFAULT 0,
+        updated_at                VARCHAR(32),
+        PRIMARY KEY (tenant_id, card_id),
+        INDEX idx_card_metrics_bucket (tenant_id, work_type, tier)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS metric_estimates (
+        tenant_id                       VARCHAR(64) NOT NULL,
+        work_type                       VARCHAR(32) NOT NULL,
+        tier                            INT         NOT NULL,
+        n_samples                       INT         NOT NULL DEFAULT 0,
+        agent_wall_seconds_p50          DOUBLE,
+        agent_wall_seconds_p75          DOUBLE,
+        agent_wall_seconds_p90          DOUBLE,
+        executor_tokens_p50             BIGINT,
+        executor_tokens_p90             BIGINT,
+        human_review_wall_seconds_p50   DOUBLE,
+        human_review_wall_seconds_p90   DOUBLE,
+        rework_rate_mean                DOUBLE,
+        contract_survival_rate          DOUBLE,
+        last_calibrated_at              VARCHAR(32),
+        prior_weight                    DOUBLE,
+        PRIMARY KEY (tenant_id, work_type, tier)
+    )
+    """,
+]
+
+# MySQL/Dolt has no `CREATE INDEX IF NOT EXISTS`. The repository wraps
+# each statement and tolerates the duplicate-index error so re-running
+# `initialize_schema()` stays idempotent.
+_MYSQL_POST_MIGRATION_DDL: list[str] = [
+    "CREATE INDEX idx_cards_work_type ON cards (tenant_id, work_type)",
 ]
 
 
@@ -333,6 +561,7 @@ def card_record_to_row(record: CardRecord) -> dict[str, Any]:
         "story_hash": record.story_hash,
         "trace_id": record.trace_id,
         "pr_url": record.pr_url,
+        "work_type": record.work_type,
         "frontmatter_extra": json.dumps(record.frontmatter_extra, sort_keys=True),
         "frontmatter_raw": record.frontmatter_raw,
         "body_md": record.body_md,
@@ -369,6 +598,7 @@ def row_to_card_record(row: dict[str, Any]) -> CardRecord:
         story_hash=_opt_str(row.get("story_hash")),
         trace_id=_opt_str(row.get("trace_id")),
         pr_url=_opt_str(row.get("pr_url")),
+        work_type=_opt_str(row.get("work_type")),
         frontmatter_extra=extra,
         frontmatter_raw=str(row.get("frontmatter_raw") or ""),
         body_md=str(row.get("body_md") or ""),
@@ -398,6 +628,9 @@ __all__ = [
     "CARD_EVENT_COLUMNS",
     "BATCH_COLUMNS",
     "DEPENDENCY_COLUMNS",
+    "CARD_METRICS_COLUMNS",
+    "METRIC_ESTIMATES_COLUMNS",
+    "EXPECTED_TABLES",
     "DIALECT_SQLITE",
     "DIALECT_MYSQL",
     "BATCH_COUNTER_NAME",

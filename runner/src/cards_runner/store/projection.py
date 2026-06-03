@@ -32,6 +32,7 @@ from typing import Any
 
 import yaml  # type: ignore[import-untyped]
 
+from ..common.types import CANONICAL_WORK_TYPES, is_canonical_work_type
 from .models import (
     DEFAULT_TENANT,
     FIELD_VALUE_OVERRIDES,
@@ -90,6 +91,7 @@ _CANONICAL_FIELD_ORDER: tuple[str, ...] = (
     "points",
     "stakes",
     "difficulty",
+    "work_type",
     "thinking_depth",
     "model",
     "extended_thinking",
@@ -213,6 +215,25 @@ def _record_from_parsed(
     if not card_id:
         raise ProjectionError("card has no id and no fallback was given")
 
+    # Per docs/design/throughput_metrics_ledger.md section 4.1, the
+    # runner validates work_type on projection and rejects an unknown
+    # enum value with a clear error. A missing field (None) is the
+    # legacy-backfill case and passes through untouched; chunk 2's
+    # writer stamps it `unknown` with incomplete_metrics=True. A value
+    # that is present but not canonical is a planner typo that would
+    # silently fragment every estimator / contract-survival / trust
+    # bucket keyed off this field, so it fails loudly here.
+    raw_work_type = fm.get("work_type")
+    if raw_work_type is not None and not is_canonical_work_type(
+        str(raw_work_type)
+    ):
+        raise ProjectionError(
+            f"card {card_id!r} has work_type {raw_work_type!r}, which is not "
+            f"a canonical value. Allowed: {', '.join(CANONICAL_WORK_TYPES)}. "
+            "New cards must use a first-class type; 'unknown' is reserved for "
+            "pre-ledger backfill."
+        )
+
     if status_override is not None:
         status = status_override
     else:
@@ -265,6 +286,7 @@ _PROMOTABLE_ATTRS: frozenset[str] = frozenset({
     "story_hash",
     "trace_id",
     "pr_url",
+    "work_type",
 })
 
 

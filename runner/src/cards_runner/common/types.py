@@ -31,6 +31,51 @@ ALL_SUBFOLDERS: Final[tuple[str, ...]] = (
     SUBFOLDER_BLOCKED,
 )
 
+
+# Canonical card work_type values. The planner stamps one of these on
+# every card it writes; the runner records the value on the cards row
+# and the ledger slices by it. Per
+# `docs/design/throughput_metrics_ledger.md` section 4, the taxonomy
+# is fixed at nine values: eight first-class types plus `unknown`, the
+# explicit escape valve used only when a pre-ledger card is loaded
+# without the field set. New cards must NOT use `unknown`.
+#
+# Adding a new entry is intentionally a schema-level act, not a free
+# string: every consumer (estimator buckets, contract-survival slices,
+# trust-signal aggregator) keys off this tuple, and a typo'd value at
+# the planner would silently fragment data.
+WORK_TYPE_FEATURE: Final[str] = "feature"
+WORK_TYPE_REFACTOR: Final[str] = "refactor"
+WORK_TYPE_BUGFIX: Final[str] = "bugfix"
+WORK_TYPE_INFRASTRUCTURE: Final[str] = "infrastructure"
+WORK_TYPE_DOCS: Final[str] = "docs"
+WORK_TYPE_SPIKE: Final[str] = "spike"
+WORK_TYPE_CONTRACT: Final[str] = "contract"
+WORK_TYPE_MIGRATION: Final[str] = "migration"
+WORK_TYPE_UNKNOWN: Final[str] = "unknown"
+
+CANONICAL_WORK_TYPES: Final[tuple[str, ...]] = (
+    WORK_TYPE_FEATURE,
+    WORK_TYPE_REFACTOR,
+    WORK_TYPE_BUGFIX,
+    WORK_TYPE_INFRASTRUCTURE,
+    WORK_TYPE_DOCS,
+    WORK_TYPE_SPIKE,
+    WORK_TYPE_CONTRACT,
+    WORK_TYPE_MIGRATION,
+    WORK_TYPE_UNKNOWN,
+)
+
+
+def is_canonical_work_type(value: str | None) -> bool:
+    """True when `value` is one of the nine canonical work_type strings.
+
+    None is not canonical: a card with no work_type at all is the
+    legacy-backfill case, separate from `unknown` which is the
+    explicit "we looked and could not classify" value.
+    """
+    return value is not None and value in CANONICAL_WORK_TYPES
+
 # Where the per-attempt runtime data lives, relative to TODO root.
 RUNS_DIRNAME: Final[str] = "_runs"
 

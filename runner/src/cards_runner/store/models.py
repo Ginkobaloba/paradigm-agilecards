@@ -143,6 +143,13 @@ class CardRecord:
     # a PR; the dashboard reads this so the operator can click straight
     # to the open PR without grepping the event log.
     pr_url: str | None = None
+    # The card's work_type, promoted in ledger chunk 1 per
+    # `docs/design/throughput_metrics_ledger.md` section 4. The planner
+    # stamps one of the canonical values from
+    # `common.types.CANONICAL_WORK_TYPES`; NULL on legacy / pre-ledger
+    # cards, which the estimator excludes from its training set via
+    # the `incomplete_metrics` flag (ledger chunk 2 wires that path).
+    work_type: str | None = None
 
     # The long tail of the ~40-field frontmatter: every key not
     # promoted above. Stored as JSON. Keeps the schema stable against
@@ -194,6 +201,7 @@ _PROMOTED_FIELD_NAMES: frozenset[str] = frozenset({
     "story_hash",
     "trace_id",
     "pr_url",
+    "work_type",
     "status",
 })
 
