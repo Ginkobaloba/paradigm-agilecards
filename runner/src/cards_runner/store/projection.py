@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import yaml  # type: ignore[import-untyped]
+import yaml
 
 from ..common.types import CANONICAL_WORK_TYPES, is_canonical_work_type
 from .models import (

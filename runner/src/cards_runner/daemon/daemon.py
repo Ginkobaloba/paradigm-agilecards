@@ -68,6 +68,8 @@ from ..store import (
     EventType,
     build_repository,
 )
+from ..metrics.store import MetricsStore
+from ..metrics.writer import LedgerWriter
 from ..store.projection import ProjectionError, parse_card_text, project_card_file
 from ..verifier import VerifierError, VerifierResult, verify_card
 from ..verifier.runner import VERDICT_FAIL, VERDICT_PASS, VERDICT_STANDUP
@@ -167,6 +169,10 @@ class Daemon:
         self._sibling_reviewer_client = sibling_reviewer_client
         self._amendment_reviewer_client = amendment_reviewer_client
         self._amendment_editor_client = amendment_editor_client
+        # Ledger chunk 2 writer. Built lazily on first use (it needs the
+        # store connection, which `_boot` opens), and only when
+        # `cfg.ledger_enabled`. None means metrics recording is off.
+        self._ledger: LedgerWriter | None = None
 
     @property
     def project_config(self) -> ProjectConfig:
@@ -873,6 +879,7 @@ class Daemon:
             return
 
         self._emit_escalated_events(claim, fields.get("cascade_history"))
+        self._record_executor_metrics(claim, fields, sidecar)
 
         if rc in (EXIT_COST_CAP_HALT, EXIT_HALT_SIGNAL):
             self._route_halt_to_blocked(claim, rc, sidecar)
@@ -907,6 +914,75 @@ class Daemon:
         except (OSError, ValueError):
             return {}
         return data if isinstance(data, dict) else {}
+
+    def _ledger_writer(self) -> "LedgerWriter | None":
+        """Return the metrics writer, building it once on first use.
+
+        None when `cfg.ledger_enabled` is False (the default) so the
+        lifecycle hooks short-circuit with zero overhead. Construction
+        failure is swallowed -- a broken metrics writer must not take
+        the daemon down."""
+        if not self.cfg.ledger_enabled:
+            return None
+        if self._ledger is None:
+            try:
+                store = MetricsStore.from_repository(self.repo)
+                self._ledger = LedgerWriter(self.paths, store)
+            except Exception as exc:  # noqa: BLE001 - best-effort.
+                log.warning("could not build ledger writer: %s", exc)
+                return None
+        return self._ledger
+
+    def _record_executor_metrics(
+        self, claim: ClaimedCard, fields: dict[str, Any],
+        sidecar: dict[str, Any],
+    ) -> None:
+        """Best-effort: record card-created + executor-exit metrics.
+
+        Wholly guarded -- any failure logs at WARNING and returns. The
+        metrics ledger is a denormalized side-record; it must never
+        affect the executor-result landing that just succeeded."""
+        writer = self._ledger_writer()
+        if writer is None:
+            return
+        try:
+            record = self.repo.get_card(claim.card_id, tenant_id=self.tenant_id)
+            if record is None:
+                return
+            pin = record.field_value("pin_required")
+            writer.record_card_created(
+                card_id=claim.card_id,
+                tenant_id=self.tenant_id,
+                work_type=record.work_type,
+                tier=record.points,
+                pin_required=None if pin is None else bool(pin),
+            )
+            if record.started_at is not None:
+                writer.record_card_started(
+                    card_id=claim.card_id,
+                    tenant_id=self.tenant_id,
+                    attempt_trace_id=claim.attempt_trace_id,
+                    started_at=record.started_at,
+                )
+            tokens_raw = fields.get("actual_tokens")
+            if tokens_raw is None:
+                tokens_raw = sidecar.get("actual_tokens")
+            cost_raw = sidecar.get("actual_cost_usd")
+            finished_raw = fields.get("finished_at")
+            writer.record_executor_exit(
+                card_id=claim.card_id,
+                tenant_id=self.tenant_id,
+                attempt_trace_id=claim.attempt_trace_id,
+                started_at=record.started_at,
+                finished_at=None if finished_raw is None else str(finished_raw),
+                tokens=int(tokens_raw) if tokens_raw is not None else 0,
+                cost_usd=float(cost_raw) if cost_raw is not None else None,
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort by contract.
+            log.warning(
+                "ledger executor-metrics write failed for %s: %s",
+                claim.card_id, exc,
+            )
 
     def _emit_escalated_events(
         self, claim: ClaimedCard, cascade_history: Any

@@ -244,6 +244,12 @@ class DaemonConfig:
     # 0 to disable the sweep. Default 72 hours -- long enough that a
     # Friday-afternoon review can still be debugged on Monday morning.
     reviewer_marker_ttl_hours: int = 72
+    # Ledger chunk 2: the throughput-metrics writer. Off by default so
+    # existing deployments and the chunk 1-6 test suites see no behavior
+    # change. When enabled, lifecycle hooks append to
+    # `signals/metrics_events.jsonl` and keep the `card_metrics` row in
+    # sync (best-effort; a metrics write never aborts the daemon sweep).
+    ledger_enabled: bool = False
     project_config_path: Path | None = None
     log_dir: Path | None = None
 

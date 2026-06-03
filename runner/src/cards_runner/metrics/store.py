@@ -14,8 +14,11 @@ plumbing.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Protocol
+
+from ..common.types import now_utc_iso
 
 
 class _Connection(Protocol):
@@ -43,6 +46,47 @@ class CardMetricsRow:
     rework_cycles: int | None
     contract_survived: int | None
     incomplete_metrics: int
+
+
+@dataclass(frozen=True)
+class CardMetricsFullRow:
+    """The complete `card_metrics` row the chunk-2 writer persists.
+
+    Mirrors `schema.CARD_METRICS_COLUMNS` field-for-field (minus the
+    derived `updated_at`, which the upsert stamps). This is the write
+    side; `CardMetricsRow` above is the narrow read projection the
+    estimator consumes. Keeping them separate stops the estimator's hot
+    read from carrying twenty-odd columns it never looks at.
+
+    `regression_card_ids` is the decoded list; the store serializes it
+    to the JSON TEXT column. Booleans (`pin_required`, `contract_survived`,
+    `incomplete_metrics`) are stored as 0/1 integers to match the schema
+    (SQLite has no native bool; Dolt uses TINYINT).
+    """
+
+    tenant_id: str
+    card_id: str
+    work_type: str | None
+    tier: int | None
+    pin_required: bool | None
+    contract_authored_at: str | None
+    started_at: str | None
+    finished_at: str | None
+    agent_wall_seconds: float | None
+    agent_attempts: int | None
+    executor_tokens_total: int | None
+    executor_cost_usd: float | None
+    verifier_tokens_total: int | None
+    reviewer_tokens_total: int | None
+    human_review_wall_seconds: float | None
+    rework_cycles: int | None
+    diff_lines_added: int | None
+    diff_lines_removed: int | None
+    merge_gate: str | None
+    merged_at: str | None
+    regression_card_ids: tuple[str, ...]
+    contract_survived: bool | None
+    incomplete_metrics: bool
 
 
 @dataclass(frozen=True)
@@ -135,6 +179,33 @@ class MetricsStore:
         )
         return [_row_to_card_metrics(row) for row in cur.fetchall()]
 
+    def get_card_metrics(
+        self, *, tenant_id: str, card_id: str
+    ) -> CardMetricsFullRow | None:
+        """Return the full `card_metrics` row for one card, or None.
+
+        Used by the writer's rebuild path and by the audit-log replay
+        verification (spec section 12.3) to compare a live row against
+        one rebuilt from the event log.
+        """
+        cur = self._conn.execute(
+            "SELECT tenant_id, card_id, work_type, tier, pin_required,"
+            " contract_authored_at, started_at, finished_at,"
+            " agent_wall_seconds, agent_attempts, executor_tokens_total,"
+            " executor_cost_usd, verifier_tokens_total,"
+            " reviewer_tokens_total, human_review_wall_seconds,"
+            " rework_cycles, diff_lines_added, diff_lines_removed,"
+            " merge_gate, merged_at, regression_card_ids,"
+            " contract_survived, incomplete_metrics"
+            " FROM card_metrics"
+            " WHERE tenant_id = ? AND card_id = ?",
+            (tenant_id, card_id),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return _row_to_card_metrics_full(row)
+
     def get_estimate(
         self,
         *,
@@ -174,6 +245,42 @@ class MetricsStore:
         return [_row_to_estimate(row) for row in cur.fetchall()]
 
     # ---- writes -------------------------------------------------------
+
+    def upsert_card_metrics(self, row: CardMetricsFullRow) -> None:
+        """Replace the card's `card_metrics` row. Idempotent.
+
+        Keyed on `(tenant_id, card_id)` via INSERT OR REPLACE, exactly
+        as spec section 5.4 prescribes. The writer always supplies the
+        full row (rebuilt by folding the card's event log), so REPLACE
+        never loses a column. `updated_at` is stamped here so callers do
+        not have to.
+        """
+        self._conn.execute(
+            "INSERT OR REPLACE INTO card_metrics"
+            " (tenant_id, card_id, work_type, tier, pin_required,"
+            "  contract_authored_at, started_at, finished_at,"
+            "  agent_wall_seconds, agent_attempts, executor_tokens_total,"
+            "  executor_cost_usd, verifier_tokens_total,"
+            "  reviewer_tokens_total, human_review_wall_seconds,"
+            "  rework_cycles, diff_lines_added, diff_lines_removed,"
+            "  merge_gate, merged_at, regression_card_ids,"
+            "  contract_survived, incomplete_metrics, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+            " ?, ?, ?, ?, ?, ?, ?)",
+            (
+                row.tenant_id, row.card_id, row.work_type, row.tier,
+                _bool_to_int(row.pin_required), row.contract_authored_at,
+                row.started_at, row.finished_at, row.agent_wall_seconds,
+                row.agent_attempts, row.executor_tokens_total,
+                row.executor_cost_usd, row.verifier_tokens_total,
+                row.reviewer_tokens_total, row.human_review_wall_seconds,
+                row.rework_cycles, row.diff_lines_added,
+                row.diff_lines_removed, row.merge_gate, row.merged_at,
+                json.dumps(list(row.regression_card_ids)),
+                _bool_to_int(row.contract_survived),
+                int(row.incomplete_metrics), now_utc_iso(),
+            ),
+        )
 
     def upsert_estimate(self, row: MetricEstimateRow) -> None:
         """Replace the bucket's `metric_estimates` row. Idempotent.
@@ -222,6 +329,34 @@ def _row_to_card_metrics(row: Any) -> CardMetricsRow:
     )
 
 
+def _row_to_card_metrics_full(row: Any) -> CardMetricsFullRow:
+    return CardMetricsFullRow(
+        tenant_id=str(row[0]),
+        card_id=str(row[1]),
+        work_type=_opt_str(row[2]),
+        tier=_opt_int(row[3]),
+        pin_required=_opt_bool(row[4]),
+        contract_authored_at=_opt_str(row[5]),
+        started_at=_opt_str(row[6]),
+        finished_at=_opt_str(row[7]),
+        agent_wall_seconds=_opt_float(row[8]),
+        agent_attempts=_opt_int(row[9]),
+        executor_tokens_total=_opt_int(row[10]),
+        executor_cost_usd=_opt_float(row[11]),
+        verifier_tokens_total=_opt_int(row[12]),
+        reviewer_tokens_total=_opt_int(row[13]),
+        human_review_wall_seconds=_opt_float(row[14]),
+        rework_cycles=_opt_int(row[15]),
+        diff_lines_added=_opt_int(row[16]),
+        diff_lines_removed=_opt_int(row[17]),
+        merge_gate=_opt_str(row[18]),
+        merged_at=_opt_str(row[19]),
+        regression_card_ids=_decode_id_list(row[20]),
+        contract_survived=_opt_bool(row[21]),
+        incomplete_metrics=bool(row[22] or 0),
+    )
+
+
 def _row_to_estimate(row: Any) -> MetricEstimateRow:
     return MetricEstimateRow(
         tenant_id=str(row[0]),
@@ -254,7 +389,34 @@ def _opt_float(value: Any) -> float | None:
     return None if value is None else float(value)
 
 
+def _opt_bool(value: Any) -> bool | None:
+    return None if value is None else bool(value)
+
+
+def _bool_to_int(value: bool | None) -> int | None:
+    return None if value is None else int(value)
+
+
+def _decode_id_list(value: Any) -> tuple[str, ...]:
+    """Decode the `regression_card_ids` JSON TEXT column to a tuple.
+
+    The column is `NOT NULL DEFAULT '[]'`, so a well-formed row always
+    holds a JSON array. A malformed value degrades to empty rather than
+    raising: the audit log is authoritative, and a corrupt denormalized
+    cell should not crash a read."""
+    if value is None:
+        return ()
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(decoded, list):
+        return ()
+    return tuple(str(item) for item in decoded)
+
+
 __all__ = [
+    "CardMetricsFullRow",
     "CardMetricsRow",
     "MetricEstimateRow",
     "MetricsStore",

@@ -1,0 +1,125 @@
+"""Integration: the daemon's executor-exit hook feeds the ledger.
+
+Proves the chunk-2 writer is wired into a real daemon lifecycle hook
+(`_post_worker_exit`) behind the off-by-default `ledger_enabled` flag,
+and that with the flag ON a clean worker exit produces a `card_metrics`
+row rebuilt from the event log. With the flag OFF (the default), no
+metrics row and no event log appear -- the daemon behaves exactly as
+before, which is what keeps the rest of the suite green.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from cards_runner.common.types import (
+    EXIT_CLEAN,
+    PROJECTED_CARD_NAME,
+    WORKER_RESULT_NAME,
+    ClaimedCard,
+    DaemonConfig,
+    RuntimePaths,
+)
+from cards_runner.daemon.daemon import Daemon, _WorkerHandle
+from cards_runner.metrics import events as ev
+from cards_runner.metrics.store import MetricsStore
+from cards_runner.store.projection import project_card_file
+from cards_runner.store.sqlite_store import SqliteRepository
+
+
+def _cfg(todo_root: Path, store_spec: str, *, ledger_enabled: bool) -> DaemonConfig:
+    return DaemonConfig(
+        todo_root=todo_root,
+        store_spec=store_spec,
+        poll_interval_sec=0.1,
+        skip_worktree=True,
+        verifier_enabled=False,  # keep the test focused on the exit hook.
+        ledger_enabled=ledger_enabled,
+    )
+
+
+def _claim_and_project(
+    repo: SqliteRepository, paths: RuntimePaths, card_id: str,
+    *, finished_at: str | None = None, tokens: int | None = None,
+) -> ClaimedCard:
+    """Claim the card and project it the way a finished worker would.
+
+    The worker stamps `finished_at` / `actual_tokens` into the projected
+    file; the non-verbatim projection omits null fields, so we set them
+    on the in-memory record before projecting rather than string-editing
+    a `null` line that the projection never wrote."""
+    attempt = "att-" + card_id
+    repo.claim_card(card_id, claimed_by="tester", attempt_trace_id=attempt)
+    run_dir = paths.runs / attempt
+    run_dir.mkdir(parents=True, exist_ok=True)
+    card_file = run_dir / PROJECTED_CARD_NAME
+    record = repo.get_card(card_id)
+    assert record is not None
+    if finished_at is not None:
+        record.finished_at = finished_at
+    if tokens is not None:
+        record.actual_tokens = tokens
+    project_card_file(record, card_file, verbatim=False)
+    return ClaimedCard(
+        card_id=card_id, attempt_trace_id=attempt, trace_id=attempt,
+        run_dir=run_dir, worktree_path=run_dir / "worktree",
+        card_file=card_file,
+    )
+
+
+def _handle(claim: ClaimedCard) -> _WorkerHandle:
+    return _WorkerHandle(claim=claim, process=object(), spawned_at=0.0)  # type: ignore[arg-type]
+
+
+def test_exit_hook_writes_card_metrics_when_enabled(
+    repo: SqliteRepository, paths: RuntimePaths, store_spec: str,
+    todo_root: Path, card_factory: Any,
+) -> None:
+    card_id = "bLED-01"
+    card_factory(card_id)
+    repo.update_card_fields(card_id, {"work_type": "feature"})
+    claim = _claim_and_project(repo, paths, card_id,
+                               finished_at="2026-06-01T00:10:00Z", tokens=750)
+    (claim.run_dir / WORKER_RESULT_NAME).write_text(
+        json.dumps({"exit_code": 0, "actual_cost_usd": 0.2}),
+        encoding="utf-8",
+    )
+
+    daemon = Daemon(_cfg(todo_root, store_spec, ledger_enabled=True), repo=repo)
+    daemon._post_worker_exit(_handle(claim), EXIT_CLEAN)
+
+    store = MetricsStore.from_repository(repo)
+    row = store.get_card_metrics(tenant_id="default", card_id=card_id)
+    assert row is not None
+    assert row.work_type == "feature"
+    assert row.tier == 2  # points from the test card template
+    assert row.agent_attempts == 1
+    assert row.executor_tokens_total == 750
+    assert row.finished_at == "2026-06-01T00:10:00Z"
+    assert row.executor_cost_usd == 0.2
+    assert row.incomplete_metrics is False
+    # The event log exists and the row is reconstructable from it.
+    assert ev.events_path(paths).exists()
+    logged = ev.read_events_for_card(paths, card_id=card_id, tenant_id="default")
+    kinds = {e.kind for e in logged}
+    assert ev.KIND_CARD_CREATED in kinds
+    assert ev.KIND_EXECUTOR_EXITED in kinds
+
+
+def test_exit_hook_is_noop_when_disabled(
+    repo: SqliteRepository, paths: RuntimePaths, store_spec: str,
+    todo_root: Path, card_factory: Any,
+) -> None:
+    card_id = "bLED-02"
+    card_factory(card_id)
+    repo.update_card_fields(card_id, {"work_type": "feature"})
+    claim = _claim_and_project(repo, paths, card_id,
+                               finished_at="2026-06-01T00:10:00Z", tokens=750)
+
+    daemon = Daemon(_cfg(todo_root, store_spec, ledger_enabled=False), repo=repo)
+    daemon._post_worker_exit(_handle(claim), EXIT_CLEAN)
+
+    store = MetricsStore.from_repository(repo)
+    assert store.get_card_metrics(tenant_id="default", card_id=card_id) is None
+    assert not ev.events_path(paths).exists()
