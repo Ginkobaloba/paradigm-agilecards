@@ -1016,7 +1016,14 @@ class Daemon:
     ) -> None:
         """Best-effort: record the merge-gate decision (and PR-open, when
         a PR was opened) to the ledger. A skipped/no-op gate records
-        nothing."""
+        nothing.
+
+        Note: with `pr_gate_enabled=False` (the default) the gate degrades
+        to `skipped=True`, so `merge_gate` stays null for cards that still
+        land in `done` under chunk-3 auto-merge. That is by design here --
+        the gate did not actually route a PR. When the PR gate is wired,
+        the real `auto`/`sibling_review`/`human_review` decision is
+        captured."""
         writer = self._ledger_writer()
         if writer is None or outcome.skipped:
             return

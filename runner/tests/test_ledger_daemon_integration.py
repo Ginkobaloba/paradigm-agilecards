@@ -145,6 +145,13 @@ def test_verifier_and_merge_gate_telemetry(
     assert row is not None
     assert row.rework_cycles == 1
     assert row.merge_gate == "sibling_review"
+    # The PR-open event landed (pr_opened_at is not a stored column; it
+    # only feeds human_review_wall on merge, so assert via the log).
+    logged = ev.read_events_for_card(paths, card_id=card_id, tenant_id="default")
+    assert any(
+        e.kind == ev.KIND_PR_OPENED and e.dedup_key.startswith("opened:")
+        for e in logged
+    )
 
 
 def test_skipped_merge_outcome_records_no_gate(
@@ -174,6 +181,32 @@ def test_skipped_merge_outcome_records_no_gate(
     assert row is not None
     assert row.rework_cycles == 0  # verifier ran, no fail
     assert row.merge_gate is None  # skipped gate records nothing
+
+
+def test_verifier_and_gate_helpers_noop_when_disabled(
+    repo: SqliteRepository, paths: RuntimePaths, store_spec: str,
+    todo_root: Path, card_factory: Any,
+) -> None:
+    """With ledger off, the verifier/gate helpers write nothing."""
+    from cards_runner.daemon.merge_gate import MergeOutcome
+    from cards_runner.verifier.runner import VERDICT_FAIL, VerifierResult
+
+    card_id = "bLED-05"
+    card_factory(card_id)
+    claim = _claim_and_project(repo, paths, card_id)
+    daemon = Daemon(_cfg(todo_root, store_spec, ledger_enabled=False), repo=repo)
+    daemon._record_verifier_metrics(
+        claim, VerifierResult(overall_status=VERDICT_FAIL, items=())
+    )
+    daemon._record_merge_gate_metrics(
+        claim,
+        MergeOutcome(decision="sibling_review", to_status="blocked",
+                     merge_status="requires_review", reason="x",
+                     pr_url="https://x/y/1"),
+    )
+    store = MetricsStore.from_repository(repo)
+    assert store.get_card_metrics(tenant_id="default", card_id=card_id) is None
+    assert not ev.events_path(paths).exists()
 
 
 def test_exit_hook_is_noop_when_disabled(
