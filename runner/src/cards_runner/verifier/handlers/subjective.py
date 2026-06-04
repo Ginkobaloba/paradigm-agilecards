@@ -34,6 +34,7 @@ from typing import Any, Sequence
 
 from ...common.types import now_utc_iso
 from ...worker_stub.cost import CostGovernor, Pricing
+from ..risk_factor import RiskFactor, parse_risk_factors
 
 
 log = logging.getLogger(__name__)
@@ -64,12 +65,26 @@ _SUBJECTIVE_SYSTEM_PROMPT = (
     '  "items": [\n'
     '    {"index": <int>, "result": "pass" | "fail", '
     '"confidence": <float 0.0..1.0>, "reasoning": <string>}\n'
+    "  ],\n"
+    '  "risk_factors": [\n'
+    '    {"kind": <string>, "severity": "low" | "medium" | "high", '
+    '"description": <string>, "location": <string or null>, '
+    '"source_item_idx": <int or null>}\n'
     "  ]\n"
     "}\n"
-    "One entry per subjective item, in the order they were given. "
+    "One `items` entry per subjective item, in the order they were given. "
     "`confidence` is YOUR confidence in YOUR verdict, NOT the executor's "
     "confidence. A low confidence value (below 0.85) signals you want a "
-    "stronger model to take a second look at this item."
+    "stronger model to take a second look at this item.\n\n"
+    "`risk_factors` enumerates any code-level risks you noticed in the "
+    "card body or evidence, EVEN IF you marked every item as pass. We "
+    "will NOT use this list to flip your pass/fail call -- it only "
+    "decides who reviews the merge, so report honestly. Mark each "
+    "low / medium / high. Use an empty list if you saw none. Useful "
+    "kinds include external_call_added, guard_removed, raw_sql, "
+    "string_eval, crypto_change, error_swallowed, concurrency_change, "
+    "permission_change, unverified_assumption, incomplete_test_coverage, "
+    "dep_pin_loosened."
 )
 
 
@@ -101,6 +116,11 @@ class SubjectiveBatchResult:
     final_verdicts: tuple[SubjectiveItemVerdict, ...]
     cascade_appendix: tuple[dict[str, Any], ...]
     standup_items: tuple[int, ...]
+    # Gate chunk 1: risk factors the evaluator enumerated. Card-level, not
+    # per-item. Carries the last (strongest-tier) call's list, since that
+    # is the most authoritative read. Empty when no subjective call ran or
+    # the model emitted none. No gate consumes this yet.
+    risk_factors: tuple[RiskFactor, ...] = ()
 
 
 def evaluate_subjective_batch(
@@ -149,6 +169,9 @@ def evaluate_subjective_batch(
     pending: dict[int, Any] = {item.index: item for item in items}
     final_by_idx: dict[int, SubjectiveItemVerdict] = {}
     appendix: list[dict[str, Any]] = []
+    # Keep the risk factors from the latest tier that actually returned
+    # them; a stronger model's read supersedes a weaker one's.
+    last_risk_factors: tuple[RiskFactor, ...] = ()
 
     for tier in tiers_to_try:
         if not pending:
@@ -165,7 +188,7 @@ def evaluate_subjective_batch(
             break
 
         try:
-            verdicts, usage_in, usage_out = _one_tier_call(
+            verdicts, usage_in, usage_out, tier_risks = _one_tier_call(
                 client=client,
                 model=model,
                 tier=tier,
@@ -175,6 +198,8 @@ def evaluate_subjective_batch(
                 max_output_tokens=max_output_tokens,
             )
             governor.record_call(model, usage_in, usage_out)
+            if tier_risks:
+                last_risk_factors = tier_risks
         except Exception as exc:  # noqa: BLE001 - SDK / network.
             log.exception("subjective verifier call at %s failed", tier)
             now = now_utc_iso()
@@ -216,6 +241,7 @@ def evaluate_subjective_batch(
         final_verdicts=final_verdicts,
         cascade_appendix=tuple(appendix),
         standup_items=standup_items,
+        risk_factors=last_risk_factors,
     )
 
 
@@ -231,10 +257,11 @@ def _one_tier_call(
     card_body: str,
     items: list[Any],
     max_output_tokens: int,
-) -> tuple[tuple[SubjectiveItemVerdict, ...], int, int]:
+) -> tuple[tuple[SubjectiveItemVerdict, ...], int, int, tuple[RiskFactor, ...]]:
     """Issue one batched evaluator call and parse the result.
 
-    Returns (verdicts, input_tokens, output_tokens). Token counts come
+    Returns (verdicts, input_tokens, output_tokens, risk_factors). Token
+    counts come
     off the message's `usage` attribute when present (the real SDK
     populates it); fakes can omit it and the cascade still works -- the
     governor just sees zero tokens for that call, which is the right
@@ -249,6 +276,7 @@ def _one_tier_call(
     )
     text = _message_text(message)
     parsed = _parse_evaluator_json(text)
+    risk_factors = parse_risk_factors(parsed.get("risk_factors"))
     usage = getattr(message, "usage", None)
     in_tok = int(getattr(usage, "input_tokens", 0) or 0)
     out_tok = int(getattr(usage, "output_tokens", 0) or 0)
@@ -304,7 +332,7 @@ def _one_tier_call(
             )
         )
     out.sort(key=lambda v: v.item_idx)
-    return tuple(out), in_tok, out_tok
+    return tuple(out), in_tok, out_tok, risk_factors
 
 
 def _build_user_prompt(card_id: str, card_body: str, items: list[Any]) -> str:

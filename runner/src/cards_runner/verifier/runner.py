@@ -36,6 +36,7 @@ from .handlers.subjective import (
     evaluate_subjective_batch,
 )
 from .parse import AcceptanceItem, parse_acceptance_block
+from .risk_factor import RiskFactor
 from .types import CANONICAL_TYPES, SchemaError
 
 
@@ -84,6 +85,12 @@ class VerifierResult:
     standup_reason_items: tuple[int, ...] = field(default_factory=tuple)
     standup_reasons: tuple[str, ...] = field(default_factory=tuple)
     notes: str = ""
+    # Gate chunk 1: structured risk factors the subjective evaluator
+    # enumerated (spec section 3.6). Default empty for backward compat --
+    # a verifier that emits none, or a deterministic-only card, carries
+    # an empty tuple. No gate consumes this yet; it rides along until the
+    # confidence-gate skeleton lands.
+    risk_factors: tuple[RiskFactor, ...] = field(default_factory=tuple)
 
     @property
     def failed_items(self) -> tuple[ItemResult, ...]:
@@ -166,6 +173,7 @@ def verify_card(
         standup_reason_items=batch_result.standup_items,
         standup_reasons=standup_reasons,
         notes=_summary_note(all_items, batch_result),
+        risk_factors=batch_result.risk_factors,
     )
 
 

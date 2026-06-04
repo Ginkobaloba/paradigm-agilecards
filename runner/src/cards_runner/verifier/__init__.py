@@ -38,6 +38,7 @@ vendored in.
 """
 from __future__ import annotations
 
+from .risk_factor import RiskFactor, parse_risk_factors
 from .runner import (
     HandlerResult,
     ItemResult,
@@ -52,8 +53,10 @@ __all__ = [
     "CANONICAL_TYPES",
     "HandlerResult",
     "ItemResult",
+    "RiskFactor",
     "SchemaError",
     "VerifierError",
     "VerifierResult",
+    "parse_risk_factors",
     "verify_card",
 ]
