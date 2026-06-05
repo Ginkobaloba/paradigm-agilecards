@@ -313,15 +313,24 @@ def build_gate_inputs(
     appendix = tuple(getattr(verifier_result, "cascade_history_appendix", ()) or ())
     cleared_tier: str | None = None
     confidences: list[float] = []
+    max_rank = 0
     if appendix:
-        max_rank = 0
         for entry in appendix:
             rank = _TIER_RANK.get(str(entry.get("tier_attempted", "")), 0)
             max_rank = max(max_rank, rank)
             if entry.get("confidence") is not None:
                 confidences.append(float(entry["confidence"]))
         cleared_tier = _RANK_TIER.get(max_rank)
-    verifier_conf = min(confidences) if confidences else 1.0
+    # cascade_climbs = tiers reached BEYOND the haiku start, NOT the raw
+    # appendix length (which has one row per item x tier, so a clean
+    # multi-item haiku pass would falsely look like many climbs). Assumes
+    # the standard haiku start (rank 1); a card that never left haiku has
+    # zero climbs.
+    cascade_climbs = max(0, max_rank - 1) if max_rank else 0
+    # No subjective phase -> neutral 0.85 (the formula's pivot, which
+    # contributes no bonus), not 1.0 (which would grant a free +0.05 for
+    # confidence the card never expressed).
+    verifier_conf = min(confidences) if confidences else 0.85
 
     pin = record.field_value("pin_required")
     files = tuple(getattr(diff_stats, "files", ()) or ())
@@ -333,7 +342,7 @@ def build_gate_inputs(
         pin_required=bool(pin) if pin is not None else False,
         all_deterministic_first_try=all_det_first,
         subjective_cleared_tier=cleared_tier,
-        cascade_climbs=len(appendix),
+        cascade_climbs=cascade_climbs,
         rework_cycles=rework_cycles,
         verifier_confidence=verifier_conf,
         sibling_decision=sibling_decision,

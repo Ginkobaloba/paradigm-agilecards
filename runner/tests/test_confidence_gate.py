@@ -246,7 +246,7 @@ def test_build_gate_inputs_extracts_signals() -> None:
     assert inp.work_type == "feature" and inp.tier == 3
     assert inp.all_deterministic_first_try is True
     assert inp.subjective_cleared_tier == "haiku"
-    assert inp.cascade_climbs == 1
+    assert inp.cascade_climbs == 0  # cleared at haiku -> no climb
     assert inp.verifier_confidence == pytest.approx(0.92)
     assert inp.diff_total_lines == 60
     assert inp.diff_is_test_only is False     # src/auth/x.py is not a test
@@ -270,8 +270,52 @@ def test_build_gate_inputs_deterministic_only_no_subjective() -> None:
                             diff_stats=DiffStats())
     assert inp.subjective_cleared_tier is None
     assert inp.cascade_climbs == 0
-    assert inp.verifier_confidence == 1.0  # no subjective -> full confidence
+    # No subjective phase -> neutral 0.85 (no free confidence bonus).
+    assert inp.verifier_confidence == 0.85
     assert inp.pin_required is False
+
+
+def test_build_gate_inputs_multi_item_haiku_is_zero_climbs() -> None:
+    """A clean multi-item haiku pass must read as ZERO climbs, not one
+    per appendix row -- the appendix has one entry per item x tier."""
+    from cards_runner.store.models import CardRecord
+    from cards_runner.verifier.runner import VerifierResult
+
+    record = CardRecord(card_id="c", tenant_id="default", status="active",
+                        work_type="feature", points=3)
+    vr = VerifierResult(
+        overall_status="pass", items=(),
+        cascade_history_appendix=(
+            {"tier_attempted": "haiku", "confidence": 0.9, "item_idx": 0},
+            {"tier_attempted": "haiku", "confidence": 0.95, "item_idx": 1},
+            {"tier_attempted": "haiku", "confidence": 0.88, "item_idx": 2},
+        ),
+    )
+    inp = build_gate_inputs(record=record, verifier_result=vr,
+                            diff_stats=DiffStats())
+    assert inp.cascade_climbs == 0          # never left haiku
+    assert inp.subjective_cleared_tier == "haiku"
+    assert inp.verifier_confidence == pytest.approx(0.88)  # min across items
+
+
+def test_build_gate_inputs_climb_to_sonnet() -> None:
+    from cards_runner.store.models import CardRecord
+    from cards_runner.verifier.runner import VerifierResult
+
+    record = CardRecord(card_id="c", tenant_id="default", status="active",
+                        work_type="feature", points=3)
+    vr = VerifierResult(
+        overall_status="pass", items=(),
+        cascade_history_appendix=(
+            {"tier_attempted": "haiku", "confidence": 0.5, "item_idx": 0},
+            {"tier_attempted": "sonnet", "confidence": 0.93, "item_idx": 0},
+        ),
+    )
+    inp = build_gate_inputs(record=record, verifier_result=vr,
+                            diff_stats=DiffStats())
+    assert inp.subjective_cleared_tier == "sonnet"
+    assert inp.cascade_climbs == 1          # haiku -> sonnet is one climb
+    assert inp.verifier_confidence == pytest.approx(0.5)  # worst entry
 
 
 # ---- bucket-history reader -------------------------------------------
