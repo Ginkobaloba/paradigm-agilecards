@@ -129,8 +129,14 @@ def fold_events(events: Iterable[ev.MetricsEvent]) -> CardMetricsFullRow | None:
             elif event.kind == ev.KIND_REGRESSION_FLAGGED:
                 regression_ids.add(event.dedup_key)
             elif event.kind == ev.KIND_CONTRACT_OUTCOME:
-                if payload.get("contract_survived") is not None:
-                    contract_survived = bool(payload["contract_survived"])
+                value = payload.get("contract_survived")
+                if value is not None:
+                    # Sticky-False: any amendment (survived=False) wins
+                    # regardless of event order. A clean `done` (True)
+                    # recorded after an earlier amendment must not erase
+                    # the drift signal. Once False, stays False.
+                    if contract_survived is not False:
+                        contract_survived = bool(value)
         except (ValueError, TypeError):
             # A corrupt-but-JSON-valid event (non-numeric tokens, junk
             # scalar) must not crash the rebuild. Skip it and flag the row

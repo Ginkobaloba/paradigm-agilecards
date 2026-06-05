@@ -312,6 +312,26 @@ def test_writer_contract_outcome(writer) -> None:
     assert row.contract_survived is True
 
 
+def test_fold_contract_survived_false_is_sticky() -> None:
+    """An amendment (False) before OR after a clean done (True) wins --
+    contract drift is permanent regardless of event order."""
+    created = ev.MetricsEvent(at="t", card_id="b1", tenant_id=TENANT,
+                              kind=ev.KIND_CARD_CREATED, dedup_key="b1",
+                              payload={"work_type": "feature", "tier": 3})
+    true_ev = ev.MetricsEvent(at="t", card_id="b1", tenant_id=TENANT,
+                              kind=ev.KIND_CONTRACT_OUTCOME, dedup_key="b1",
+                              payload={"contract_survived": True})
+    false_ev = ev.MetricsEvent(at="t", card_id="b1", tenant_id=TENANT,
+                               kind=ev.KIND_CONTRACT_OUTCOME, dedup_key="b1",
+                               payload={"contract_survived": False})
+    # True then False -> False (drift after a clean record).
+    assert fold_events([created, true_ev, false_ev]).contract_survived is False
+    # False then True -> False (sticky; a later clean done can't erase it).
+    assert fold_events([created, false_ev, true_ev]).contract_survived is False
+    # True only -> True.
+    assert fold_events([created, true_ev]).contract_survived is True
+
+
 # ---- spec 12.3 audit-log replay verification -------------------------
 
 

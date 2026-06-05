@@ -223,6 +223,29 @@ def test_pr_merged_metrics_records_diff_and_wall(
     assert row.human_review_wall_seconds > 0
 
 
+def test_contract_outcome_helper_records_and_is_sticky(
+    repo: SqliteRepository, paths: RuntimePaths, store_spec: str,
+    todo_root: Path, card_factory: Any,
+) -> None:
+    """The daemon contract-outcome helper records survival, and an
+    amendment (False) after a clean done (True) wins via the fold."""
+    card_id = "bLED-07"
+    card_factory(card_id)
+    repo.update_card_fields(card_id, {"work_type": "feature"})
+    claim = _claim_and_project(repo, paths, card_id,
+                               finished_at="2026-06-03T00:10:00Z", tokens=100)
+    daemon = Daemon(_cfg(todo_root, store_spec, ledger_enabled=True), repo=repo)
+    daemon._post_worker_exit(_handle(claim), EXIT_CLEAN)
+    daemon._record_contract_outcome(card_id, survived=True)
+    store = MetricsStore.from_repository(repo)
+    assert store.get_card_metrics(
+        tenant_id="default", card_id=card_id).contract_survived is True
+    # A later amendment flips it to False and it stays there.
+    daemon._record_contract_outcome(card_id, survived=False)
+    assert store.get_card_metrics(
+        tenant_id="default", card_id=card_id).contract_survived is False
+
+
 def test_verifier_and_gate_helpers_noop_when_disabled(
     repo: SqliteRepository, paths: RuntimePaths, store_spec: str,
     todo_root: Path, card_factory: Any,

@@ -456,6 +456,7 @@ class Daemon:
                 if d.action == "unblocked":
                     summary["unblocked_to_done"] += 1
                     self._record_pr_merged_metrics(d)
+                    self._record_contract_outcome(d.card_id, survived=True)
         except Exception:  # noqa: BLE001
             log.exception("pr unblocker failed; continuing")
 
@@ -1046,6 +1047,29 @@ class Daemon:
                 claim.card_id, exc,
             )
 
+    def _record_contract_outcome(self, card_id: str, *, survived: bool) -> None:
+        """Best-effort: record whether the card's up-front contract held.
+
+        `survived=False` on any amendment / change-request route (drift);
+        `survived=True` when the card reaches `done` cleanly. The writer's
+        fold makes False sticky, so an amendment recorded before a later
+        clean `done` still lands False -- the order does not matter. Per
+        the ledger spec the contract-survival RATE (a later read-side
+        chunk) restricts this raw signal to contract-first cards via
+        `contract_authored_at`; the writer records it for every card."""
+        writer = self._ledger_writer()
+        if writer is None:
+            return
+        try:
+            writer.record_contract_outcome(
+                card_id=card_id, tenant_id=self.tenant_id, survived=survived
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort by contract.
+            log.warning(
+                "ledger contract-outcome write failed for %s: %s",
+                card_id, exc,
+            )
+
     def _record_pr_merged_metrics(self, decision: "UnblockDecision") -> None:
         """Best-effort: record a PR merge to the ledger from an unblock
         decision. The writer derives `human_review_wall_seconds` from the
@@ -1229,6 +1253,10 @@ class Daemon:
                 "could not drop amendment marker for %s: %s",
                 claim.card_id, exc,
             )
+
+        # Contract drift: the executor needed an AC amendment, so the
+        # up-front contract did not survive unchanged.
+        self._record_contract_outcome(claim.card_id, survived=False)
 
     def _route_halt_to_blocked(
         self, claim: ClaimedCard, rc: int, sidecar: dict[str, Any]
@@ -1558,6 +1586,13 @@ class Daemon:
                 "merge-gate transition failed for %s -> %s: %s",
                 claim.card_id, outcome.to_status, exc,
             )
+            return
+
+        # Card reached a terminal `done` via auto-merge without an
+        # amendment route: the contract survived (sticky-False in the
+        # fold means a prior amendment still wins).
+        if outcome.to_status == CardStatus.DONE.value:
+            self._record_contract_outcome(claim.card_id, survived=True)
 
     def _verifier_apply_fail(
         self, claim: ClaimedCard, result: VerifierResult
