@@ -206,6 +206,27 @@ class MetricsStore:
             return None
         return _row_to_card_metrics_full(row)
 
+    def bucket_regression(
+        self, *, tenant_id: str, work_type: str, tier: int
+    ) -> tuple[int, int]:
+        """Return (n_cards, n_regressed) for a `(work_type, tier)` bucket.
+
+        A card "regressed" if its `regression_card_ids` is a non-empty
+        JSON list (a follow-up bugfix cited it). The confidence gate's
+        historical-floor (spec 3.5) reads the rate; the trust-signal read
+        (a later chunk) refines the definition with a rolling window."""
+        cur = self._conn.execute(
+            "SELECT regression_card_ids FROM card_metrics"
+            " WHERE tenant_id = ? AND work_type = ? AND tier = ?",
+            (tenant_id, work_type, tier),
+        )
+        rows = cur.fetchall()
+        n = len(rows)
+        regressed = sum(
+            1 for r in rows if _decode_id_list(r[0])
+        )
+        return n, regressed
+
     def get_estimate(
         self,
         *,
