@@ -80,6 +80,10 @@ class UnblockDecision:
     reason: str = ""
     pr_state: str | None = None
     merged_at: str | None = None
+    # Ledger chunk 2: PR diff stats from `gh pr view`, populated on a
+    # merged PR so the daemon can record them on the card_metrics row.
+    diff_lines_added: int | None = None
+    diff_lines_removed: int | None = None
 
 
 def unblock_merged_cards(
@@ -135,7 +139,11 @@ def _process_card(
     # the project field names a real directory. For multi-remote projects
     # this disambiguates which repo gh resolves the PR against; for a
     # bare URL gh works either way, so the worktree is best-effort.
-    view = gh.view_pr(identifier=pr_url, worktree=_project_worktree(record))
+    view = gh.view_pr(
+        identifier=pr_url,
+        worktree=_project_worktree(record),
+        fields=("state", "mergedAt", "url", "additions", "deletions"),
+    )
     if not view.ok:
         log.info(
             "gh pr view failed for %s (%s): %s",
@@ -149,6 +157,8 @@ def _process_card(
     parsed = view.parsed or {}
     state = _normalize_state(parsed.get("state"))
     merged_at = parsed.get("mergedAt") or parsed.get("merged_at")
+    diff_added = _opt_int(parsed.get("additions"))
+    diff_removed = _opt_int(parsed.get("deletions"))
     if state != "merged":
         return UnblockDecision(
             card_id=record.card_id,
@@ -178,6 +188,8 @@ def _process_card(
         reason="gh reported MERGED; transitioned blocked -> done",
         pr_state=state,
         merged_at=merged_at,
+        diff_lines_added=diff_added,
+        diff_lines_removed=diff_removed,
     )
 
 
@@ -237,6 +249,16 @@ def _project_worktree(record: CardRecord) -> Path | None:
     if not path.is_dir():
         return None
     return path
+
+
+def _opt_int(value: Any) -> int | None:
+    """Coerce a gh JSON number to int, or None if absent/unparseable."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _normalize_state(value: Any) -> str | None:

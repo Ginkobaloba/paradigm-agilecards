@@ -91,7 +91,7 @@ from .sibling_reviewer import (
     run_sibling_reviews,
 )
 from .spawner import spawn_worker
-from .unblocker import unblock_merged_cards
+from .unblocker import UnblockDecision, unblock_merged_cards
 from .worktree import WorktreeCreateError, prepare_worktree, prune_git_worktrees
 
 
@@ -455,6 +455,7 @@ class Daemon:
             for d in decisions:
                 if d.action == "unblocked":
                     summary["unblocked_to_done"] += 1
+                    self._record_pr_merged_metrics(d)
         except Exception:  # noqa: BLE001
             log.exception("pr unblocker failed; continuing")
 
@@ -1043,6 +1044,29 @@ class Daemon:
             log.warning(
                 "ledger merge-gate-metrics write failed for %s: %s",
                 claim.card_id, exc,
+            )
+
+    def _record_pr_merged_metrics(self, decision: "UnblockDecision") -> None:
+        """Best-effort: record a PR merge to the ledger from an unblock
+        decision. The writer derives `human_review_wall_seconds` from the
+        pr-opened event (recorded by the merge-gate hook) and this
+        merged_at. Diff stats come from the `gh pr view` the unblocker
+        already ran."""
+        writer = self._ledger_writer()
+        if writer is None:
+            return
+        try:
+            writer.record_pr_merged(
+                card_id=decision.card_id,
+                tenant_id=self.tenant_id,
+                merged_at=decision.merged_at,
+                diff_lines_added=decision.diff_lines_added,
+                diff_lines_removed=decision.diff_lines_removed,
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort by contract.
+            log.warning(
+                "ledger pr-merged write failed for %s: %s",
+                decision.card_id, exc,
             )
 
     def _emit_escalated_events(

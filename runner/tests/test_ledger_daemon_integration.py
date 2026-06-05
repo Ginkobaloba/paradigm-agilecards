@@ -183,6 +183,46 @@ def test_skipped_merge_outcome_records_no_gate(
     assert row.merge_gate is None  # skipped gate records nothing
 
 
+def test_pr_merged_metrics_records_diff_and_wall(
+    repo: SqliteRepository, paths: RuntimePaths, store_spec: str,
+    todo_root: Path, card_factory: Any,
+) -> None:
+    """A merged PR records merged_at + diff stats, and the writer derives
+    human_review_wall_seconds by pairing the pr-opened event (from the
+    merge-gate hook) with merged_at."""
+    from cards_runner.daemon.merge_gate import MergeOutcome
+    from cards_runner.daemon.unblocker import UnblockDecision
+
+    card_id = "bLED-06"
+    card_factory(card_id)
+    repo.update_card_fields(card_id, {"work_type": "feature"})
+    claim = _claim_and_project(repo, paths, card_id,
+                               finished_at="2026-06-03T00:10:00Z", tokens=200)
+    daemon = Daemon(_cfg(todo_root, store_spec, ledger_enabled=True), repo=repo)
+    daemon._post_worker_exit(_handle(claim), EXIT_CLEAN)
+    # Gate opens a PR (records pr_opened at ~now).
+    daemon._record_merge_gate_metrics(
+        claim,
+        MergeOutcome(decision="human_review", to_status="blocked",
+                     merge_status="open", reason="tier 5-6",
+                     pr_url="https://github.com/x/y/pull/1"),
+    )
+    # PR later merges (future merged_at so the wall is positive).
+    daemon._record_pr_merged_metrics(UnblockDecision(
+        card_id=card_id, action="unblocked",
+        merged_at="2026-06-30T00:00:00Z",
+        diff_lines_added=120, diff_lines_removed=8,
+    ))
+    store = MetricsStore.from_repository(repo)
+    row = store.get_card_metrics(tenant_id="default", card_id=card_id)
+    assert row is not None
+    assert row.merged_at == "2026-06-30T00:00:00Z"
+    assert row.diff_lines_added == 120
+    assert row.diff_lines_removed == 8
+    assert row.human_review_wall_seconds is not None
+    assert row.human_review_wall_seconds > 0
+
+
 def test_verifier_and_gate_helpers_noop_when_disabled(
     repo: SqliteRepository, paths: RuntimePaths, store_spec: str,
     todo_root: Path, card_factory: Any,
