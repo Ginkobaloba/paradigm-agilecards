@@ -223,6 +223,39 @@ def test_pr_merged_metrics_records_diff_and_wall(
     assert row.human_review_wall_seconds > 0
 
 
+def test_regression_links_append_to_parent(
+    repo: SqliteRepository, paths: RuntimePaths, store_spec: str,
+    todo_root: Path,
+) -> None:
+    """A bugfix card's `regresses: [parent]` appends the bugfix id to the
+    parent's regression_card_ids; a non-bugfix card is ignored."""
+    from cards_runner.store.models import CardRecord
+
+    daemon = Daemon(_cfg(todo_root, store_spec, ledger_enabled=True), repo=repo)
+    bug = CardRecord(
+        card_id="bug-1", tenant_id="default", status="active",
+        work_type="bugfix", frontmatter_extra={"regresses": ["parent-1"]},
+    )
+    daemon._record_regression_links(bug)
+    store = MetricsStore.from_repository(repo)
+    parent = store.get_card_metrics(tenant_id="default", card_id="parent-1")
+    assert parent is not None
+    assert parent.regression_card_ids == ("bug-1",)
+
+    # Re-running the same bugfix is idempotent (dedup on regressing id).
+    daemon._record_regression_links(bug)
+    parent = store.get_card_metrics(tenant_id="default", card_id="parent-1")
+    assert parent.regression_card_ids == ("bug-1",)
+
+    # A non-bugfix card with a stray regresses field is ignored.
+    feat = CardRecord(
+        card_id="feat-1", tenant_id="default", status="active",
+        work_type="feature", frontmatter_extra={"regresses": ["parent-2"]},
+    )
+    daemon._record_regression_links(feat)
+    assert store.get_card_metrics(tenant_id="default", card_id="parent-2") is None
+
+
 def test_contract_outcome_helper_records_and_is_sticky(
     repo: SqliteRepository, paths: RuntimePaths, store_spec: str,
     todo_root: Path, card_factory: Any,

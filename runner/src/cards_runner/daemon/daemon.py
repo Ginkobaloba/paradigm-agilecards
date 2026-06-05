@@ -52,6 +52,7 @@ from ..common.types import (
     EXIT_COST_CAP_HALT,
     EXIT_HALT_SIGNAL,
     PROJECTED_CARD_NAME,
+    WORK_TYPE_BUGFIX,
     WORKER_RESULT_NAME,
     ClaimedCard,
     DaemonConfig,
@@ -980,11 +981,36 @@ class Daemon:
                 tokens=int(tokens_raw) if tokens_raw is not None else 0,
                 cost_usd=float(cost_raw) if cost_raw is not None else None,
             )
+            self._record_regression_links(record)
         except Exception as exc:  # noqa: BLE001 - best-effort by contract.
             log.warning(
                 "ledger executor-metrics write failed for %s: %s",
                 claim.card_id, exc,
             )
+
+    def _record_regression_links(self, record: Any) -> None:
+        """Best-effort: a bugfix card stamps `regresses: [parent, ...]`
+        (ledger spec 9.4). Append this card to each parent's
+        `regression_card_ids` so the auto-merge trust signal can later
+        ask "did this merged card cause a follow-up bugfix?". Deduped by
+        the regressing card id, so re-running the bugfix is idempotent.
+
+        Only `work_type: bugfix` cards carry a meaningful `regresses:`;
+        anything else is ignored. Runs inside the caller's try/except."""
+        writer = self._ledger_writer()
+        if writer is None or record.work_type != WORK_TYPE_BUGFIX:
+            return
+        regresses = record.field_value("regresses")
+        if not isinstance(regresses, list):
+            return
+        for parent in regresses:
+            parent_id = str(parent).strip()
+            if parent_id:
+                writer.record_regression(
+                    parent_card_id=parent_id,
+                    tenant_id=self.tenant_id,
+                    regressing_card_id=record.card_id,
+                )
 
     def _record_verifier_metrics(
         self, claim: ClaimedCard, result: "VerifierResult | None"
