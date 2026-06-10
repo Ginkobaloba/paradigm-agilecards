@@ -25,6 +25,15 @@ the orchestrator.
 """
 from __future__ import annotations
 
+from .calibration import (
+    Calibration,
+    CalibrationBand,
+    ShadowDecision,
+    buckets_in_shadow_log,
+    calibrate,
+    calibration_for_bucket,
+    read_shadow_decisions,
+)
 from .estimator import (
     Estimate,
     PercentileSet,
@@ -44,6 +53,14 @@ from .priors import (
     layered_prior,
     load_priors,
 )
+from .ramp import (
+    PhaseRecommendation,
+    RampState,
+    RampStore,
+    count_live_decisions,
+    evaluate_advance,
+    killswitch_quiet,
+)
 from .recalibrate import (
     RecalibrationResult,
     recalibrate_all,
@@ -53,24 +70,37 @@ from .store import CardMetricsFullRow, MetricsStore
 from .writer import LedgerWriter, fold_events
 
 __all__ = [
+    "Calibration",
+    "CalibrationBand",
     "CardMetricsFullRow",
     "Estimate",
     "LedgerWriter",
     "MetricsEvent",
     "MetricsStore",
     "PercentileSet",
+    "PhaseRecommendation",
     "Priors",
     "PriorSet",
+    "RampState",
+    "RampStore",
     "RecalibrationResult",
+    "ShadowDecision",
     "append_event",
     "blend",
+    "buckets_in_shadow_log",
+    "calibrate",
+    "calibration_for_bucket",
+    "count_live_decisions",
+    "evaluate_advance",
     "events_path",
     "fold_events",
+    "killswitch_quiet",
     "layered_prior",
     "load_priors",
     "percentiles_from_samples",
     "read_events",
     "read_events_for_card",
+    "read_shadow_decisions",
     "recalibrate_all",
     "recalibrate_bucket",
 ]

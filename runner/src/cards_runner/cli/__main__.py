@@ -220,6 +220,67 @@ def main(argv: list[str] | None = None) -> int:
         help="JSON output (default: one line per bucket)",
     )
 
+    p_calibration = stats_sub.add_parser(
+        "calibration",
+        help="per-bucket confidence-band regression table from "
+        "gate shadow decisions (gate chunk 3)",
+    )
+    _add_common(p_calibration)
+    p_calibration.add_argument(
+        "--tenant", default="default",
+        help="tenant scope (default: 'default')",
+    )
+    p_calibration.add_argument(
+        "--work-type", default=None,
+        help="bucket work_type; omit to report every bucket present "
+        "in the shadow log",
+    )
+    p_calibration.add_argument(
+        "--tier", type=int, default=None,
+        help="bucket tier; required when --work-type is given",
+    )
+    p_calibration.add_argument(
+        "--window", type=int, default=100,
+        help="most-recent-N-cards window (default: 100)",
+    )
+    p_calibration.add_argument(
+        "--bands", type=int, default=10,
+        help="number of confidence bands (default: 10 deciles)",
+    )
+    p_calibration.add_argument(
+        "--json", action="store_true",
+        help="JSON output (default: fixed-width table)",
+    )
+
+    p_ramp = stats_sub.add_parser(
+        "ramp",
+        help="confidence-gate ramp phases: show state, advance a "
+        "bucket (operator-explicit, gate chunk 3)",
+    )
+    ramp_sub = p_ramp.add_subparsers(dest="ramp_cmd", required=True)
+    p_ramp_show = ramp_sub.add_parser(
+        "show", help="per-bucket phase, alarm, and advancement readiness"
+    )
+    _add_common(p_ramp_show)
+    p_ramp_show.add_argument("--tenant", default="default")
+    p_ramp_show.add_argument("--json", action="store_true")
+    p_ramp_advance = ramp_sub.add_parser(
+        "advance",
+        help="advance one bucket's phase after the section 9.3 gates "
+        "pass; refuses otherwise",
+    )
+    _add_common(p_ramp_advance)
+    p_ramp_advance.add_argument("--tenant", default="default")
+    p_ramp_advance.add_argument(
+        "--bucket", required=True,
+        help="bucket as work_type:tier, e.g. feature:3",
+    )
+    p_ramp_advance.add_argument(
+        "--confirm", action="store_true",
+        help="actually apply the advancement; without it the gates "
+        "are evaluated and printed but nothing changes",
+    )
+
     args = parser.parse_args(argv)
     if args.cmd == "start":
         return _cmd_start(args)
@@ -234,6 +295,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "stats":
         if args.stats_cmd == "recalibrate":
             return _cmd_stats_recalibrate(args)
+        if args.stats_cmd == "calibration":
+            return _cmd_stats_calibration(args)
+        if args.stats_cmd == "ramp":
+            if args.ramp_cmd == "show":
+                return _cmd_stats_ramp_show(args)
+            if args.ramp_cmd == "advance":
+                return _cmd_stats_ramp_advance(args)
+            parser.error(f"unknown ramp subcommand {args.ramp_cmd}")
         parser.error(f"unknown stats subcommand {args.stats_cmd}")
     parser.error(f"unknown subcommand {args.cmd}")
     return 2  # unreachable
@@ -471,6 +540,268 @@ def _cmd_stats_recalibrate(args: argparse.Namespace) -> int:
                 f"({'written' if r.written else 'skipped'})"
             )
     return 0
+
+
+def _calibration_payload(cal: Any) -> dict[str, Any]:
+    return {
+        "work_type": cal.work_type,
+        "tier": cal.tier,
+        "overall_n": cal.overall_n,
+        "overall_regressions": cal.overall_regressions,
+        "overall_regression_rate": round(cal.overall_regression_rate, 4),
+        "monotonic": cal.monotonic,
+        "bands": [
+            {
+                "lo": b.lo, "hi": b.hi, "n": b.n,
+                "regressions": b.regressions,
+                "regression_rate": round(b.regression_rate, 4),
+            }
+            for b in cal.bands if b.n > 0
+        ],
+    }
+
+
+def _cmd_stats_calibration(args: argparse.Namespace) -> int:
+    """`cards-runner stats calibration` -- the spec 8.2 banding table.
+
+    With --work-type/--tier, one bucket; without, every bucket that has
+    at least one shadow decision in the metrics event log."""
+    from ..metrics.calibration import (
+        buckets_in_shadow_log, calibration_for_bucket, render_table,
+    )
+    from ..metrics.store import MetricsStore
+
+    if (args.work_type is None) != (args.tier is None):
+        print(
+            "error: --work-type and --tier must be given together",
+            file=sys.stderr,
+        )
+        return 2
+    paths = RuntimePaths.from_root(args.todo_root)
+    repo = _open_store(args)
+    try:
+        store = MetricsStore.from_repository(repo)
+        if args.work_type is not None:
+            buckets = [(args.work_type, args.tier)]
+        else:
+            buckets = buckets_in_shadow_log(paths, tenant_id=args.tenant)
+        calibrations = [
+            calibration_for_bucket(
+                store, paths,
+                tenant_id=args.tenant, work_type=wt, tier=t,
+                n_bands=args.bands, window_cards=args.window,
+            )
+            for wt, t in buckets
+        ]
+    finally:
+        repo.close()
+
+    if args.json:
+        print(json.dumps({
+            "tenant": args.tenant,
+            "buckets": [_calibration_payload(c) for c in calibrations],
+        }, indent=2))
+        return 0
+    if not calibrations:
+        print(
+            f"no gate shadow decisions for tenant '{args.tenant}'; "
+            "nothing to calibrate"
+        )
+        return 0
+    print("\n\n".join(render_table(c) for c in calibrations))
+    return 0
+
+
+def _parse_bucket(text: str) -> tuple[str, int]:
+    work_type, sep, tier_text = text.rpartition(":")
+    if not sep or not work_type:
+        raise ValueError(
+            f"bucket must be work_type:tier (e.g. feature:3), got {text!r}"
+        )
+    return work_type, int(tier_text)
+
+
+def _cmd_stats_ramp_show(args: argparse.Namespace) -> int:
+    """`cards-runner stats ramp show` -- phases + advancement readiness.
+
+    Reports every bucket present in either the ramp table or the shadow
+    log, so a bucket that has shadow data but no explicit phase row
+    shows up at its default phase 1."""
+    from ..metrics.calibration import (
+        buckets_in_shadow_log, calibration_for_bucket,
+        read_shadow_decisions,
+    )
+    from ..metrics.ramp import (
+        RampStore, count_live_decisions, evaluate_advance,
+        killswitch_quiet,
+    )
+    from ..metrics.store import MetricsStore
+
+    paths = RuntimePaths.from_root(args.todo_root)
+    repo = _open_store(args)
+    try:
+        store = MetricsStore.from_repository(repo)
+        ramp = RampStore.from_repository(repo)
+        buckets = {
+            (s.work_type, s.tier)
+            for s in ramp.list_states(tenant_id=args.tenant)
+        } | set(buckets_in_shadow_log(paths, tenant_id=args.tenant))
+        shadow = read_shadow_decisions(paths, tenant_id=args.tenant)
+        ks_quiet = killswitch_quiet(paths, tenant_id=args.tenant)
+        rows = []
+        for work_type, tier in sorted(buckets):
+            state = ramp.get(
+                tenant_id=args.tenant, work_type=work_type, tier=tier
+            )
+            cal = calibration_for_bucket(
+                store, paths,
+                tenant_id=args.tenant, work_type=work_type, tier=tier,
+            )
+            shadow_n = len({
+                d.card_id for d in shadow
+                if d.work_type == work_type and d.tier == tier
+            })
+            rec = evaluate_advance(
+                state, cal,
+                shadow_n=shadow_n,
+                live_n=count_live_decisions(
+                    paths, tenant_id=args.tenant,
+                    work_type=work_type, tier=tier,
+                ),
+                killswitch_clear=ks_quiet,
+            )
+            rows.append((state, shadow_n, rec))
+    finally:
+        repo.close()
+
+    if args.json:
+        print(json.dumps({
+            "tenant": args.tenant,
+            "buckets": [
+                {
+                    "work_type": state.work_type,
+                    "tier": state.tier,
+                    "phase": state.phase,
+                    "alarm_active": state.alarm_active,
+                    "shadow_n": shadow_n,
+                    "advance_ready": rec.ready,
+                    "checks": [
+                        {"name": c.name, "passed": c.passed,
+                         "detail": c.detail}
+                        for c in rec.checks
+                    ],
+                }
+                for state, shadow_n, rec in rows
+            ],
+        }, indent=2))
+        return 0
+    if not rows:
+        print(f"no gate buckets for tenant '{args.tenant}'")
+        return 0
+    for state, shadow_n, rec in rows:
+        flag = " ALARM" if state.alarm_active else ""
+        ready = "ready to advance" if rec.ready else "not ready"
+        print(
+            f"{state.work_type}/tier{state.tier}: phase {state.phase}"
+            f"{flag}  shadow_n={shadow_n}  {ready}"
+        )
+        for check in rec.checks:
+            mark = "ok " if check.passed else "no "
+            print(f"  [{mark}] {check.name}: {check.detail}")
+    return 0
+
+
+def _cmd_stats_ramp_advance(args: argparse.Namespace) -> int:
+    """`cards-runner stats ramp advance --bucket work_type:tier --confirm`.
+
+    Operator-explicit phase advancement (spec 9.3). Evaluates the
+    gates, emits a `gate_phase_recommendation` event either way, and
+    only with --confirm AND all gates green applies the +1 and emits
+    `gate_phase_advanced`. Exit codes: 0 advanced (or dry-run ready),
+    1 gates not met, 2 usage error."""
+    from ..common.types import now_utc_iso
+    from ..metrics.calibration import (
+        calibration_for_bucket, read_shadow_decisions,
+    )
+    from ..metrics.ramp import (
+        RampStore, count_live_decisions, evaluate_advance,
+        killswitch_quiet,
+    )
+    from ..metrics.store import MetricsStore
+    from ..metrics.writer import LedgerWriter
+
+    try:
+        work_type, tier = _parse_bucket(args.bucket)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    paths = RuntimePaths.from_root(args.todo_root)
+    repo = _open_store(args)
+    try:
+        store = MetricsStore.from_repository(repo)
+        ramp = RampStore.from_repository(repo)
+        writer = LedgerWriter(paths, store)
+        state = ramp.get(
+            tenant_id=args.tenant, work_type=work_type, tier=tier
+        )
+        cal = calibration_for_bucket(
+            store, paths,
+            tenant_id=args.tenant, work_type=work_type, tier=tier,
+        )
+        shadow_n = len({
+            d.card_id
+            for d in read_shadow_decisions(paths, tenant_id=args.tenant)
+            if d.work_type == work_type and d.tier == tier
+        })
+        rec = evaluate_advance(
+            state, cal,
+            shadow_n=shadow_n,
+            live_n=count_live_decisions(
+                paths, tenant_id=args.tenant,
+                work_type=work_type, tier=tier,
+            ),
+            killswitch_clear=killswitch_quiet(
+                paths, tenant_id=args.tenant
+            ),
+        )
+        at = now_utc_iso()
+        writer.record_gate_phase_recommendation(
+            tenant_id=args.tenant, work_type=work_type, tier=tier,
+            current_phase=rec.current_phase, next_phase=rec.next_phase,
+            ready=rec.ready,
+            checks=[
+                {"name": c.name, "passed": c.passed, "detail": c.detail}
+                for c in rec.checks
+            ],
+            at=at,
+        )
+        print(
+            f"{work_type}/tier{tier}: phase {rec.current_phase} -> "
+            f"{rec.next_phase}  "
+            f"{'gates green' if rec.ready else 'gates NOT met'}"
+        )
+        for check in rec.checks:
+            mark = "ok " if check.passed else "no "
+            print(f"  [{mark}] {check.name}: {check.detail}")
+        if not rec.ready:
+            return 1
+        if not args.confirm:
+            print("dry run: pass --confirm to apply")
+            return 0
+        new_state = ramp.set_phase(
+            tenant_id=args.tenant, work_type=work_type, tier=tier,
+            phase=rec.next_phase,
+        )
+        ramp.commit()
+        writer.record_gate_phase_advanced(
+            tenant_id=args.tenant, work_type=work_type, tier=tier,
+            from_phase=rec.current_phase, to_phase=new_state.phase,
+            at=at,
+        )
+        print(f"advanced: now phase {new_state.phase}")
+        return 0
+    finally:
+        repo.close()
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:

@@ -118,6 +118,21 @@ METRIC_ESTIMATES_COLUMNS: tuple[str, ...] = (
     "prior_weight",
 )
 
+# Gate chunk 3: per-bucket confidence-gate ramp state. The gate spec
+# (section 9.5) sketched this as a `phase_per_bucket` column on
+# `metric_estimates`, but that table is a recomputable cache refreshed
+# via INSERT OR REPLACE -- a phase column there would silently reset on
+# every recalibration. Phase and the kill-switch alarm are operator
+# policy, not derived data, so they get their own row.
+GATE_RAMP_COLUMNS: tuple[str, ...] = (
+    "tenant_id",
+    "work_type",
+    "tier",
+    "phase",
+    "alarm_active",
+    "updated_at",
+)
+
 # Every table the chunk-1 DDL creates. Doctor reports presence/absence
 # of each so an operator can confirm migrations actually applied. Order
 # matches the SQLite + MySQL DDL lists.
@@ -129,6 +144,7 @@ EXPECTED_TABLES: tuple[str, ...] = (
     "counters",
     "card_metrics",
     "metric_estimates",
+    "gate_ramp",
 )
 
 CARD_EVENT_COLUMNS: tuple[str, ...] = (
@@ -376,6 +392,20 @@ _SQLITE_DDL: list[str] = [
         PRIMARY KEY (tenant_id, work_type, tier)
     )
     """,
+    # Gate chunk 3: confidence-gate ramp state, one row per bucket.
+    # Deliberately NOT a column on `metric_estimates` -- see the
+    # GATE_RAMP_COLUMNS comment above.
+    """
+    CREATE TABLE IF NOT EXISTS gate_ramp (
+        tenant_id    TEXT NOT NULL,
+        work_type    TEXT NOT NULL,
+        tier         INTEGER NOT NULL,
+        phase        INTEGER NOT NULL DEFAULT 1,
+        alarm_active INTEGER NOT NULL DEFAULT 0,
+        updated_at   TEXT,
+        PRIMARY KEY (tenant_id, work_type, tier)
+    )
+    """,
 ]
 
 # Statements that depend on a column added via `ADDED_COLUMNS`. The
@@ -519,6 +549,17 @@ _MYSQL_DDL: list[str] = [
         PRIMARY KEY (tenant_id, work_type, tier)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS gate_ramp (
+        tenant_id    VARCHAR(64) NOT NULL,
+        work_type    VARCHAR(32) NOT NULL,
+        tier         INT         NOT NULL,
+        phase        INT         NOT NULL DEFAULT 1,
+        alarm_active TINYINT     NOT NULL DEFAULT 0,
+        updated_at   VARCHAR(32),
+        PRIMARY KEY (tenant_id, work_type, tier)
+    )
+    """,
 ]
 
 # MySQL/Dolt has no `CREATE INDEX IF NOT EXISTS`. The repository wraps
@@ -630,6 +671,7 @@ __all__ = [
     "DEPENDENCY_COLUMNS",
     "CARD_METRICS_COLUMNS",
     "METRIC_ESTIMATES_COLUMNS",
+    "GATE_RAMP_COLUMNS",
     "EXPECTED_TABLES",
     "DIALECT_SQLITE",
     "DIALECT_MYSQL",

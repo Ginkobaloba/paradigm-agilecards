@@ -53,6 +53,17 @@ KIND_CONTRACT_OUTCOME: str = "contract_outcome"
 # the log for later calibration (gate-3); the card_metrics fold ignores
 # it (no gate columns in the chunk-1 schema).
 KIND_GATE_SHADOW_DECISION: str = "gate_shadow_decision"
+# Gate chunk 3: ramp lifecycle events (spec section 7.2). The phase
+# kinds are emitted by `stats ramp advance`; the live-decision and
+# kill-switch kinds are defined now so the chunk-3 readers (live-count,
+# kill-switch-quiet checks in `metrics/ramp.py`) recognize them the
+# moment chunk-4 live-mode wiring starts emitting them. None of these
+# participate in the card_metrics fold.
+KIND_GATE_PHASE_ADVANCED: str = "gate_phase_advanced"
+KIND_GATE_PHASE_RECOMMENDATION: str = "gate_phase_recommendation"
+KIND_GATE_LIVE_DECISION: str = "gate_live_decision"
+KIND_GATE_KILLSWITCH_TRIPPED: str = "gate_killswitch_tripped"
+KIND_GATE_KILLSWITCH_CLEARED: str = "gate_killswitch_cleared"
 
 ALL_KINDS: tuple[str, ...] = (
     KIND_CARD_CREATED,
@@ -66,6 +77,11 @@ ALL_KINDS: tuple[str, ...] = (
     KIND_REGRESSION_FLAGGED,
     KIND_CONTRACT_OUTCOME,
     KIND_GATE_SHADOW_DECISION,
+    KIND_GATE_PHASE_ADVANCED,
+    KIND_GATE_PHASE_RECOMMENDATION,
+    KIND_GATE_LIVE_DECISION,
+    KIND_GATE_KILLSWITCH_TRIPPED,
+    KIND_GATE_KILLSWITCH_CLEARED,
 )
 
 
@@ -174,6 +190,11 @@ __all__ = [
     "KIND_CARD_STARTED",
     "KIND_CONTRACT_OUTCOME",
     "KIND_EXECUTOR_EXITED",
+    "KIND_GATE_KILLSWITCH_CLEARED",
+    "KIND_GATE_KILLSWITCH_TRIPPED",
+    "KIND_GATE_LIVE_DECISION",
+    "KIND_GATE_PHASE_ADVANCED",
+    "KIND_GATE_PHASE_RECOMMENDATION",
     "KIND_GATE_SHADOW_DECISION",
     "KIND_PR_MERGED",
     "KIND_PR_OPENED",

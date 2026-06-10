@@ -424,6 +424,62 @@ class LedgerWriter:
             },
         ))
 
+    def record_gate_phase_advanced(
+        self,
+        *,
+        tenant_id: str,
+        work_type: str,
+        tier: int,
+        from_phase: int,
+        to_phase: int,
+        at: str,
+    ) -> bool:
+        """Append a ramp phase advancement to the event log (spec 7.2).
+
+        Phase events are bucket-scoped, not card-scoped; the `card_id`
+        slot carries a synthetic `bucket:<work_type>:<tier>` id so the
+        event shape stays uniform without colliding with any real card.
+        Append-only; the fold ignores the kind."""
+        return ev.append_event(self._paths, ev.MetricsEvent(
+            at=at, card_id=f"bucket:{work_type}:{tier}",
+            tenant_id=tenant_id,
+            kind=ev.KIND_GATE_PHASE_ADVANCED,
+            dedup_key=f"phase:{work_type}:{tier}:{at}",
+            payload={
+                "work_type": work_type, "tier": tier,
+                "from_phase": from_phase, "to_phase": to_phase,
+            },
+        ))
+
+    def record_gate_phase_recommendation(
+        self,
+        *,
+        tenant_id: str,
+        work_type: str,
+        tier: int,
+        current_phase: int,
+        next_phase: int,
+        ready: bool,
+        checks: list[dict[str, Any]],
+        at: str,
+    ) -> bool:
+        """Append a ramp advancement evaluation to the event log
+        (spec 7.2 `gate_phase_recommendation`). Emitted on every
+        `stats ramp advance` run so the audit trail shows what the
+        operator saw, whether or not the advancement happened."""
+        return ev.append_event(self._paths, ev.MetricsEvent(
+            at=at, card_id=f"bucket:{work_type}:{tier}",
+            tenant_id=tenant_id,
+            kind=ev.KIND_GATE_PHASE_RECOMMENDATION,
+            dedup_key=f"recommend:{work_type}:{tier}:{at}",
+            payload={
+                "work_type": work_type, "tier": tier,
+                "current_phase": current_phase,
+                "next_phase": next_phase,
+                "ready": ready, "checks": checks,
+            },
+        ))
+
     # ---- rebuild -----------------------------------------------------
 
     def rebuild_card(self, *, card_id: str, tenant_id: str) -> bool:

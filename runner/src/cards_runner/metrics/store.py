@@ -227,6 +227,24 @@ class MetricsStore:
         )
         return n, regressed
 
+    def regressed_card_ids(
+        self, *, tenant_id: str, work_type: str, tier: int
+    ) -> frozenset[str]:
+        """Return the bucket's card ids whose `regression_card_ids` is a
+        non-empty list. The calibration read (gate chunk 3) joins these
+        against shadow decisions; same regression definition as
+        `bucket_regression` above, surfaced per-card instead of as a
+        count."""
+        cur = self._conn.execute(
+            "SELECT card_id, regression_card_ids FROM card_metrics"
+            " WHERE tenant_id = ? AND work_type = ? AND tier = ?",
+            (tenant_id, work_type, tier),
+        )
+        return frozenset(
+            str(row[0]) for row in cur.fetchall()
+            if _decode_id_list(row[1])
+        )
+
     def get_estimate(
         self,
         *,
