@@ -1,0 +1,12 @@
+# Build artifacts
+dist/
+.vite/
+.vite-temp/
+
+# Dependencies
+node_modules/
+
+# Local env
+.env
+.env.local
+.env.*.local

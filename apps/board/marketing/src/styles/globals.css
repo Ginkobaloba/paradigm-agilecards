@@ -1,0 +1,76 @@
+/*
+ * Gantry marketing landing globals.
+ *
+ * Font loading: Fraunces (display), Geist Sans (UI), Geist Mono (logotype).
+ * Per the brand handoff we pull the weights we actually use to keep the
+ * payload tight. Fraunces is loaded with 400 italic + 700; Geist Sans
+ * with 400 / 500 / 700; Geist Mono with 600 / 700.
+ */
+@import url("https://fonts.googleapis.com/css2?family=Fraunces:ital,wght@0,400;0,700;1,400&family=Geist:wght@400;500;700&family=Geist+Mono:wght@600;700&display=swap");
+
+/* Bring in shared brand tokens as CSS custom properties. */
+@import "../../../brand/tokens.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--gantry-font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: var(--gantry-surface);
+  color: var(--gantry-gunmetal);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/*
+ * Reusable surface tokens, tier-2 components on top of the brand primitives.
+ * Kept narrow on purpose; the landing is a single page and doesn't need a
+ * full component library.
+ */
+@layer components {
+  .gantry-wordmark {
+    @apply font-mono font-bold tracking-logotype lowercase text-gantry-gunmetal;
+  }
+  .gantry-wordmark-active {
+    @apply font-mono font-bold text-gantry-forest;
+  }
+  .gantry-panel {
+    @apply bg-white border border-gantry-gunmetal/10 rounded-sm;
+  }
+  .gantry-panel-dark {
+    @apply bg-gantry-gunmetal text-gantry-surface border border-gantry-gunmetal rounded-sm;
+  }
+  .gantry-btn {
+    @apply inline-flex items-center justify-center
+      bg-gantry-gunmetal text-gantry-surface
+      px-5 py-3 text-sm font-medium tracking-wide
+      rounded-sm transition-colors
+      hover:bg-gantry-forest focus:outline-none focus:ring-2 focus:ring-gantry-forest;
+  }
+  .gantry-input {
+    @apply bg-white border border-gantry-gunmetal/20 rounded-sm
+      px-4 py-3 text-sm text-gantry-gunmetal placeholder:text-gantry-gunmetal/50
+      outline-none focus:border-gantry-forest;
+  }
+  .gantry-eyebrow {
+    @apply font-mono text-xs uppercase tracking-[0.18em] text-gantry-forest;
+  }
+  .gantry-grid-bg {
+    background-image:
+      linear-gradient(to right, rgba(42, 52, 57, 0.06) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(42, 52, 57, 0.06) 1px, transparent 1px);
+    background-size: 32px 32px;
+  }
+}
