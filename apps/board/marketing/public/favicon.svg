@@ -1,0 +1,24 @@
+<!--
+  Gantry monochrome favicon.
+
+  Two fine vertical lines framing a heavy horizontal block. The structural
+  schematic per the brand handoff. Drawn at 32x32 so it stays crisp in
+  system trays and browser tabs.
+-->
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 32 32"
+  width="32"
+  height="32"
+  fill="none"
+  role="img"
+  aria-label="Gantry"
+>
+  <rect width="32" height="32" fill="#f4f5f6" />
+  <!-- Left vertical line -->
+  <rect x="6" y="5" width="2" height="22" fill="#2a3439" />
+  <!-- Right vertical line -->
+  <rect x="24" y="5" width="2" height="22" fill="#2a3439" />
+  <!-- Heavy horizontal block (the lifted load) -->
+  <rect x="9" y="13" width="14" height="6" fill="#2a3439" />
+</svg>

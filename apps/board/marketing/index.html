@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+
+    <!-- Title and description. Per brand handoff: commas, never em or en dashes. -->
+    <title>Gantry, manage the outcome.</title>
+    <meta
+      name="description"
+      content="Gantry is the workflow surface for the AI you already trust. Bring your own model, drop a card, and let your agents do the work."
+    />
+
+    <!-- Canonical. Placeholder subdomain; update at deploy time. -->
+    <link rel="canonical" href="https://gantry.projectnexuscode.org/" />
+
+    <!-- Favicon: monochrome engineering schematic per brand handoff. -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="alternate icon" type="image/png" href="/favicon.png" />
+    <link rel="apple-touch-icon" href="/favicon.png" />
+
+    <!-- Open Graph. -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Gantry" />
+    <meta property="og:title" content="Gantry, manage the outcome." />
+    <meta
+      property="og:description"
+      content="The workflow surface for the AI you already trust. Bring your own model, drop a card, and let your agents do the work."
+    />
+    <meta property="og:url" content="https://gantry.projectnexuscode.org/" />
+    <meta property="og:image" content="/og-image.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Gantry wordmark." />
+
+    <!-- Twitter card. -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Gantry, manage the outcome." />
+    <meta
+      name="twitter:description"
+      content="The workflow surface for the AI you already trust. Bring your own model, drop a card, and let your agents do the work."
+    />
+    <meta name="twitter:image" content="/og-image.png" />
+
+    <!--
+      Preconnect to Google Fonts. We load Fraunces (display), Geist Sans (UI),
+      and Geist Mono (logotype) via @import in src/styles/globals.css so the
+      Tailwind preset stays the single source of font-family truth.
+    -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  </head>
+  <body class="bg-gantry-surface text-gantry-gunmetal antialiased">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

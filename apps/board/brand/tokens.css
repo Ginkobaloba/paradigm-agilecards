@@ -1,0 +1,30 @@
+/*
+ * Gantry brand tokens, exported as CSS custom properties.
+ *
+ * Source of truth: apps/board/brand/BRAND_HANDOFF_GANTRY_2026-06-18.md
+ *
+ * These tokens are the customer-facing primitives for any surface that
+ * renders the Gantry brand: marketing landing, signed-in board UI,
+ * future docs site, etc. Importing this file installs the variables on
+ * :root so any downstream stylesheet or Tailwind preset can reference
+ * them.
+ */
+
+:root {
+  /* Color palette */
+  --gantry-forest: #1f5a44;   /* Primary accent (active states, connections) */
+  --gantry-gunmetal: #2a3439; /* Technical base (text, structural boundaries) */
+  --gantry-surface: #f4f5f6;  /* Surface light (primary canvas) */
+  --gantry-sage: #2a6b4e;     /* System success (completed, verified tasks) */
+  --gantry-slate: #4a7abc;    /* System info (passive data nodes) */
+
+  /* Typography stacks. Loaded by @import in the consumer stylesheet. */
+  --gantry-font-display: "Fraunces", Georgia, "Times New Roman", serif;
+  --gantry-font-sans: "Geist", "Geist Sans", ui-sans-serif, system-ui, -apple-system,
+    BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --gantry-font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  /* Logotype tracking. The wordmark uses -0.04em. */
+  --gantry-logotype-tracking: -0.04em;
+}
