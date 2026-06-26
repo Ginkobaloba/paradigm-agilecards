@@ -5,11 +5,11 @@
   "description": "Backend for the agile-cards dashboard. Express + TypeScript + better-sqlite3 + chokidar + SSE.",
   "license": "SEE LICENSE IN ../LICENSE",
   "type": "module",
-  "main": "dist/server.js",
+  "main": "dist/src/server.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/server.ts",
-    "start": "node dist/server.js",
+    "start": "node dist/src/server.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test src/routes/stories.test.ts src/cost/rates.test.ts src/db/ranks.test.ts src/db/views.test.ts src/events/derive.test.ts src/db/events.test.ts src/routes/sprints.test.ts src/routes/cards.test.ts src/routes/triage.test.ts",
     "create-token": "tsx scripts/create-token.ts",
@@ -22,6 +22,7 @@
     "chokidar": "^3.6.0",
     "cors": "^2.8.5",
     "express": "^4.21.1",
+    "jose": "^5.10.0",
     "js-yaml": "^4.1.0"
   },
   "devDependencies": {

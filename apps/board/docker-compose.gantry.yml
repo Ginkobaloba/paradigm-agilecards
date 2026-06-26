@@ -1,0 +1,44 @@
+# Gantry portal-embed overlay for the agile-cards board.
+#
+# Use ON TOP OF docker-compose.yml to run the board as the "Gantry" tile
+# behind the Paradigm portal. The board is served at <portal>/gantry/ by
+# the shared demo-proxy nginx, which reaches the board frontend container
+# on the host port published here.
+#
+#   $env:BASE_PATH   = "/gantry/"
+#   $env:CORS_ORIGIN = "https://portal.projectnexuscode.org,https://portal.paradigm.codes"
+#   docker compose -f docker-compose.yml -f docker-compose.gantry.yml up -d --build backend frontend
+#
+# Bring up only backend + frontend (the public ingress is the portal's
+# demo-proxy, not this stack's own cloudflared service).
+#
+# Federation env (PORTAL_*) is runtime-only, so the canonical portal host
+# can change with a `up -d --force-recreate` and no image rebuild. The
+# image itself is host-agnostic; only BASE_PATH (a path prefix) is baked.
+
+services:
+  backend:
+    container_name: gantry-board-backend
+    environment:
+      PORT: "4070"
+      CARDS_DIR: "/cards"
+      DB_PATH: "/data/board.sqlite"
+      CORS_ORIGIN: "${CORS_ORIGIN:-https://portal.projectnexuscode.org,https://portal.paradigm.codes}"
+      LOG_LEVEL: "info"
+      # Paradigm portal federation. Verifies portal-minted RS256 JWTs.
+      PORTAL_JWKS_URL: "${PORTAL_JWKS_URL:-https://portal.projectnexuscode.org/.well-known/jwks.json}"
+      PORTAL_ISSUER: "${PORTAL_ISSUER:-https://portal.projectnexuscode.org}"
+      PORTAL_AUDIENCE: "gantry"
+
+  frontend:
+    container_name: gantry-board-frontend
+    build:
+      args:
+        BASE_PATH: "${BASE_PATH:-/gantry/}"
+        APP_BRAND: "Gantry"
+        APP_TAGLINE: "board"
+    # !override replaces the base 8080:80 mapping instead of appending to
+    # it (8080 is taken by paradigm-site on this host).
+    ports: !override
+      # Host port the demo-proxy reaches via host.docker.internal:8110.
+      - "8110:80"

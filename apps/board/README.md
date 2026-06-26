@@ -108,12 +108,17 @@ Environment variables read by the backend at startup:
 | `CORS_ORIGIN`| `http://localhost:5173`                | Allowed origin(s) for browser calls. Comma-separated list. |
 | `LOG_LEVEL`  | `info`                                 | `error`, `warn`, `info`, `debug`                 |
 | `CLAUDE_CLI_PATH` | `claude`                          | Override the `claude` CLI binary path for the planner invoker |
+| `PORTAL_JWKS_URL` | (unset)                           | Paradigm portal JWKS endpoint. When set with `PORTAL_ISSUER`, the board also accepts portal-minted RS256 JWTs as bearer credentials (the "Gantry" embed). |
+| `PORTAL_ISSUER`   | (unset)                           | Exact portal origin the JWT `iss` must match (e.g. `https://portal.paradigm.codes`). Federation is off unless both this and `PORTAL_JWKS_URL` are set. |
+| `PORTAL_AUDIENCE` | `gantry`                          | The app-slug the JWT `aud` must match. |
 
 Frontend build-time variables:
 
 | var               | default | what it does                                              |
 |-------------------|---------|-----------------------------------------------------------|
-| `VITE_BASE_PATH`  | `/`     | URL prefix the app is served from. Set to `/board/` to host this stack behind the Paradigm portal reverse proxy. Bakes into both Vite's `base` (asset URLs + React Router `basename`) and the nginx location prefixes inside the docker image. |
+| `VITE_BASE_PATH`  | `/`     | URL prefix the app is served from. Set to `/board/` (or `/gantry/`) to host this stack behind the Paradigm portal reverse proxy. Bakes into both Vite's `base` (asset URLs + React Router `basename`) and the nginx location prefixes inside the docker image. |
+| `VITE_APP_BRAND`  | `agile-cards` | Customer-facing brand shown in the header and document title. The portal embed builds with `Gantry`. |
+| `VITE_APP_TAGLINE`| `board v0+` | Small badge next to the brand. |
 
 ## Hosting behind the Paradigm portal
 
@@ -147,6 +152,66 @@ npm run dev
 The Vite dev proxy strips the `/board` prefix off `/api`, `/events`,
 and `/healthz` before forwarding to the backend, so the backend keeps
 its single-mount-point routes.
+
+## Gantry: the portal embed at `/gantry/`
+
+The board ships to customers as **Gantry**, a tile inside the Paradigm
+portal (`portal-shell`). A logged-in portal user clicks the Gantry tile,
+the portal mints a short-lived RS256 JWT and hands it off in the URL
+fragment, and the board verifies it and shows the kanban -- no second
+login.
+
+This is one concrete instance of the generic "host behind the portal"
+support above. What makes it Gantry rather than a bare `/board/` mount:
+
+1. **Base path `/gantry/`** -- the image is built with `BASE_PATH=/gantry/`.
+2. **Brand** -- built with `APP_BRAND=Gantry`, so the header and tab title
+   read Gantry, not `agile-cards`.
+3. **Portal federation** -- the backend trusts portal-minted JWTs.
+
+### Auth: portal JWKS federation
+
+The board honors the [portal Gate Contract](../../../portal-shell/docs/PORTAL_GATE_CONTRACT.md),
+the same handoff the demo fleet uses:
+
+- The portal's launch route redirects to `<board>/#portal_token=<JWT>`.
+- `frontend/src/lib/portalHandoff.ts` reads the fragment on boot, stores
+  the JWT as the board's bearer token (the existing sessionStorage slot),
+  and scrubs the fragment so it cannot leak or replay.
+- `backend/src/auth/portalToken.ts` verifies the JWT against the portal
+  JWKS (`PORTAL_JWKS_URL`), checking `iss` (`PORTAL_ISSUER`), `aud`
+  (`PORTAL_AUDIENCE`, default `gantry`), and expiry. The local SQLite
+  bearer tokens still work; the JWT path is a fallback tried only for
+  JWT-shaped credentials when federation is configured.
+
+Federation is inert unless both `PORTAL_JWKS_URL` and `PORTAL_ISSUER` are
+set, so a standalone deployment is unaffected.
+
+### Running the Gantry overlay
+
+`docker-compose.gantry.yml` overlays the base compose with the Gantry
+brand, base path, federation env, and a distinct host port (8110) the
+portal's reverse proxy reaches via `host.docker.internal:8110`:
+
+```powershell
+$env:BASE_PATH   = "/gantry/"
+$env:CORS_ORIGIN = "https://portal.projectnexuscode.org,https://portal.paradigm.codes"
+docker compose -f docker-compose.yml -f docker-compose.gantry.yml up -d --build backend frontend
+```
+
+Only `backend` and `frontend` come up; the public ingress is the portal's
+shared `demo-proxy` nginx, not this stack's own `cloudflared`.
+
+### Note on the Docker base-path path
+
+Two fixes landed with the Gantry work because the image had never been
+run under a non-root base path before:
+
+- The backend entrypoint is `dist/src/server.js` (tsc preserves the
+  `src/` + `scripts/` tree under `rootDir: "."`), not `dist/server.js`.
+- The frontend build is copied **under** `BASE_PATH` in the image
+  (`/usr/share/nginx/html/gantry/`), because Vite prefixes asset URLs and
+  the SPA fallback with the base path.
 
 ## Submitting a story
 

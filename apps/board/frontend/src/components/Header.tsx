@@ -1,6 +1,7 @@
 import { NavLink } from "react-router-dom";
 
 import { useAuth } from "../hooks/useAuth";
+import { APP_BRAND, APP_TAGLINE } from "../lib/brand";
 import { ViewMenu } from "./ViewMenu";
 
 interface Props {
@@ -26,10 +27,10 @@ export function Header({ onRefresh, onOpenPalette, cardsDir }: Props) {
     <header className="flex items-center gap-4 px-5 py-3 bg-panel border-b border-border">
       <h1 className="text-[15px] font-semibold tracking-tight flex items-center gap-2">
         <span className="inline-block w-2 h-2 rounded-sm bg-accent" />
-        agile-cards
+        {APP_BRAND}
       </h1>
       <span className="text-[11px] uppercase tracking-wider text-muted border border-border px-1.5 py-0.5 rounded">
-        board v0+
+        {APP_TAGLINE}
       </span>
       <nav className="flex items-center gap-1 ml-2">
         {NAV.map((n) => (
