@@ -30,5 +30,8 @@ RUN npm install --omit=dev && npm cache clean --force
 
 COPY --from=build /app/dist ./dist
 
+# tsconfig has rootDir "." with src/ and scripts/ both compiled, so tsc
+# preserves the tree: the entrypoint lands at dist/src/server.js (and the
+# token CLIs at dist/scripts/*.js), not dist/server.js.
 EXPOSE 4070
-CMD ["node", "dist/server.js"]
+CMD ["node", "dist/src/server.js"]

@@ -18,6 +18,19 @@ export interface Config {
    */
   readonly corsOrigins: ReadonlyArray<string>;
   readonly logLevel: "error" | "warn" | "info" | "debug";
+  /**
+   * Paradigm portal federation (the "Gantry" embed). When the portal's
+   * JWKS URL and issuer are both set, the board additionally accepts
+   * portal-minted RS256 JWTs as bearer credentials, verified against the
+   * portal JWKS per the portal Gate Contract. Leave unset for a
+   * standalone deployment that uses only the local SQLite token store.
+   */
+  readonly portal: {
+    readonly jwksUrl: string | null;
+    readonly issuer: string | null;
+    readonly audience: string;
+    readonly enabled: boolean;
+  };
 }
 
 function envStr(key: string, fallback: string): string {
@@ -51,6 +64,25 @@ function envCorsOrigins(): ReadonlyArray<string> {
   );
 }
 
+function envStrOrNull(key: string): string | null {
+  const v = process.env[key];
+  return v && v.length > 0 ? v : null;
+}
+
+function envPortal(): Config["portal"] {
+  const jwksUrl = envStrOrNull("PORTAL_JWKS_URL");
+  const issuer = envStrOrNull("PORTAL_ISSUER");
+  const audience = envStr("PORTAL_AUDIENCE", "gantry");
+  return Object.freeze({
+    jwksUrl,
+    issuer,
+    audience,
+    // Federation is only live when both the key source and the issuer to
+    // trust are configured. Audience alone is not enough.
+    enabled: jwksUrl !== null && issuer !== null,
+  });
+}
+
 const defaultCardsDir =
   process.platform === "win32" ? "C:\\dev\\todo" : path.resolve("./todo");
 
@@ -62,4 +94,5 @@ export const config: Config = Object.freeze({
   dbPath: envStr("DB_PATH", defaultDbPath),
   corsOrigins: envCorsOrigins(),
   logLevel: envLogLevel(),
+  portal: envPortal(),
 });

@@ -10,6 +10,8 @@
 import type { NextFunction, Request, Response } from "express";
 
 import { validateToken } from "../auth/tokens.js";
+import { config } from "../config.js";
+import { looksLikeJwt, verifyPortalToken } from "../auth/portalToken.js";
 
 export interface AuthContext {
   readonly tokenId: number;
@@ -46,21 +48,62 @@ function extractToken(req: Request): string | null {
   return null;
 }
 
+/**
+ * Sentinel token id for credentials that did not come from the local
+ * SQLite store (portal-federated JWTs). Keeps getAuthContext's "tokenId
+ * is a number" invariant while marking the row as not-from-our-store.
+ */
+const PORTAL_TOKEN_ID = -1;
+
 export function requireAuth(
   req: Request,
   res: Response,
   next: NextFunction
 ): void {
+  // Express ignores a returned promise, so own the rejection here and
+  // turn any unexpected failure into a clean 401 rather than an unhandled
+  // rejection that crashes the process.
+  void authenticate(req, res, next).catch(() => {
+    if (!res.headersSent) {
+      res.status(401).json({ error: "invalid bearer token" });
+    }
+  });
+}
+
+async function authenticate(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
   const plaintext = extractToken(req);
   if (!plaintext) {
     res.status(401).json({ error: "missing bearer token" });
     return;
   }
+
+  // Local opaque token first: synchronous, no network, the common path
+  // for the admin/laptop tokens minted via create-token.
   const row = validateToken(plaintext);
-  if (!row) {
-    res.status(401).json({ error: "invalid bearer token" });
+  if (row) {
+    res.locals["auth"] = { tokenId: row.id, tokenLabel: row.label };
+    next();
     return;
   }
-  res.locals["auth"] = { tokenId: row.id, tokenLabel: row.label };
-  next();
+
+  // Portal federation fallback: a JWT-shaped bearer is verified against
+  // the portal JWKS. Only attempted when federation is configured and the
+  // credential actually has the three-segment JWT shape.
+  if (config.portal.enabled && looksLikeJwt(plaintext)) {
+    const claims = await verifyPortalToken(plaintext);
+    if (claims) {
+      res.locals["auth"] = {
+        tokenId: PORTAL_TOKEN_ID,
+        tokenLabel: `portal:${claims.email}`,
+      };
+      next();
+      return;
+    }
+  }
+
+  res.status(401).json({ error: "invalid bearer token" });
 }

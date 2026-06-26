@@ -8,6 +8,10 @@
 
 FROM node:20-alpine AS build
 ARG BASE_PATH=/
+# Deployment branding (the portal embed builds with APP_BRAND=Gantry).
+# Defaults keep the standalone product identity.
+ARG APP_BRAND=agile-cards
+ARG APP_TAGLINE=board v0+
 WORKDIR /app
 
 COPY frontend/package.json frontend/package-lock.json* ./
@@ -15,13 +19,20 @@ RUN npm install
 
 COPY frontend/. ./
 ENV VITE_BASE_PATH=${BASE_PATH}
+ENV VITE_APP_BRAND=${APP_BRAND}
+ENV VITE_APP_TAGLINE=${APP_TAGLINE}
 RUN npm run build
 
 # ----- runtime -----
 
 FROM nginx:alpine
 ARG BASE_PATH=/
-COPY --from=build /app/dist /usr/share/nginx/html
+# Vite emits index.html + assets/ with URLs already prefixed by BASE_PATH
+# (e.g. /gantry/assets/...). The nginx config below serves them via
+# `root` + try_files where $uri carries that same prefix, so the files
+# must live UNDER the prefix on disk. BASE_PATH always ends with "/", so
+# this resolves to html/ at the root and html/gantry/ under a base path.
+COPY --from=build /app/dist /usr/share/nginx/html${BASE_PATH}
 COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
 # Replace the literal ${BASE_PATH} placeholders in nginx.conf with the
 # build-arg value. Using sed keeps the runtime image free of envsubst
