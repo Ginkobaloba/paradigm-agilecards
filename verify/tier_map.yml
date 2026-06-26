@@ -1,0 +1,75 @@
+# tier_map.yml -- surface risk classification for agile-cards-board
+#
+# Tiers:
+#   1 -- informational / low stakes; smoke-only is sufficient
+#   2 -- moderate stakes; smoke required, deep recommended
+#   3 -- high stakes; deep-verify REQUIRED before merge
+#
+# Surfaces that write or mutate state (moving cards between statuses,
+# patching frontmatter) are Tier 3 because a bad write corrupts the card
+# files on disk, which are the canonical source of truth for the engine.
+# A corrupt or misrouted card is not easily detected without a full tree
+# scan, and the damage propagates to the runner's next batch pick-up.
+
+surfaces:
+  - name: api-card-move
+    tier: 3
+    deep_verify_before_merge: true
+    reason: >
+      POST /api/cards/:id/move rewrites the card file on disk (moves it
+      between status folders in C:\dev\todo). A bug here silently corrupts
+      the canonical card tree that the engine runner and board both read.
+      Disk writes are not transactional; a partial write or wrong-status
+      move requires manual recovery.
+
+  - name: api-card-frontmatter-patch
+    tier: 3
+    deep_verify_before_merge: true
+    reason: >
+      PATCH /api/cards/:id/frontmatter overwrites YAML frontmatter in the
+      card file on disk. Corrupted frontmatter breaks the runner's
+      verifier and the board's parser simultaneously. Stakes/points/ready
+      fields drive cost-governor and sprint-planner logic downstream.
+
+  - name: auth-token-gate
+    tier: 3
+    deep_verify_before_merge: true
+    reason: >
+      The requireAuth middleware gates every /api/* route. A regression
+      here (accidental bypass or always-401) would either expose all card
+      data unauthenticated or lock Drew out of the dashboard entirely.
+      Token creation (npm run create-token) and validation flow must be
+      tested end-to-end before any auth-touching PR merges.
+
+  - name: healthz
+    tier: 1
+    deep_verify_before_merge: false
+    reason: >
+      Public health endpoint, no auth, read-only. Only returns {"ok":true}
+      and optional cardsDir. A regression here is immediately visible
+      and has no data-integrity impact.
+
+  - name: home
+    tier: 1
+    deep_verify_before_merge: false
+    reason: >
+      Board SPA shell served by nginx. Unauthenticated load renders only
+      the TokenGate form (static HTML/JS). No data mutation possible
+      before auth is established.
+
+  - name: sse-events
+    tier: 2
+    deep_verify_before_merge: false
+    reason: >
+      GET /events SSE stream is read-only but drives real-time card
+      updates in the UI. A regression breaks live refresh without data
+      loss. Deep verify recommended but not required before merge because
+      the board falls back to polling on SSE failure.
+
+  - name: api-cards-list
+    tier: 2
+    deep_verify_before_merge: false
+    reason: >
+      GET /api/cards is read-only. A regression returns wrong data or 500
+      but does not corrupt disk state. Smoke is sufficient for CI; deep
+      verify recommended when the fs/cards.ts parser changes.

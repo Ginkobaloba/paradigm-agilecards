@@ -1,0 +1,50 @@
+# assertions/home.yml -- deep assertion set for the board home surface
+#
+# The home surface (/) serves the SPA shell. Without a valid bearer token
+# the user sees the TokenGate form. This file asserts on that pre-auth
+# state because CI does not have a live token.
+#
+# For the authenticated Kanban view, run /verify deep locally after
+# sign-in and add a separate kanban.yml with selector_present assertions
+# against the drag-drop columns.
+#
+# Assertion types used here:
+#   http_status       -- HTTP response code equals `expect`
+#   text_present      -- `text` appears in the response body (case-sensitive)
+#   selector_present  -- CSS selector matches >= 1 element in rendered DOM
+#   header_present    -- named response header exists
+#   no_console_errors -- zero console errors in a headless browser run
+#   lcp_under_ms      -- Largest Contentful Paint below `expect` milliseconds
+#   axe_no_critical   -- axe-core returns zero critical accessibility issues
+
+surface: home
+url: /
+assertions:
+  - { type: http_status, expect: 200 }
+
+  # The TokenGate h1 renders "agile-cards-board" before auth.
+  - { type: text_present, text: "agile-cards-board" }
+
+  # Instruction text visible in the gate form (from TokenGate.tsx).
+  - { type: text_present, text: "Paste a bearer token" }
+
+  # The password input rendered by TokenGate -- type="password" and placeholder="paste token".
+  - { type: selector_present, selector: "input[type='password']" }
+
+  # The sign-in submit button.
+  - { type: selector_present, selector: "button[type='submit']" }
+
+  # The outer form wrapping the gate.
+  - { type: selector_present, selector: "form" }
+
+  # SPA shell is served with a content-type that triggers browser HTML parsing.
+  - { type: header_present, header: "content-type" }
+
+  # No JS errors on initial shell load (before auth attempt).
+  - { type: no_console_errors }
+
+  # Gate form should be interactive within 2.5s on a fast connection.
+  - { type: lcp_under_ms, expect: 2500 }
+
+  # Gate form must be accessible -- Radix-free form, so axe should be clean.
+  - { type: axe_no_critical }

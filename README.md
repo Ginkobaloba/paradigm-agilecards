@@ -122,3 +122,58 @@ so they are pinned in `.github/AUTO_MERGE.md` as Tier-3 sensitive.
 - 2026-06-30 (chunk K2): renamed to `paradigm-agilecards` and restructured from
   `apps/{board,engine}` to the Paradigm target shape. `git log --follow` reaches
   the original commits through the renames.
+
+## Verification
+
+The `verify/` directory contains the Paradigm Verify suite for this repo.
+It covers the board's live surfaces and the card REST API.
+
+### Quick reference
+
+| Command | What it does |
+|---------|-------------|
+| `/verify C:\dev\paradigm-agilecards` | Quick smoke against `verify/smoke.yml` (all PRs, ~10s) |
+| `/verify deep C:\dev\paradigm-agilecards` | Full deep verify including browser layers (Tier-3 PRs, local only) |
+
+### Surfaces and tiers
+
+| Surface | Tier | Gate |
+|---------|------|------|
+| home (TokenGate form) | 1 | smoke only |
+| healthz | 1 | smoke only |
+| SSE events stream | 2 | smoke; deep recommended |
+| GET /api/cards (read) | 2 | smoke; deep recommended on parser changes |
+| POST /api/cards/:id/move | **3** | deep-verify required before merge |
+| PATCH /api/cards/:id/frontmatter | **3** | deep-verify required before merge |
+| auth token gate (requireAuth) | **3** | deep-verify required before merge |
+
+### CI behavior
+
+`.github/workflows/verify.yml` runs two jobs on every PR:
+
+- `quick-verify` (all PRs): runs `verify/ci/quick_smoke.sh` against
+  `verify/smoke.yml`. Checks HTTP status, json_path_equals, and headers.
+  Browser assertions (selector_present) are skipped; they run in the
+  local deep pass.
+
+- `deep-verify` (PRs labeled `tier-3` only): runs `verify/ci/deep_gate.sh`,
+  which requires a committed report under `verify/reports/` containing
+  `Overall: PASS`. A tier-3 PR with no report, or with a non-PASS report,
+  fails the gate and cannot merge.
+
+To make the `deep-verify` job actually block merges, add it as a required
+status check in Settings > Branches for the `main` branch protection rule.
+
+### Running locally
+
+```powershell
+# Quick smoke (same as CI, no token needed for the unauthed assertions)
+bash verify/ci/quick_smoke.sh verify/smoke.yml
+
+# Deep verify -- requires computer-use MCP + Chrome + a valid BOARD_TOKEN
+# Follow prompts from the /verify deep skill run; commit the report to
+# verify/reports/YYYY-MM-DD-<surface>-deep.md with "Overall: PASS".
+```
+
+The deploy URL is `https://app.projectnexuscode.org` (Cloudflare Tunnel,
+Cloudflare Access gated). Update `verify/smoke.yml` if the URL changes.

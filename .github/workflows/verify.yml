@@ -1,0 +1,51 @@
+# .github/workflows/verify.yml
+# Last updated: 2026-06-26
+#
+# BRANCH PROTECTION NOTE:
+# For the deep-verify gate to actually block merges, add "deep-verify" as a
+# Required status check in branch protection settings for your default branch
+# (Settings > Branches > branch protection rule > "Require status checks to pass
+# before merging"). Without this, the job runs but GitHub will still allow merge
+# if it fails or is skipped.
+#
+# WINDOWS / HEADED NOTE:
+# The headed layer (Layer 5, Windows MCP / computer-use) and adversarial generation
+# (--adversarial) are LOCAL deep-verify steps -- they require a real Windows desktop
+# with Chrome and the computer-use MCP running. They cannot run in CI. CI covers
+# layers 1-4 and curated edge cases only. The human-gated local run covers layers 5-6.
+# Default to ubuntu-latest for network and headless layers.
+
+name: Paradigm Verify
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+jobs:
+  quick-verify:
+    name: Quick Verify (all PRs)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Run quick smoke against verify/smoke.yml
+        run: bash verify/ci/quick_smoke.sh verify/smoke.yml
+
+  deep-verify:
+    name: Deep Verify (tier-3 PRs only)
+    runs-on: ubuntu-latest
+    if: contains(github.event.pull_request.labels.*.name, 'tier-3')
+    needs: quick-verify
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Require committed local deep-verify report
+        run: bash verify/ci/deep_gate.sh

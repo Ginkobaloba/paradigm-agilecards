@@ -1,0 +1,43 @@
+# smoke.yml -- fast surface checks run on every PR
+#
+# deploy_url: Cloudflare Tunnel exposes the board at https://app.projectnexuscode.org
+# The backend API is proxied by nginx at /api/ on the same origin.
+# The board is token-gated, so the home surface returns 200 but renders the
+# TokenGate form rather than the authenticated dashboard.
+#
+# Supported assertion types:
+#   http_status       -- checks HTTP response code matches `expect`
+#   text_present      -- checks that `text` appears in the response body
+#   selector_present  -- checks that a CSS selector matches at least one element (browser only)
+#   header_present    -- checks that the named response header exists
+#   redirects_to      -- checks that the URL redirects to `expect` (final URL)
+#   json_path_equals  -- checks that a JSONPath expression equals `expect`
+
+target: agile-cards-board
+deploy_url: https://app.projectnexuscode.org  # TODO: confirm live URL is reachable from CI
+
+surfaces:
+  - name: home
+    url: /
+    assertions:
+      - { type: http_status, expect: 200 }
+      - { type: text_present, text: "agile-cards-board" }
+      - { type: header_present, header: "content-type" }
+
+  - name: healthz
+    url: /healthz
+    assertions:
+      - { type: http_status, expect: 200 }
+      - { type: json_path_equals, path: "$.ok", expect: true }
+
+  - name: api-cards-unauthed
+    url: /api/cards
+    assertions:
+      # All /api/* routes require a bearer token; unauthenticated requests must
+      # return 401 (not 200 or 500). This is the Tier-3 auth surface check.
+      - { type: http_status, expect: 401 }
+
+  - name: api-columns-unauthed
+    url: /api/columns
+    assertions:
+      - { type: http_status, expect: 401 }
