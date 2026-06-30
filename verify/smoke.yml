@@ -1,0 +1,58 @@
+# smoke.yml -- fast surface checks run on every PR
+#
+# deploy_url: PLACEHOLDER until the Gantry cutover lands. The board is not
+# independently reachable from CI right now:
+#   - app.projectnexuscode.org no longer resolves in public DNS (it was the old
+#     Cloudflare Tunnel host and is what made this smoke fail from CI).
+#   - The board now only answers behind the portal auth wall: every
+#     https://portal.projectnexuscode.org/gantry/* and
+#     https://portal.paradigm.codes/gantry/* path returns 200 but redirects to
+#     portal.paradigm.codes/login, so none of the surfaces below (/, /healthz,
+#     /api/cards) can be asserted unauthenticated yet.
+# While deploy_url stays a placeholder, the verify workflow's detect job skips
+# quick-verify (neutral, not a green pass) instead of failing on DNS or faking a pass.
+# TODO (Gantry cutover): once the board is reachable, set deploy_url to the real
+# origin -- expected https://portal.projectnexuscode.org/gantry (or
+# https://portal.paradigm.codes/gantry after the paradigm.codes migration) -- and
+# prefix the surface URLs below with the /gantry base path.
+#
+# The backend API is proxied by nginx at /api/ on the same origin.
+# The board is token-gated, so the home surface returns 200 but renders the
+# TokenGate form rather than the authenticated dashboard.
+#
+# Supported assertion types:
+#   http_status       -- checks HTTP response code matches `expect`
+#   text_present      -- checks that `text` appears in the response body
+#   selector_present  -- checks that a CSS selector matches at least one element (browser only)
+#   header_present    -- checks that the named response header exists
+#   redirects_to      -- checks that the URL redirects to `expect` (final URL)
+#   json_path_equals  -- checks that a JSONPath expression equals `expect`
+
+target: agile-cards-board
+deploy_url: placeholder-pending-gantry-cutover  # see header note; detect job skips quick-verify while placeholder
+
+surfaces:
+  - name: home
+    url: /
+    assertions:
+      - { type: http_status, expect: 200 }
+      - { type: text_present, text: "agile-cards-board" }
+      - { type: header_present, header: "content-type" }
+
+  - name: healthz
+    url: /healthz
+    assertions:
+      - { type: http_status, expect: 200 }
+      - { type: json_path_equals, path: "$.ok", expect: true }
+
+  - name: api-cards-unauthed
+    url: /api/cards
+    assertions:
+      # All /api/* routes require a bearer token; unauthenticated requests must
+      # return 401 (not 200 or 500). This is the Tier-3 auth surface check.
+      - { type: http_status, expect: 401 }
+
+  - name: api-columns-unauthed
+    url: /api/columns
+    assertions:
+      - { type: http_status, expect: 401 }

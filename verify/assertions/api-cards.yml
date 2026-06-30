@@ -1,0 +1,65 @@
+# assertions/api-cards.yml -- deep assertion set for the cards REST API surface
+#
+# This is the most important interactive surface: it is the bridge between
+# the board UI and the card files on disk. Tier-3 endpoints (move, frontmatter
+# patch) require a deep-verify report before any PR that touches them can merge.
+#
+# CI smoke covers the unauthenticated 401 check. Deep verify (run locally
+# with a valid token) covers the authenticated read paths and, with caution,
+# the write paths against a test card.
+#
+# Assertion types:
+#   http_status       -- HTTP response code equals `expect`
+#   text_present      -- `text` appears in the response body
+#   json_path_equals  -- JSONPath expression over response body equals `expect`
+#   header_present    -- named response header exists
+
+surface: api-cards
+url: /api/cards
+
+assertions:
+  # --- Unauthenticated guard (runnable in CI, no token needed) ---
+
+  # GET /api/cards without a token must return 401.
+  - { type: http_status, expect: 401 }
+
+  # GET /api/columns without a token must also return 401.
+  # (Tested separately below via a surface-level comment; the deep runner
+  # should also hit /api/columns with the same token-absent check.)
+  # Both routes are gated by the same requireAuth middleware.
+
+  # --- Authenticated read paths (run locally with BOARD_TOKEN env var) ---
+  # The deep runner should set Authorization: Bearer $BOARD_TOKEN before
+  # the assertions below. Smoke runner skips these (no token in CI).
+
+  # GET /api/cards with a valid token must return 200 and a `cards` array.
+  # Deep runner: override http_status to 200 and add json_path_equals below.
+  # - { type: http_status, expect: 200 }
+  # - { type: json_path_equals, path: "$.cards", expect: [] }  # may be non-empty
+
+  # GET /api/columns with a valid token must return 200 and a `columns` array.
+  # - { type: http_status, expect: 200 }
+  # - { type: json_path_equals, path: "$.columns[0].id", expect: "backlog" }
+
+  # --- Tier-3 write path reminders (manual deep-verify steps, not auto-asserted) ---
+  #
+  # POST /api/cards/:id/move
+  #   - Use a synthetic test card in backlog/. Move it to active/. Confirm
+  #     the file moved on disk (C:\dev\todo\active\<id>.md exists).
+  #     Move it back. Confirm 200 response with {id, file, status, rank}.
+  #     Confirm 400 on invalid status. Confirm 409 on already-at-status.
+  #
+  # PATCH /api/cards/:id/frontmatter
+  #   - Patch `stakes: "high"` on the test card. Confirm the YAML frontmatter
+  #     on disk was updated. Patch `stakes: null` to clear. Confirm 400 on
+  #     unknown field (e.g., `{"bogus": 1}`).
+  #
+  # These steps must be recorded in verify/reports/YYYY-MM-DD-api-cards-deep.md
+  # with "Overall: PASS" before a tier-3 PR can merge.
+
+  # Health endpoint is public and verifiable in CI.
+  - type: http_status
+    expect: 200
+    # Override: this assertion applies to /healthz, not /api/cards.
+    # The deep runner should target /healthz explicitly. Kept here as a
+    # reminder that the health check is the one always-200 API surface.
