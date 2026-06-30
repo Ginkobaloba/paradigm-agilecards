@@ -4,6 +4,11 @@ name: CI
 # does not merge unless CI on its head SHA is green. This workflow is the
 # gating check. It runs on windows-latest to match the development host
 # (the runner suite is developed and verified on Windows).
+#
+# Job NAMES below are load-bearing: three of them are required status-check
+# contexts in main's branch protection. Do not rename them without updating
+# the protection rule too, or PRs will hang waiting for a context that never
+# reports.
 on:
   pull_request:
     branches: [main]
@@ -23,7 +28,7 @@ jobs:
     runs-on: windows-latest
     defaults:
       run:
-        working-directory: apps/engine/runner
+        working-directory: engine/runner
     steps:
       - uses: actions/checkout@v4
 
@@ -31,7 +36,7 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: apps/engine/runner/pyproject.toml
+          cache-dependency-path: engine/runner/pyproject.toml
 
       - name: Install runner (with dev extras)
         run: pip install -e .[dev]
@@ -55,7 +60,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: apps/board/frontend
+        working-directory: frontend
     steps:
       - uses: actions/checkout@v4
 
@@ -63,7 +68,7 @@ jobs:
         with:
           node-version: "20"
           cache: npm
-          cache-dependency-path: apps/board/frontend/package-lock.json
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Install (npm ci)
         run: npm ci
@@ -78,9 +83,12 @@ jobs:
   board-backend:
     name: board backend battery (build + tests)
     runs-on: ubuntu-latest
+    # Legacy Express/TS backend, frozen reference for the K11 FastAPI rewrite.
+    # Still the currently-live board backend, so its coverage stays on until
+    # K11 replaces it. Repathed under legacy/ by chunk K2.
     defaults:
       run:
-        working-directory: apps/board/backend
+        working-directory: legacy/board-express/backend
     steps:
       - uses: actions/checkout@v4
 
@@ -88,7 +96,7 @@ jobs:
         with:
           node-version: "20"
           cache: npm
-          cache-dependency-path: apps/board/backend/package-lock.json
+          cache-dependency-path: legacy/board-express/backend/package-lock.json
 
       - name: Install (npm ci)
         run: npm ci
@@ -99,3 +107,29 @@ jobs:
       - name: Tests
         continue-on-error: true
         run: npm test --if-present
+
+  backend-fastapi:
+    name: backend (fastapi scaffold)
+    runs-on: ubuntu-latest
+    # New Python/FastAPI backend (chunk K2 scaffold). Not yet a required
+    # context; promote it in branch protection once K11 lands the real API.
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+
+      - name: Install (with dev extras)
+        run: pip install -e .[dev]
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Tests (pytest)
+        run: pytest -q

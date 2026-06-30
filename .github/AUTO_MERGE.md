@@ -1,13 +1,16 @@
-# Auto-merge policy -- agile-cards (monorepo)
+# Auto-merge policy -- paradigm-agilecards
 
 This repo is opted into agent auto-merge per `C:\dev\PARADIGM_VELOCITY_RULES.md`
 (CTO-mode velocity). Drew authorized the opt-in on 2026-06-03. This file is
 the repo-local record of the activation (velocity rules section 10 step 2).
 
-As of the 2026-06-18 monorepo merge the repo carries two apps:
-`apps/engine/` (the Python runner suite) and `apps/board/` (the Next-style
-React board and its Node backend). The policy below applies to both; the
-Tier-3 sensitivity list is updated to use the new monorepo paths.
+Structure note: the repo was renamed from `agile-cards` and restructured from
+the interim `apps/{board,engine}` monorepo into the Paradigm target shape on
+2026-06-29 (chunk K2). The Python runner suite is now at `engine/`, the Boards
+UI at `frontend/`, the new FastAPI backend (scaffold; K11 owns the real API) at
+`backend/`, and the frozen pre-Paradigm Express/TS backend at
+`legacy/board-express/backend/`. The Tier-3 sensitivity list below uses the new
+paths.
 
 ## How auto-merge works here
 
@@ -32,8 +35,9 @@ can `hold PR #N` or `revert PR #N`.
 ## Safety floors (cannot be bypassed, velocity rules section 4)
 
 - CI on the PR head SHA must be green (the `engine runner battery` and the
-  `board frontend battery` checks; the `board backend battery` check is
-  added but informational until the board side has a real test suite).
+  `board frontend battery` checks; the `board backend battery` and
+  `backend (fastapi scaffold)` checks are informational on their test step
+  until the suites are real).
 - Full test battery passes with honest signal; no `--force`, `--no-verify`,
   `--skip-tests`, or flag-papering.
 - `delete_branch_on_merge` enforced (repo setting on).
@@ -47,20 +51,21 @@ A PR touching any of these auto-promotes to Tier 3 (multi-Opus, Drew on
 dissent):
 
 - The card store schema and migrations:
-  `apps/engine/runner/src/cards_runner/store/schema.py`,
-  `apps/engine/runner/src/cards_runner/store/migrate_v1.py`, anything
+  `engine/runner/src/cards_runner/store/schema.py`,
+  `engine/runner/src/cards_runner/store/migrate_v1.py`, anything
   adding or altering a table or promoted column.
 - The merge gate and the (future) confidence gate:
-  `apps/engine/runner/src/cards_runner/daemon/merge_gate.py`,
-  `apps/engine/runner/src/cards_runner/daemon/confidence_gate.py`.
-- The verifier decision surface: `apps/engine/runner/src/cards_runner/verifier/**`
-  and `apps/engine/lib/verifier/**`.
-- `apps/engine/RUNNER_CONTRACT.md`, `apps/engine/DEFINITION_OF_DONE.md`,
-  `apps/engine/tier_pricing.yaml`, `apps/engine/tier_map_claude.yaml`
+  `engine/runner/src/cards_runner/daemon/merge_gate.py`,
+  `engine/runner/src/cards_runner/daemon/confidence_gate.py`.
+- The verifier decision surface: `engine/runner/src/cards_runner/verifier/**`
+  and `engine/lib/verifier/**`.
+- `engine/RUNNER_CONTRACT.md`, `engine/DEFINITION_OF_DONE.md`,
+  `engine/tier_pricing.yaml`, `engine/tier_map_claude.yaml`
   (the cost / tier contracts).
-- The board canonical surfaces: `apps/board/backend/src/**` (the API the
-  engine consumes) and `apps/board/frontend/src/state/**` (the view-model
-  contract the engine ledger feeds).
+- The board canonical surfaces: the live board API
+  (`legacy/board-express/backend/src/**`, and `backend/**` once K11 lands the
+  FastAPI rewrite) and `frontend/src/state/**` (the view-model contract the
+  engine ledger feeds).
 - Anything that flips a merge-routing default from review to auto (e.g.
   turning the confidence gate to live mode -- this is Tier 3 / Drew).
 
