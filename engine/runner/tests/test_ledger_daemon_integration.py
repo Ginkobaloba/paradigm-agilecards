@@ -10,6 +10,7 @@ before, which is what keeps the rest of the suite green.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -207,16 +208,23 @@ def test_pr_merged_metrics_records_diff_and_wall(
                      merge_status="open", reason="tier 5-6",
                      pr_url="https://github.com/x/y/pull/1"),
     )
-    # PR later merges (future merged_at so the wall is positive).
+    # PR later merges. merged_at must be after the pr_opened recorded above
+    # (which is real "now") for the wall to be positive. Derive it from now so
+    # the test does not rot when the wall clock passes a hardcoded date -- the
+    # original literal "2026-06-30T00:00:00Z" silently went non-positive once
+    # that day arrived.
+    merged_at = (datetime.now(tz=timezone.utc) + timedelta(hours=1)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
     daemon._record_pr_merged_metrics(UnblockDecision(
         card_id=card_id, action="unblocked",
-        merged_at="2026-06-30T00:00:00Z",
+        merged_at=merged_at,
         diff_lines_added=120, diff_lines_removed=8,
     ))
     store = MetricsStore.from_repository(repo)
     row = store.get_card_metrics(tenant_id="default", card_id=card_id)
     assert row is not None
-    assert row.merged_at == "2026-06-30T00:00:00Z"
+    assert row.merged_at == merged_at
     assert row.diff_lines_added == 120
     assert row.diff_lines_removed == 8
     assert row.human_review_wall_seconds is not None
