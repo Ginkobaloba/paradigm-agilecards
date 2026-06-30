@@ -10,6 +10,8 @@ desktop.ini
 .env
 .env.*
 *.local.env
+# ...but the placeholder template (no real secrets) must be tracked.
+!.env.example
 
 # Editors
 .vscode/
