@@ -27,7 +27,7 @@ spanned 2026-06-25 into 2026-06-26.
     `${BASE_PATH}` (was nginx 500).
   - `docker-compose.gantry.yml` overlay (brand, base path, federation env,
     host port 8110).
-- **Stood up the board live on DREWSPC** (containers `gantry-board-frontend`
+- **Stood up the board live on <HOST>** (containers `gantry-board-frontend`
   :8110, `gantry-board-backend` :4070, mounts `C:/dev/todo`). Verified:
   `/gantry/` 200, `/gantry/healthz` 200, `/gantry/api/cards` 401 no-token /
   200 with board token.
