@@ -1,0 +1,13 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "description": "Chunk K16/K17: @paradigm/* are first-party platform packages. Every bump must (1) run the consumer contract tests -- the `contracts` CI job runs on every PR, and Renovate bumps ARE PRs, so this is automatic -- and (2) NEVER auto-merge. Each @paradigm/* bump is Tier-3 and Drew reviews it (AC-CARDS-015 / AC-CI-005). K17 reshapes this into the full @paradigm/*-bump review gate; until then this rule is the floor that keeps auto-merge off.",
+      "matchPackageNames": ["@paradigm/**"],
+      "automerge": false,
+      "addLabels": ["tier-3", "paradigm-bump", "needs-drew-review"]
+    }
+  ]
+}
