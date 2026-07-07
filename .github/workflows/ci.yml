@@ -133,3 +133,49 @@ jobs:
 
       - name: Tests (pytest)
         run: pytest -q
+
+  contracts:
+    name: contracts (@paradigm/* consumer contract tests)
+    runs-on: ubuntu-latest
+    # Chunk K16 (CARDS-013 + CARDS-014): consumer contract tests against the
+    # @paradigm/* packages. Runs on every PR and -- because Renovate opens PRs --
+    # on every @paradigm/* version bump (renovate.json keeps those PRs from
+    # auto-merging; Drew reviews them). The suites are self-contained and do not
+    # install the app dependency sets. Not yet a required status context; promote
+    # it in branch protection once it has baked.
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- CARDS-013: Python contract for @paradigm/auth (backend/contracts) ---
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/contracts/requirements.txt
+
+      - name: Install Python contract deps
+        working-directory: backend
+        run: pip install -r contracts/requirements.txt
+
+      - name: Lint Python contracts (ruff)
+        working-directory: backend
+        run: ruff check contracts
+
+      - name: Python auth contract (CARDS-013)
+        working-directory: backend
+        run: pytest contracts -q
+
+      # --- CARDS-014: TS contract for @paradigm/llm-client (frontend/contracts) ---
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend deps (npm ci)
+        working-directory: frontend
+        run: npm ci
+
+      - name: TS llm-client contract (CARDS-014)
+        working-directory: frontend
+        run: npm run test:contracts

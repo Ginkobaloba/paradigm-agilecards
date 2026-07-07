@@ -1,0 +1,10 @@
+# Dependencies for the backend consumer contract tests (CARDS-013, chunk K16).
+#
+# Kept separate from backend/pyproject.toml on purpose: the contract suite is a
+# standalone harness run by the `contracts` CI job, so it does not couple to the
+# backend app's dependency set (owned by K11). PyJWT + cryptography give us RS256
+# JWKS verification; the rest is the test toolchain.
+pyjwt>=2.8
+cryptography>=42
+pytest>=8
+ruff>=0.5

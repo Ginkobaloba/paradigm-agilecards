@@ -10,7 +10,8 @@
     "build": "tsc -p tsconfig.json --noEmit && vite build",
     "preview": "vite preview --port 5173",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:contracts": "vitest run --config vitest.contracts.config.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.1.0",
