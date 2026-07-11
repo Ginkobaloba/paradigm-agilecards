@@ -1,9 +1,10 @@
 # paradigm-agilecards
 
 The Paradigm AgileCards app repo. AgileCards is the planning/runner engine and
-Boards is its UI, so they live together here. This repo consumes the shared
-`@paradigm/*` packages and deploys at `cards.paradigm.codes` (backend at
-`/api`, Boards UI at `/`).
+Boards is its UI, so they live together here. The shared `@paradigm-codes/*`
+packages (auth, ui) are the convergence target for this repo (the C3 consumer
+migration); today it ships its own auth verifier and UI and does not yet import
+them. Deploys at `cards.paradigm.codes` (backend at `/api`, Boards UI at `/`).
 
 Licensed under PolyForm Noncommercial 1.0.0. See [LICENSE](./LICENSE).
 
