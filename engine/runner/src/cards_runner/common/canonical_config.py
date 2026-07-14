@@ -70,7 +70,29 @@ _EMBEDDED_TIER_MAP: Final[dict[int, dict[str, Any]]] = {
         "pin_required": True, "extended_thinking": True},
 }
 
+# Self-hosted local models (KL1) map to a fixed model id served over an
+# OpenAI-compatible endpoint. Kept minimal: the shipped tier_map_local.yaml
+# is the source of truth; this is only the last-resort fallback if that
+# file is dropped from a deploy, and it must NOT silently route a local
+# request to a paid Claude model.
+_EMBEDDED_TIER_MAP_LOCAL: Final[dict[int, dict[str, Any]]] = {
+    p: {
+        "model": "ollama/qwen3:30b",
+        "model_floor": "local",
+        "pin_required": p >= 5,
+        "extended_thinking": p % 2 == 0,
+    }
+    for p in range(1, 7)
+}
+
+_EMBEDDED_TIER_MAPS: Final[dict[str, dict[int, dict[str, Any]]]] = {
+    "claude": _EMBEDDED_TIER_MAP,
+    "local": _EMBEDDED_TIER_MAP_LOCAL,
+}
+
+
 _EMBEDDED_PRICING_BY_TIER: Final[dict[str, tuple[float, float]]] = {
+    "local": (0.00, 0.00),  # self-hosted inference is free.
     "haiku": (1.00, 5.00),
     "sonnet": (3.00, 15.00),
     "opus": (15.00, 75.00),
@@ -78,6 +100,23 @@ _EMBEDDED_PRICING_BY_TIER: Final[dict[str, tuple[float, float]]] = {
 
 
 _TIER_ORDER: Final[tuple[str, ...]] = ("haiku", "sonnet", "opus")
+
+
+# Local (self-hosted) models carry a `<provider>/<tag>` prefix so the
+# runner can distinguish them from hosted models. They always price at
+# the zero-rate `local` tier regardless of what the tag contains.
+LOCAL_MODEL_PREFIXES: Final[tuple[str, ...]] = ("ollama/", "local/", "vllm/")
+
+
+def is_local_model(model_id: str) -> bool:
+    """True if `model_id` is a self-hosted local model.
+
+    Local models are namespaced with a provider prefix (`ollama/`,
+    `local/`, `vllm/`). This is how the cost governor and tier logic
+    tell "free, runs on Drew's GPU" from "paid, runs in the cloud".
+    """
+    low = model_id.lower()
+    return any(low.startswith(prefix) for prefix in LOCAL_MODEL_PREFIXES)
 
 
 # Env vars used by the loader and by callers that want to opt in.
@@ -164,6 +203,8 @@ def _model_to_tier(model_id: str) -> str:
     cycle would otherwise emerge: cost imports the loader, the loader
     imports cost.
     """
+    if is_local_model(model_id):
+        return "local"
     low = model_id.lower()
     for tier in _TIER_ORDER:
         if tier in low:
@@ -216,24 +257,32 @@ def _read_yaml(path: Path) -> dict[str, Any]:
 
 
 def load_tier_map(
-    path: Path | None = None, *, strict: bool = False
+    path: Path | None = None, *, provider: str = "claude", strict: bool = False
 ) -> TierMap:
-    """Load `tier_map_claude.yaml`. Falls back to embedded defaults.
+    """Load `tier_map_<provider>.yaml`. Falls back to embedded defaults.
+
+    `provider` selects which canonical map to resolve (`claude` is the
+    default and preserves prior behavior; `local` resolves the KL1
+    local-GPU map). The embedded fallback is provider-matched so a
+    missing `tier_map_local.yaml` never silently routes a local request
+    to a paid Claude model.
 
     Set `strict=True` to raise `CanonicalConfigMissing` when no YAML is
     reachable -- useful in CI to catch a botched deploy that drops the
     canonical files.
     """
-    candidates = _candidate_paths(ENV_TIER_MAP_PATH, "tier_map_claude.yaml", path)
+    filename = f"tier_map_{provider}.yaml"
+    embedded = _EMBEDDED_TIER_MAPS.get(provider, _EMBEDDED_TIER_MAP)
+    candidates = _candidate_paths(ENV_TIER_MAP_PATH, filename, path)
     found = _first_existing(candidates)
     if found is None:
         if strict:
             raise CanonicalConfigMissing(
-                "no tier_map_claude.yaml found on the canonical search path; "
+                f"no {filename} found on the canonical search path; "
                 f"checked: {[str(p) for p in candidates]}"
             )
-        log.info("tier_map_claude.yaml not found; using embedded defaults")
-        return TierMap(tiers=dict(_EMBEDDED_TIER_MAP), source="embedded-defaults")
+        log.info("%s not found; using embedded defaults", filename)
+        return TierMap(tiers=dict(embedded), source="embedded-defaults")
     try:
         raw = _read_yaml(found)
         tiers_section = raw.get("tiers") if isinstance(raw, dict) else None
@@ -254,7 +303,7 @@ def load_tier_map(
         if strict:
             raise CanonicalConfigMissing(f"could not load {found}: {exc}") from exc
         log.warning("could not load %s (%s); using embedded defaults", found, exc)
-        return TierMap(tiers=dict(_EMBEDDED_TIER_MAP), source=f"embedded-defaults (after {found} failed)")
+        return TierMap(tiers=dict(embedded), source=f"embedded-defaults (after {found} failed)")
     return TierMap(tiers=tiers, source=str(found))
 
 

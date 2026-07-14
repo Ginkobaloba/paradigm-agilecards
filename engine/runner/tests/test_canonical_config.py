@@ -228,3 +228,74 @@ def test_load_tier_pricing_walks_up_from_package(
     # The shipped file declares at least the three Claude tiers.
     for tier in ("haiku", "sonnet", "opus"):
         assert tier in pricing.by_tier
+
+
+# ---- local-GPU provider (KL1) -----------------------------------------
+
+
+def test_is_local_model_recognizes_provider_prefixes() -> None:
+    assert cc.is_local_model("ollama/qwen3:30b") is True
+    assert cc.is_local_model("local/foo") is True
+    assert cc.is_local_model("vllm/qwen3") is True
+    assert cc.is_local_model("claude-opus-4-7") is False
+    assert cc.is_local_model("claude-haiku-4-5-20251001") is False
+
+
+def test_model_to_tier_maps_local_prefix_to_local() -> None:
+    assert cc._model_to_tier("ollama/qwen3:30b") == "local"
+    # A local prefix wins over a Claude tier substring in the tag.
+    assert cc._model_to_tier("ollama/haiku-finetune") == "local"
+    # Hosted ids still resolve normally.
+    assert cc._model_to_tier("claude-sonnet-4-6") == "sonnet"
+
+
+def test_embedded_pricing_has_zero_local_tier() -> None:
+    # The local tier is embedded (not read from the model-keyed YAML),
+    # so it is always present and always free.
+    pricing = cc.load_tier_pricing()
+    assert pricing.by_tier["local"] == (0.0, 0.0)
+    assert pricing.rate_for_tier("local") == (0.0, 0.0)
+
+
+def test_load_tier_map_provider_builds_filename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # provider= must select the tier_map_<provider>.yaml filename.
+    captured: dict[str, str] = {}
+
+    def fake_candidates(env_var: str, filename: str, explicit: Path | None):
+        captured["filename"] = filename
+        return [tmp_path / "nope.yaml"]  # force embedded fallback.
+
+    monkeypatch.setattr(cc, "_candidate_paths", fake_candidates)
+    cc.load_tier_map(provider="local")
+    assert captured["filename"] == "tier_map_local.yaml"
+
+
+def test_load_tier_map_default_provider_is_claude(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Backward compatibility: no provider arg still resolves claude.
+    captured: dict[str, str] = {}
+
+    def fake_candidates(env_var: str, filename: str, explicit: Path | None):
+        captured["filename"] = filename
+        return [tmp_path / "nope.yaml"]
+
+    monkeypatch.setattr(cc, "_candidate_paths", fake_candidates)
+    cc.load_tier_map()
+    assert captured["filename"] == "tier_map_claude.yaml"
+
+
+def test_load_tier_map_local_provider_finds_shipped_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The engine ships tier_map_local.yaml at the repo root; an ancestor
+    # walk from this package finds it, and every tier is a local model.
+    monkeypatch.delenv(cc.ENV_TIER_MAP_PATH, raising=False)
+    tier_map = cc.load_tier_map(provider="local")
+    assert tier_map.source.endswith("tier_map_local.yaml")
+    for points in range(1, 7):
+        model = tier_map.model_for(points)
+        assert cc.is_local_model(model), f"tier {points} is not local: {model}"
+        assert tier_map.tier_name_for(points) == "local"

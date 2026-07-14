@@ -28,7 +28,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..common.canonical_config import load_tier_pricing
+from ..common.canonical_config import is_local_model, load_tier_pricing
 
 
 log = logging.getLogger(__name__)
@@ -43,10 +43,13 @@ def model_tier(model_id: str) -> str:
     """Map a model id to a coarse pricing / cascade tier.
 
     Substring match keeps it robust against version-dated suffixes:
-    `claude-haiku-4-5-20251001` -> `haiku`. An unknown model is priced
-    as `opus` so the cap errs toward halting early rather than
-    silently overspending.
+    `claude-haiku-4-5-20251001` -> `haiku`. A self-hosted local model
+    (`ollama/...`) prices at the free `local` tier. An unknown hosted
+    model is priced as `opus` so the cap errs toward halting early
+    rather than silently overspending.
     """
+    if is_local_model(model_id):
+        return "local"
     low = model_id.lower()
     for tier in TIER_ORDER:
         if tier in low:
@@ -94,13 +97,17 @@ class Pricing:
         return cls(table=merged)
 
     def rates(self, model_id: str) -> tuple[float, float]:
+        tier = model_tier(model_id)
+        # Local (self-hosted) inference is definitionally free, so it
+        # short-circuits to zero even if a hand-built pricing table has
+        # no `local` row. This is what keeps the GPU fallback from ever
+        # tripping a cost cap.
+        if tier == "local":
+            return (0.0, 0.0)
         # Defensive default to "opus" if neither a tier nor an opus
         # fallback is present (would only happen if the YAML omitted
         # every tier; the loader's embedded fallback prevents this).
-        return self.table.get(
-            model_tier(model_id),
-            self.table.get("opus", (15.00, 75.00)),
-        )
+        return self.table.get(tier, self.table.get("opus", (15.00, 75.00)))
 
     def call_cost(
         self, model_id: str, input_tokens: int, output_tokens: int
