@@ -1,0 +1,93 @@
+# tier_map_local.yaml
+#
+# Local-GPU provider map (KL1). Same points -> tier contract as
+# tier_map_claude.yaml, but every tier routes to a self-hosted model
+# served over an OpenAI-compatible endpoint. Ollama on the 4090 is the
+# default target (Fork A, resolved 2026-07-14); a Nexus-fronted vLLM is
+# a later swap that changes only the endpoint, not this file.
+#
+# Model ids carry a `<provider>/<tag>` prefix (`ollama/qwen3:30b`) so the
+# runner can tell a free local model from a paid hosted one. Local
+# inference always prices at the zero-rate `local` tier, so a local run
+# never trips a positive cost cap (see common/canonical_config.is_local_model and
+# worker_stub/cost.model_tier). The LocalInvoker (KL2) strips the
+# provider prefix before sending `model` to the endpoint.
+#
+# HONEST SCOPING (see C:\dev\AGILECARDS_MVP_LOCALGPU_ASSESSMENT_2026-07-14.md):
+# local execution is trustworthy for tier 1-2 (deterministic-AC,
+# mechanical) work. Tiers 3-6 are mapped for completeness, but the
+# routing policy (KL4) keeps real high-stakes work on hosted models by
+# default. `pin_required` stays true at 5/6 so anything high-stakes
+# still routes to Drew at the merge gate.
+#
+# The exact Ollama tag is Drew's to set to whatever he has pulled on the
+# 4090 (e.g. `ollama/qwen3:30b`); it can also be overridden per-project.
+#
+# Tier matrix (stakes x difficulty):
+#   stakes\difficulty   shallow   deep
+#   low                 1         2
+#   medium              3         4
+#   high                5         6
+
+version: 1
+provider: local
+updated: 2026-07-14
+
+tiers:
+  1:
+    label: "low stakes, shallow"
+    model: ollama/qwen3:30b
+    extended_thinking: false
+    thinking_depth: shallow
+    model_floor: local
+    pin_required: false
+    typical_use: "trivial edits, copy tweaks, single-file refactors with tests"
+
+  2:
+    label: "low stakes, deep"
+    model: ollama/qwen3:30b
+    extended_thinking: true
+    thinking_depth: deep
+    model_floor: local
+    pin_required: false
+    typical_use: "low-risk work that still needs reasoning; e.g. unusual data shapes"
+
+  3:
+    label: "medium stakes, shallow"
+    model: ollama/qwen3:30b
+    extended_thinking: false
+    thinking_depth: shallow
+    model_floor: local
+    pin_required: false
+    typical_use: "feature work in a shared module (prefer hosted; see KL4 routing)"
+
+  4:
+    label: "medium stakes, deep"
+    model: ollama/qwen3:30b
+    extended_thinking: true
+    thinking_depth: deep
+    model_floor: local
+    pin_required: false
+    typical_use: "design-touching changes (prefer hosted; see KL4 routing)"
+
+  5:
+    label: "high stakes, shallow"
+    model: ollama/qwen3:30b
+    extended_thinking: false
+    thinking_depth: shallow
+    model_floor: local
+    pin_required: true
+    typical_use: "production-touching mechanical work (prefer hosted; pin routes to Drew)"
+
+  6:
+    label: "high stakes, deep"
+    model: ollama/qwen3:30b
+    extended_thinking: true
+    thinking_depth: deep
+    model_floor: local
+    pin_required: true
+    typical_use: "architecture / security boundary changes (prefer hosted; pin routes to Drew)"
+
+# Stakes axis is the hard constraint. The local map deliberately does not
+# vary the model by tier (there is one local model), so tier here changes
+# only extended_thinking and the pin/merge-gate routing, not model choice.

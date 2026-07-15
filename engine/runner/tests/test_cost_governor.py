@@ -117,3 +117,43 @@ def test_before_tool_raises_only_when_over() -> None:
     with pytest.raises(CostCapExceeded) as exc:
         gov.before_tool("read_file")
     assert exc.value.stage == "pre_tool"
+
+
+# ---- local-GPU provider (KL1) ----------------------------------------
+
+
+def test_local_model_recognized_not_priced_as_opus() -> None:
+    # A provider-prefixed local model must NOT fall through to the
+    # opus bucket (the pre-KL1 behavior that tripped caps immediately).
+    assert model_tier("ollama/qwen3:30b") == "local"
+    assert model_tier("local/whatever") == "local"
+    assert model_tier("vllm/qwen3-coder") == "local"
+    # A local prefix wins even when the tag contains a Claude tier word.
+    assert model_tier("ollama/haiku-finetune") == "local"
+    # Hosted Claude ids are unaffected.
+    assert model_tier("claude-opus-4-7") == "opus"
+    assert model_tier("claude-haiku-4-5-20251001") == "haiku"
+
+
+def test_local_model_prices_at_zero() -> None:
+    pricing = Pricing.default()
+    assert pricing.rates("ollama/qwen3:30b") == (0.0, 0.0)
+    # Millions of tokens, still $0 -- local inference is free.
+    assert pricing.call_cost("ollama/qwen3:30b", 5_000_000, 5_000_000) == 0.0
+
+
+def test_local_run_never_trips_cost_cap() -> None:
+    # The whole point of the GPU fallback: a positive cap plus huge token
+    # counts must never halt a local run, because cost stays $0.
+    gov = CostGovernor.create(0.01)
+    gov.before_call("ollama/qwen3:30b", est_input_tokens=10_000_000,
+                    max_output_tokens=10_000_000)
+    gov.record_call("ollama/qwen3:30b", 10_000_000, 10_000_000)
+    gov.before_tool("edit_file")
+    assert gov.meter.usd == 0.0
+
+
+def test_bare_local_floor_token_prices_as_local() -> None:
+    # The `local` tier sentinel (used as a model_floor) must resolve to
+    # the local tier, not opus -- otherwise it clamps local cards upward.
+    assert model_tier("local") == "local"

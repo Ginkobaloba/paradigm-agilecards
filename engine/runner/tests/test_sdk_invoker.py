@@ -205,6 +205,18 @@ def test_model_floor_clamps_the_starting_tier() -> None:
     assert result.model_used == "claude-opus-4-7"
 
 
+def test_local_model_floor_does_not_clamp_upward() -> None:
+    client = _FakeClient([_FakeMessage("done\nCONFIDENCE: 0.99")])
+    inv = SdkInvoker(client=client, api_key="fake")
+    # The 'local' floor sentinel must NOT clamp a tier-1 card upward.
+    # Pre-fix, model_tier("local") returned "opus" and forced points 5.
+    # Post-fix it resolves to the 'local' tier, so the card starts at its
+    # planned tier 1 (haiku, since this invoker still uses the claude map).
+    result = inv.invoke(_request(points=1, model_floor="local"))
+    assert client.messages.calls[0]["model"] == "claude-haiku-4-5-20251001"
+    assert result.model_used == "claude-haiku-4-5-20251001"
+
+
 def test_escalation_cap_is_hard_two() -> None:
     inv = SdkInvoker(client=_FakeClient([]), api_key="fake", max_escalations=9)
     assert inv.max_escalations == 2  # clamped to the contract cap.

@@ -51,7 +51,7 @@ log = logging.getLogger(__name__)
 # The lowest `points` value whose tier is >= a given model floor. The
 # floor mapping is a property of the cascade ladder (`haiku < sonnet <
 # opus`), not of the canonical tier YAML, so it stays embedded.
-_FLOOR_MIN_POINTS: dict[str, int] = {"haiku": 1, "sonnet": 3, "opus": 5}
+_FLOOR_MIN_POINTS: dict[str, int] = {"local": 1, "haiku": 1, "sonnet": 3, "opus": 5}
 
 # Lazy module-level cache of the canonical tier map. Loaded on first
 # access via `_get_tier_map()`. Tests that want a specific map can
