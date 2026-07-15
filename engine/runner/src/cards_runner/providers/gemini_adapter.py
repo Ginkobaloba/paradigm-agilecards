@@ -47,7 +47,9 @@ class GeminiAdapter:
         )
 
 
-def _extract_text(data: dict[str, Any]) -> str:
+def _extract_text(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
     candidates = data.get("candidates")
     if not isinstance(candidates, list) or not candidates:
         return ""

@@ -60,3 +60,19 @@ def test_gemini_tolerates_empty_response() -> None:
     assert result.text == ""
     assert result.input_tokens == 0
     assert result.output_tokens == 0
+
+
+def test_gemini_tolerates_non_dict_response() -> None:
+    class _ListPost:
+        def __call__(
+            self, url: str, *, headers: Any, body: Any, timeout: float
+        ) -> Any:
+            return []
+
+    adapter = GeminiAdapter(api_key="k", post_json=_ListPost())
+    result = adapter.complete(
+        CompletionRequest(model="m", system="s", user="u", max_output_tokens=8)
+    )
+    assert result.text == ""
+    assert result.input_tokens == 0
+    assert result.output_tokens == 0
