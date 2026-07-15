@@ -49,6 +49,94 @@ class CompletionResult:
     output_tokens: int
 
 
+# ---- tool-use (KL3) --------------------------------------------------
+#
+# A neutral tool vocabulary so the multi-turn tool loop is written once
+# and each adapter translates to/from its provider's wire format. The
+# representation is deliberately generic -- a "tool" is a name + JSON
+# schema + (elsewhere) an executor -- so a future non-code tool belt
+# (e.g. a fabrication card type) plugs into the same port unchanged.
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    """A callable tool offered to the model. `parameters` is JSON schema."""
+
+    name: str
+    description: str
+    parameters: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """A model's request to call one tool."""
+
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ToolResultMsg:
+    """The outcome of executing one `ToolCall`, fed back to the model."""
+
+    tool_call_id: str
+    name: str
+    content: str
+    is_error: bool = False
+
+
+@dataclass(frozen=True)
+class UserText:
+    """A plain user message."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class AssistantTurn:
+    """A model turn: free text plus zero or more tool-call requests."""
+
+    text: str
+    tool_calls: tuple[ToolCall, ...]
+
+
+@dataclass(frozen=True)
+class ToolResults:
+    """A batch of tool outcomes returned to the model as one turn."""
+
+    results: tuple[ToolResultMsg, ...]
+
+
+# The neutral conversation element. The loop owns the history; adapters
+# are stateless and translate the whole history on each turn.
+Message = UserText | AssistantTurn | ToolResults
+
+
+@dataclass(frozen=True)
+class ToolTurnRequest:
+    model: str
+    system: str
+    messages: tuple[Message, ...]
+    tools: tuple[ToolSpec, ...]
+    max_output_tokens: int
+
+
+@dataclass(frozen=True)
+class ToolTurnResult:
+    """One tool-use turn, normalized across providers.
+
+    `finished` is True when the model produced no tool calls (it ended
+    its turn), which the loop reads as "settle / stop".
+    """
+
+    text: str
+    tool_calls: tuple[ToolCall, ...]
+    input_tokens: int
+    output_tokens: int
+    finished: bool
+
+
 class ProviderAdapter(Protocol):
     """Strategy for making one model call against a provider."""
 
