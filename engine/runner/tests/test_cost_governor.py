@@ -143,7 +143,7 @@ def test_local_model_prices_at_zero() -> None:
 
 
 def test_local_run_never_trips_cost_cap() -> None:
-    # The whole point of the GPU fallback: a tiny cap plus huge token
+    # The whole point of the GPU fallback: a positive cap plus huge token
     # counts must never halt a local run, because cost stays $0.
     gov = CostGovernor.create(0.01)
     gov.before_call("ollama/qwen3:30b", est_input_tokens=10_000_000,
@@ -151,3 +151,9 @@ def test_local_run_never_trips_cost_cap() -> None:
     gov.record_call("ollama/qwen3:30b", 10_000_000, 10_000_000)
     gov.before_tool("edit_file")
     assert gov.meter.usd == 0.0
+
+
+def test_bare_local_floor_token_prices_as_local() -> None:
+    # The `local` tier sentinel (used as a model_floor) must resolve to
+    # the local tier, not opus -- otherwise it clamps local cards upward.
+    assert model_tier("local") == "local"

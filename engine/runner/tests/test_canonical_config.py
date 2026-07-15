@@ -260,7 +260,9 @@ def test_embedded_pricing_has_zero_local_tier() -> None:
 def test_load_tier_map_provider_builds_filename(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # provider= must select the tier_map_<provider>.yaml filename.
+    # provider= must select the tier_map_<provider>.yaml filename, and
+    # with the file absent it must fall back to a LOCAL (free) map, not
+    # a paid one -- the safety property the docstring promises.
     captured: dict[str, str] = {}
 
     def fake_candidates(env_var: str, filename: str, explicit: Path | None):
@@ -268,8 +270,63 @@ def test_load_tier_map_provider_builds_filename(
         return [tmp_path / "nope.yaml"]  # force embedded fallback.
 
     monkeypatch.setattr(cc, "_candidate_paths", fake_candidates)
-    cc.load_tier_map(provider="local")
+    tier_map = cc.load_tier_map(provider="local")
     assert captured["filename"] == "tier_map_local.yaml"
+    for points in range(1, 7):
+        assert cc.is_local_model(tier_map.model_for(points))
+
+
+def test_unknown_or_miscased_provider_falls_back_to_free_map_not_paid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # SAFETY: a typo'd or unexpected provider with a missing YAML must
+    # NEVER fall back to the paid Claude map (that would disable cost
+    # tracking on a paid model). It falls back to a free/local map.
+    monkeypatch.setattr(
+        cc, "_candidate_paths",
+        lambda env_var, filename, explicit: [tmp_path / "missing.yaml"],
+    )
+    for prov in ("Local", "gpt", "typo-provider"):
+        tier_map = cc.load_tier_map(provider=prov)
+        for points in range(1, 7):
+            model = tier_map.model_for(points)
+            assert cc.is_local_model(model), (
+                f"provider={prov!r} fell back to non-local model: {model}"
+            )
+
+
+def test_provider_is_case_normalized_for_filename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake(env_var: str, filename: str, explicit: Path | None):
+        captured["filename"] = filename
+        return [tmp_path / "nope.yaml"]
+
+    monkeypatch.setattr(cc, "_candidate_paths", fake)
+    cc.load_tier_map(provider="Local")
+    assert captured["filename"] == "tier_map_local.yaml"
+
+
+def test_claude_provider_still_uses_paid_claude_map(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression guard: the known 'claude' provider must still resolve
+    # the paid Claude embedded map when its YAML is missing.
+    monkeypatch.setattr(
+        cc, "_candidate_paths",
+        lambda env_var, filename, explicit: [tmp_path / "missing.yaml"],
+    )
+    tier_map = cc.load_tier_map(provider="claude")
+    assert tier_map.model_for(1).startswith("claude-")
+
+
+def test_bare_local_token_is_recognized_as_local_tier() -> None:
+    # A `model_floor: local` token must map to the 'local' tier, not
+    # fall through to 'opus' (which would clamp local cards upward).
+    assert cc.is_local_model("local") is True
+    assert cc._model_to_tier("local") == "local"
 
 
 def test_load_tier_map_default_provider_is_claude(

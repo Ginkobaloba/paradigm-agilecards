@@ -113,9 +113,16 @@ def is_local_model(model_id: str) -> bool:
 
     Local models are namespaced with a provider prefix (`ollama/`,
     `local/`, `vllm/`). This is how the cost governor and tier logic
-    tell "free, runs on Drew's GPU" from "paid, runs in the cloud".
+    tell "free, runs on my own GPU" from "paid, runs in the cloud".
+
+    The bare token `"local"` is also recognized: it is the local-tier
+    sentinel used as a `model_floor`, so floor normalization via
+    `model_tier` maps it to the `local` tier instead of mis-clamping a
+    local card up to the `opus` floor.
     """
     low = model_id.lower()
+    if low == "local":
+        return True
     return any(low.startswith(prefix) for prefix in LOCAL_MODEL_PREFIXES)
 
 
@@ -271,8 +278,12 @@ def load_tier_map(
     reachable -- useful in CI to catch a botched deploy that drops the
     canonical files.
     """
+    provider = provider.strip().lower()
     filename = f"tier_map_{provider}.yaml"
-    embedded = _EMBEDDED_TIER_MAPS.get(provider, _EMBEDDED_TIER_MAP)
+    # An unknown/typo'd provider with a missing YAML falls back to the
+    # FREE local map, never the paid Claude map: a misconfiguration must
+    # not silently bill. `claude` is the one known paid map.
+    embedded = _EMBEDDED_TIER_MAPS.get(provider, _EMBEDDED_TIER_MAP_LOCAL)
     candidates = _candidate_paths(ENV_TIER_MAP_PATH, filename, path)
     found = _first_existing(candidates)
     if found is None:

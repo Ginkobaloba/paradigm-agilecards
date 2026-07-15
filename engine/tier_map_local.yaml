@@ -9,7 +9,7 @@
 # Model ids carry a `<provider>/<tag>` prefix (`ollama/qwen3:30b`) so the
 # runner can tell a free local model from a paid hosted one. Local
 # inference always prices at the zero-rate `local` tier, so a local run
-# never trips a cost cap (see common/canonical_config.is_local_model and
+# never trips a positive cost cap (see common/canonical_config.is_local_model and
 # worker_stub/cost.model_tier). The LocalInvoker (KL2) strips the
 # provider prefix before sending `model` to the endpoint.
 #
