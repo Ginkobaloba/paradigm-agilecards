@@ -49,7 +49,9 @@ class OpenAICompatAdapter:
         )
 
 
-def _extract_text(data: dict[str, Any]) -> str:
+def _extract_text(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
         return ""
@@ -60,7 +62,9 @@ def _extract_text(data: dict[str, Any]) -> str:
     return content.strip() if isinstance(content, str) else ""
 
 
-def _usage(data: dict[str, Any], key: str) -> int:
+def _usage(data: Any, key: str) -> int:
+    if not isinstance(data, dict):
+        return 0
     usage = data.get("usage")
     if not isinstance(usage, dict):
         return 0

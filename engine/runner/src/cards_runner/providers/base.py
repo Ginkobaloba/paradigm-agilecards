@@ -90,4 +90,10 @@ def urllib_post_json(
         req.add_header(key, value)
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
         raw = resp.read().decode("utf-8")
-    return json.loads(raw) if raw.strip() else {}
+    if not raw.strip():
+        return {}
+    parsed = json.loads(raw)
+    # A well-behaved provider returns a JSON object; anything else (a
+    # top-level array, string, etc. from a broken server) normalizes to
+    # {} so the return type is honest and adapters degrade gracefully.
+    return parsed if isinstance(parsed, dict) else {}

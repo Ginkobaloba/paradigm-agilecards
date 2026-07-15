@@ -99,3 +99,24 @@ def test_openai_compat_tolerates_missing_usage_and_content() -> None:
 def test_openai_compat_name_is_stable() -> None:
     adapter = OpenAICompatAdapter(base_url="http://x/v1", api_key=None)
     assert adapter.name == "openai_compat"
+
+
+def test_openai_compat_tolerates_non_dict_response() -> None:
+    # A broken/misconfigured local server can return a top-level JSON
+    # array (or anything non-dict). That must degrade to empty text /
+    # zero usage, not crash the worker with an AttributeError.
+    class _ListPost:
+        def __call__(
+            self, url: str, *, headers: Any, body: Any, timeout: float
+        ) -> Any:
+            return []
+
+    adapter = OpenAICompatAdapter(
+        base_url="http://x/v1", api_key=None, post_json=_ListPost()
+    )
+    result = adapter.complete(
+        CompletionRequest(model="m", system="s", user="u", max_output_tokens=10)
+    )
+    assert result.text == ""
+    assert result.input_tokens == 0
+    assert result.output_tokens == 0
