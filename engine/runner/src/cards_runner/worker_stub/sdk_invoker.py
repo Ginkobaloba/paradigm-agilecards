@@ -33,13 +33,20 @@ from __future__ import annotations
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from pathlib import Path
 
 from ..common.canonical_config import TierMap, load_tier_map
 from ..common.types import now_utc_iso
+from ..providers import (
+    CompletionRequest,
+    PostJson,
+    build_adapter,
+    split_model,
+    urllib_post_json,
+)
 from .cost import CostCapExceeded, CostGovernor, Pricing, model_tier
 from .invoker import InvokeRequest, InvokeResult
 from .tools import TOOL_DESCRIPTORS, ToolBelt, ToolError, ToolResult
@@ -265,6 +272,10 @@ class SdkInvoker:
     tool_env: dict[str, str] | None = None  # env block the tool belt's
                                             # shell/git tools inherit;
                                             # defaults to os.environ.
+    # Injected HTTP transport for the non-Anthropic providers (OpenAI /
+    # vLLM / Ollama / Gemini). Tests pass a fake; production uses the
+    # stdlib-urllib default. The Anthropic path never touches it.
+    post_json: PostJson = field(default=urllib_post_json)
 
     def __post_init__(self) -> None:
         # The contract caps escalations at 2; clamp defensively in
@@ -470,19 +481,28 @@ class SdkInvoker:
     def _one_turn(
         self, model: str, system: str, user: str
     ) -> tuple[str, int, int]:
-        """One model call. Returns (text, input_tokens, output_tokens)."""
-        client = self._get_client()
-        message = client.messages.create(
-            model=model,
-            max_tokens=self.max_output_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
+        """One model call through the provider port.
+
+        Returns (text, input_tokens, output_tokens). The provider is
+        chosen from the model id: unprefixed / `claude` ids use the
+        in-process Anthropic client (built lazily, unchanged); a
+        provider-prefixed id (`ollama/`, `vllm/`, `openai/`, `gemini/`,
+        ...) routes to the matching adapter over the injected transport.
+        """
+        provider, _ = split_model(model)
+        client = self._get_client() if provider == "anthropic" else None
+        adapter, tag = build_adapter(
+            model, anthropic_client=client, post_json=self.post_json
         )
-        text = self._text_of(message)
-        usage = getattr(message, "usage", None)
-        in_tok = int(getattr(usage, "input_tokens", 0) or 0)
-        out_tok = int(getattr(usage, "output_tokens", 0) or 0)
-        return text, in_tok, out_tok
+        result = adapter.complete(
+            CompletionRequest(
+                model=tag,
+                system=system,
+                user=user,
+                max_output_tokens=self.max_output_tokens,
+            )
+        )
+        return result.text, result.input_tokens, result.output_tokens
 
     @staticmethod
     def _text_of(message: Any) -> str:
