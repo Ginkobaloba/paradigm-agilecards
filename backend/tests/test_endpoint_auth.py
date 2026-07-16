@@ -14,7 +14,7 @@ def _bearer(token: str) -> dict[str, str]:
 def test_healthz_is_public(client) -> None:
     resp = client.get("/healthz")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+    assert resp.json()["ok"] is True
 
 
 def test_no_token_is_401(client) -> None:

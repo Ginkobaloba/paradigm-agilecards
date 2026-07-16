@@ -1,90 +1,128 @@
-"""FastAPI application for the Paradigm AgileCards backend (chunk K11).
+"""FastAPI application for the Paradigm AgileCards backend.
 
-Wires the JWKS verifier (AC-CARDS-003) into a bearer guard on every authed
-route (AC-CARDS-006), enforces org isolation + role authorization from verified
-claims (AC-CARDS-007), and sources its config/secrets at boot (AC-CARDS-008).
+K11 delivered the auth contract (JWKS verify, org isolation, secrets at boot).
+This revision delivers the rest of the backend for real (ADR-2026-07-16):
+Postgres persistence with database-enforced row-level security, the full board
+CRUD surface at legacy-Express wire parity, an append-only audit trail, and the
+SSE live channel.
 
-The card surface here is intentionally narrow -- enough to prove the auth and
-isolation contract. The full card CRUD rewrite of the legacy Express backend is
-a separate chunk.
+Error envelope: the frontend reads a top-level ``error`` key from failure
+bodies (legacy contract). FastAPI nests ``HTTPException.detail`` under
+``detail`` by default, so a global handler flattens dict details to the top
+level. Validation errors surface as 400 ``{"error": ...}`` for the same reason.
 """
 
 from __future__ import annotations
 
-from fastapi import Depends, FastAPI, HTTPException, status
-from pydantic import BaseModel
+import logging
+from contextlib import asynccontextmanager
 
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from .audit import AuditLog
 from .auth import ParadigmClaims, TokenVerifier
-from .config import load_settings
-from .deps import get_store, require_claims, require_roles
-from .store import CardStore, default_store
+from .config import Settings, load_settings
+from .db import Database
+from .deps import require_claims
+from .events import EventBus
+from .routers import audit_admin, cards, columns, health, ranks, rates_router, sse
+from .routers import retros as retros_router
+from .routers import sprints as sprints_router
+from .routers import stories as stories_router
+from .routers import triage as triage_router
+from .routers import views as views_router
 
 
-class CardCreate(BaseModel):
-    title: str
-    # An org_id sent in the body is ignored on purpose: the verified token's
-    # org_id is authoritative (see create_card). Declared so it is accepted but
-    # never trusted.
-    org_id: str | None = None
+def _configure_logging() -> None:
+    """Structured-ish stdout logging (audit item S4). Uvicorn owns access logs;
+    this covers application + audit records with stable, parseable fields."""
+    root = logging.getLogger()
+    if root.handlers:  # respect an embedding process's configuration
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    )
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
 
 
 def create_app(
     *,
     verifier: TokenVerifier | None = None,
-    store: CardStore | None = None,
+    database: Database | None = None,
+    settings: Settings | None = None,
 ) -> FastAPI:
-    """Application factory. Tests inject an offline verifier and a seeded store;
-    production builds both from settings resolved at boot."""
-    settings = load_settings()
-    app = FastAPI(title="Paradigm AgileCards API", version="1.0.0")
+    """Application factory. Tests inject an offline verifier and a migrated
+    test Database; production builds both from settings resolved at boot."""
+    _configure_logging()
+    settings = settings or load_settings()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+        if app.state.db is not None:
+            app.state.db.dispose()
+
+    app = FastAPI(title="Paradigm AgileCards API", version="1.0.0", lifespan=lifespan)
+
     app.state.verifier = verifier or TokenVerifier(
         issuer=settings.jwt_issuer,
         audience=settings.jwt_audience,
         jwks_url=settings.jwks_url,
     )
-    app.state.store = store if store is not None else default_store()
+    if database is not None:
+        app.state.db = database
+    elif settings.database_url:
+        app.state.db = Database(settings.database_url)
+    else:
+        app.state.db = None
+    app.state.bus = EventBus()
+    app.state.audit = AuditLog(app.state.db)
 
-    @app.get("/healthz")
-    def healthz() -> dict[str, str]:
-        """Unauthenticated liveness probe (AC-OBS-004)."""
-        return {"status": "ok"}
+    if settings.cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(settings.cors_origins),
+            allow_credentials=False,  # bearer tokens, no cookies
+            allow_methods=["*"],
+            allow_headers=["Authorization", "Content-Type"],
+        )
+
+    @app.exception_handler(HTTPException)
+    async def flatten_http_exception(request: Request, exc: HTTPException) -> JSONResponse:
+        """Serve `{"error": ...}` at the top level (legacy contract)."""
+        body = exc.detail if isinstance(exc.detail, dict) else {"error": str(exc.detail)}
+        return JSONResponse(status_code=exc.status_code, content=body, headers=exc.headers)
+
+    @app.exception_handler(RequestValidationError)
+    async def flatten_validation_error(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        first = exc.errors()[0] if exc.errors() else {}
+        message = first.get("msg", "invalid request")
+        return JSONResponse(status_code=400, content={"error": message})
 
     @app.get("/api/me")
     def whoami(claims: ParadigmClaims = Depends(require_claims)) -> dict:
         """Echo the identity extracted from the verified token (AC-CARDS-007)."""
         return {"sub": claims.sub, "org_id": claims.org_id, "roles": list(claims.roles)}
 
-    @app.get("/api/cards")
-    def list_cards(
-        claims: ParadigmClaims = Depends(require_claims),
-        store: CardStore = Depends(get_store),
-    ) -> dict:
-        cards = [c.public_dict() for c in store.list_for_org(claims.org_id)]
-        return {"org_id": claims.org_id, "cards": cards}
-
-    @app.get("/api/cards/{card_id}")
-    def get_card(
-        card_id: str,
-        claims: ParadigmClaims = Depends(require_claims),
-        store: CardStore = Depends(get_store),
-    ) -> dict:
-        card = store.get_for_org(card_id, claims.org_id)
-        if card is None:
-            # 404 (not 403) so a caller cannot probe another org's card ids.
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail={"error": "not_found"}
-            )
-        return card.public_dict()
-
-    @app.post("/api/cards", status_code=201)
-    def create_card(
-        body: CardCreate,
-        claims: ParadigmClaims = Depends(require_roles("admin")),
-        store: CardStore = Depends(get_store),
-    ) -> dict:
-        # org_id is taken from the verified token, never from the request body.
-        card = store.create(org_id=claims.org_id, title=body.title)
-        return card.public_dict()
+    app.include_router(health.router)
+    app.include_router(columns.router)
+    app.include_router(cards.router)
+    app.include_router(ranks.router)
+    app.include_router(rates_router.router)
+    app.include_router(views_router.router)
+    app.include_router(sprints_router.router)
+    app.include_router(retros_router.router)
+    app.include_router(triage_router.router)
+    app.include_router(stories_router.router)
+    app.include_router(sse.router)
+    app.include_router(audit_admin.router)
 
     return app
 

@@ -7,11 +7,24 @@ own org's cards, and (2) role-based authorization on mutating routes.
 
 from __future__ import annotations
 
+import pytest
 from conftest import ORG_A, ORG_B
 
 
 def _bearer(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture(autouse=True)
+def seeded_cards(org_session):
+    """Deterministic cards across two orgs (the K11 seed, now in Postgres)."""
+    from cards_api.models import Card
+
+    with org_session(ORG_A) as s:
+        s.add(Card(org_id=ORG_A, id="a1", frontmatter={"title": "Acme: ship login"}))
+        s.add(Card(org_id=ORG_A, id="a2", frontmatter={"title": "Acme: fix nav"}))
+    with org_session(ORG_B) as s:
+        s.add(Card(org_id=ORG_B, id="b1", frontmatter={"title": "Globex: invoice run"}))
 
 
 def test_claims_are_extracted_from_token(client, make_token) -> None:

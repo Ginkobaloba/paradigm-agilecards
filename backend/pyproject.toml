@@ -13,6 +13,11 @@ dependencies = [
   # AC-CARDS-003: direct JWKS RS256 verification. The [crypto] extra pulls in
   # `cryptography`, which PyJWT needs for RS256.
   "pyjwt[crypto]>=2.8",
+  # Persistence (ADR-2026-07-16): Postgres via SQLAlchemy 2 (sync ORM) +
+  # psycopg 3, schema versioned with Alembic. RLS lives in the migrations.
+  "sqlalchemy>=2.0.30",
+  "psycopg[binary]>=3.2",
+  "alembic>=1.13",
 ]
 
 [project.optional-dependencies]
@@ -27,6 +32,11 @@ dev = [
 infisical = [
   "infisical-python>=2.3",
 ]
+# One-off operational tooling (scripts/import_legacy.py needs YAML frontmatter
+# parsing). Not part of the runtime image.
+tools = [
+  "pyyaml>=6",
+]
 
 [tool.setuptools]
 packages = ["cards_api"]
@@ -36,6 +46,14 @@ py-modules = ["app"]
 
 [tool.ruff]
 line-length = 100
+
+# Audit S13: the default E/F set alone is a weak signal. Bugbear, isort,
+# pyupgrade, and simplify catch real defects; keep the backend honest.
+[tool.ruff.lint]
+select = ["E", "F", "B", "I", "UP", "SIM"]
+# B008 flags call-in-default, which is FastAPI's dependency-injection idiom
+# (`arg: T = Depends(...)`) -- a false positive across this entire package.
+ignore = ["B008"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

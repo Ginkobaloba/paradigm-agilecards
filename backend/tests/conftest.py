@@ -1,19 +1,40 @@
-"""Shared test fixtures for the AgileCards backend auth suite.
+"""Shared test fixtures: offline JWKS auth + a real migrated Postgres.
 
-The chunk requires JWKS verification that is *mockable for tests* (AC-CARDS-003):
-no network, no real IdP. We generate an RSA keypair in-process, expose it as a
-JWKS, and mint RS256 tokens signed with the private half. The verifier under
-test is pointed at a fake JWK client that serves that public key, so every
-auth path (valid / expired / tampered / wrong-alg / wrong-iss / wrong-aud) is
-exercised deterministically and offline.
+Auth (AC-CARDS-003): an in-process RSA keypair and a fake JWK client keep every
+auth path (valid / expired / tampered / wrong-alg / wrong-iss / wrong-aud)
+deterministic and offline -- unchanged from K11.
+
+Persistence (ADR-2026-07-16): row-level security can only be proven against
+real Postgres, so the suite runs against one. Locally that is the disposable
+dev container (see backend/README.md):
+
+    docker run -d --name agilecards-pg-dev -e POSTGRES_PASSWORD=devpassword \
+        -e POSTGRES_DB=agilecards -p 5440:5432 postgres:16-alpine
+
+CI provides a service container. A fresh, uniquely-named database is created
+per test session, migrated to head with Alembic, and dropped afterwards. Tests
+connect as the ``agilecards_app`` role (NOSUPERUSER/NOBYPASSRLS) -- the same
+privilege level as production -- so RLS is actually in force under test.
+
+These fixtures fail loudly (never skip) when Postgres is unreachable: silently
+skipping the security suite is exactly the CI-masking failure the 2026-07-16
+audit flagged (S1).
 """
 
 from __future__ import annotations
 
+import os
+import uuid
+from pathlib import Path
+
 import jwt
 import pytest
+from alembic import command
+from alembic.config import Config as AlembicConfig
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 
 ISSUER = "https://auth.paradigm.codes"
 AUDIENCE = "paradigm-agilecards"
@@ -22,6 +43,18 @@ KID = "test-key-1"
 # Two orgs used across the isolation tests (AC-CARDS-007).
 ORG_A = "org_acme"
 ORG_B = "org_globex"
+
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+
+_DEFAULT_ADMIN_DSN = "postgresql+psycopg://postgres:devpassword@localhost:5440/postgres"
+ADMIN_DSN = os.environ.get("AGILECARDS_TEST_ADMIN_DSN", _DEFAULT_ADMIN_DSN)
+APP_ROLE = "agilecards_app"
+APP_ROLE_PASSWORD = "agilecards_test_app_pw"  # test-database-only credential
+
+
+# --------------------------------------------------------------------------
+# Auth fixtures (offline JWKS)
+# --------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="session")
@@ -83,29 +116,6 @@ def verifier(jwk_client):
 
 
 @pytest.fixture
-def seeded_store():
-    """A store with deterministic cards across two orgs for isolation tests."""
-    from cards_api.store import Card, CardStore
-
-    store = CardStore()
-    store.add(Card(id="a1", org_id=ORG_A, title="Acme: ship login"))
-    store.add(Card(id="a2", org_id=ORG_A, title="Acme: fix nav"))
-    store.add(Card(id="b1", org_id=ORG_B, title="Globex: invoice run"))
-    return store
-
-
-@pytest.fixture
-def client(verifier, seeded_store):
-    """TestClient over an app using the offline verifier and seeded store."""
-    from fastapi.testclient import TestClient
-
-    from cards_api.main import create_app
-
-    app = create_app(verifier=verifier, store=seeded_store)
-    return TestClient(app)
-
-
-@pytest.fixture
 def make_token(rsa_keypair):
     """Factory minting tokens. Defaults produce a valid Paradigm access token."""
     import time
@@ -142,3 +152,131 @@ def make_token(rsa_keypair):
         return jwt.encode(payload, signing_key, algorithm=alg, headers=headers)
 
     return _make
+
+
+@pytest.fixture
+def auth_headers(make_token):
+    """Factory: Authorization headers for a valid token (kwargs pass through)."""
+
+    def _headers(**kwargs) -> dict[str, str]:
+        return {"Authorization": f"Bearer {make_token(**kwargs)}"}
+
+    return _headers
+
+
+# --------------------------------------------------------------------------
+# Postgres fixtures (real database, migrated, app-role connection)
+# --------------------------------------------------------------------------
+
+_ALL_TABLES = (
+    "staged_cards",
+    "story_batches",
+    "sprint_cards",
+    "sprints",
+    "retros",
+    "saved_views",
+    "card_events",
+    "card_rank",
+    "cards",
+    "audit_events",
+)
+
+
+@pytest.fixture(scope="session")
+def pg_urls():
+    """Create a unique test database, migrate it, bootstrap the app role."""
+    admin_url = make_url(ADMIN_DSN)
+    dbname = f"agilecards_test_{uuid.uuid4().hex[:10]}"
+
+    try:
+        control = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+        with control.connect() as conn:
+            conn.execute(text(f'CREATE DATABASE "{dbname}"'))
+    except Exception as exc:  # noqa: BLE001 - we want ONE clear message here
+        pytest.fail(
+            "Cannot reach the test Postgres at "
+            f"{admin_url.render_as_string(hide_password=True)!r}: {exc}\n"
+            "Start it with:\n"
+            "  docker run -d --name agilecards-pg-dev -e POSTGRES_PASSWORD=devpassword "
+            "-e POSTGRES_DB=agilecards -p 5440:5432 postgres:16-alpine\n"
+            "or point AGILECARDS_TEST_ADMIN_DSN at an admin-capable Postgres.\n"
+            "(This suite fails rather than skips: it contains the RLS/security "
+            "tests and must never be silently green.)"
+        )
+
+    db_admin_url = admin_url.set(database=dbname)
+    db_admin_str = db_admin_url.render_as_string(hide_password=False)
+
+    alembic_cfg = AlembicConfig(str(BACKEND_DIR / "alembic.ini"))
+    alembic_cfg.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+    previous = os.environ.get("PARADIGM_DATABASE_MIGRATE_URL")
+    os.environ["PARADIGM_DATABASE_MIGRATE_URL"] = db_admin_str
+    try:
+        command.upgrade(alembic_cfg, "head")
+    finally:
+        if previous is None:
+            os.environ.pop("PARADIGM_DATABASE_MIGRATE_URL", None)
+        else:
+            os.environ["PARADIGM_DATABASE_MIGRATE_URL"] = previous
+
+    admin_engine = create_engine(db_admin_url, isolation_level="AUTOCOMMIT")
+    with admin_engine.connect() as conn:
+        conn.execute(text(f"ALTER ROLE {APP_ROLE} LOGIN PASSWORD '{APP_ROLE_PASSWORD}'"))
+
+    app_url = db_admin_url.set(username=APP_ROLE, password=APP_ROLE_PASSWORD)
+
+    yield {
+        "app": app_url.render_as_string(hide_password=False),
+        "admin": db_admin_str,
+        "admin_engine": admin_engine,
+    }
+
+    admin_engine.dispose()
+    with control.connect() as conn:
+        conn.execute(text(f'DROP DATABASE "{dbname}" WITH (FORCE)'))
+    control.dispose()
+
+
+@pytest.fixture(scope="session")
+def app_engine(pg_urls):
+    """Engine connected as agilecards_app -- production privilege level."""
+    engine = create_engine(pg_urls["app"], pool_pre_ping=True)
+    yield engine
+    engine.dispose()
+
+
+@pytest.fixture
+def database(pg_urls, app_engine):
+    """A clean, migrated Database per test (all tables truncated up front)."""
+    from cards_api.db import Database
+
+    with pg_urls["admin_engine"].connect() as conn:
+        conn.execute(
+            text(f"TRUNCATE {', '.join(_ALL_TABLES)} RESTART IDENTITY CASCADE")
+        )
+    return Database(engine=app_engine)
+
+
+@pytest.fixture
+def org_session(database):
+    """Factory for org-bound sessions, for seeding and direct assertions:
+
+    with org_session(ORG_A) as s:
+        s.add(Card(org_id=ORG_A, id="a1", ...))
+    """
+
+    def _factory(org_id: str):
+        return database.org_session(org_id)
+
+    return _factory
+
+
+@pytest.fixture
+def client(verifier, database):
+    """TestClient over an app using the offline verifier and the migrated DB."""
+    from fastapi.testclient import TestClient
+
+    from cards_api.main import create_app
+
+    app = create_app(verifier=verifier, database=database)
+    return TestClient(app)

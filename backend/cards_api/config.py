@@ -29,6 +29,13 @@ class Settings:
     jwt_issuer: str
     jwt_audience: str
     jwks_url: str
+    # Postgres DSN for the runtime (agilecards_app) connection. None means the
+    # app boots without a database (auth-only surfaces still work); any route
+    # that needs the store raises a clear 503 instead of a stack trace.
+    database_url: str | None
+    # Extra allowed CORS origins (comma-separated env). Same-origin deploys
+    # (portal proxy) need none; standalone Vite dev needs http://localhost:5173.
+    cors_origins: tuple[str, ...]
 
 
 def load_settings(source: Mapping[str, str] | None = None) -> Settings:
@@ -43,7 +50,16 @@ def load_settings(source: Mapping[str, str] | None = None) -> Settings:
     issuer = secrets.get("PARADIGM_JWT_ISSUER", _DEFAULT_ISSUER)
     audience = secrets.get("PARADIGM_JWT_AUDIENCE", _DEFAULT_AUDIENCE)
     jwks_url = secrets.get("PARADIGM_JWKS_URL") or f"{issuer}/.well-known/jwks.json"
-    return Settings(jwt_issuer=issuer, jwt_audience=audience, jwks_url=jwks_url)
+    database_url = secrets.get("PARADIGM_DATABASE_URL") or None
+    cors_raw = secrets.get("PARADIGM_CORS_ORIGINS", "")
+    cors_origins = tuple(o.strip() for o in cors_raw.split(",") if o.strip())
+    return Settings(
+        jwt_issuer=issuer,
+        jwt_audience=audience,
+        jwks_url=jwks_url,
+        database_url=database_url,
+        cors_origins=cors_origins,
+    )
 
 
 def _load_secret_source() -> Mapping[str, str]:

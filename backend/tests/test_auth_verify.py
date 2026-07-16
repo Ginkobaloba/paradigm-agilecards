@@ -8,9 +8,9 @@ so the HS256-with-public-key confusion attack is impossible.
 from __future__ import annotations
 
 import pytest
-from cards_api.auth import ParadigmClaims, TokenError, TokenVerifier
-
 from conftest import AUDIENCE, ISSUER, KID, ORG_A
+
+from cards_api.auth import ParadigmClaims, TokenError, TokenVerifier
 
 
 @pytest.fixture

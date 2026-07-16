@@ -1,7 +1,8 @@
-"""Smoke test for the K2 backend scaffold.
+"""Smoke test for the entrypoint shim: ``uvicorn app:app`` must keep working.
 
-This is the passing CI placeholder. Substantive backend tests (JWKS verify,
-401 on missing/tampered tokens, org isolation) arrive with chunk K11.
+The app boots with no database configured (PARADIGM_DATABASE_URL unset in unit
+CI); the health probe stays green and DB-backed routes 503 cleanly instead of
+crashing -- that behavior is covered in test_endpoint_auth.
 """
 
 from fastapi.testclient import TestClient
@@ -14,4 +15,7 @@ client = TestClient(app)
 def test_healthz_returns_200_ok() -> None:
     resp = client.get("/healthz")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+    body = resp.json()
+    assert body["ok"] is True
+    assert "version" in body
+    assert "cardsDir" in body  # legacy-typed field, vestigial but load-bearing
