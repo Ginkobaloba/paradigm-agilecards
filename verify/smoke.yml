@@ -11,12 +11,15 @@
 #     /api/cards) can be asserted unauthenticated yet.
 # While deploy_url stays a placeholder, the verify workflow's detect job skips
 # quick-verify (neutral, not a green pass) instead of failing on DNS or faking a pass.
-# TODO (Gantry cutover): once the board is reachable, set deploy_url to the real
-# origin -- expected https://portal.projectnexuscode.org/gantry (or
-# https://portal.paradigm.codes/gantry after the paradigm.codes migration) -- and
-# prefix the surface URLs below with the /gantry base path.
+# TODO (alpha deploy): the canonical target is https://cards.paradigm.codes
+# (README.md is authoritative; the old app.projectnexuscode.org and
+# portal.*/gantry references are dead -- audit 2026-07-16, M3). Set deploy_url
+# to that origin when the deploy/agilecards compose stack goes live. The
+# assertions below already match the FastAPI backend: /healthz serves
+# {ok: true, ...} and /api/cards + /api/columns answer 401 unauthenticated.
 #
-# The backend API is proxied by nginx at /api/ on the same origin.
+# The backend API is proxied by Caddy at /api/ on the same origin
+# (deploy/agilecards/Caddyfile).
 # The board is token-gated, so the home surface returns 200 but renders the
 # TokenGate form rather than the authenticated dashboard.
 #

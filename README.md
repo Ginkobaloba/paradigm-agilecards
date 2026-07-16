@@ -17,10 +17,14 @@ Licensed under PolyForm Noncommercial 1.0.0. See [LICENSE](./LICENSE).
 
 ```
 paradigm-agilecards/
-  backend/                FastAPI (Python). K2 scaffold; real Cards API is K11.
-    app.py                FastAPI app with /healthz
+  backend/                FastAPI (Python) Cards API: JWKS auth (K11) + Postgres
+                          persistence, full board CRUD, DB-enforced RLS, audit
+                          trail (P1, 2026-07-16). See backend/README.md.
+    app.py                entrypoint shim (uvicorn app:app)
+    cards_api/            the application package
+    migrations/           Alembic schema + RLS policies
     pyproject.toml        deps + dev extras (pytest, httpx, ruff)
-    tests/                /healthz smoke test (the passing CI placeholder)
+    tests/                auth + RLS + wire-parity suites (real Postgres)
   frontend/               Vite + React + TypeScript + Tailwind Boards UI
   tests/                  repo-level integration/e2e home (placeholder; K16/V)
   docs/                   repo docs
@@ -34,8 +38,11 @@ paradigm-agilecards/
     SKILL.md RUNNER_CONTRACT.md DEFINITION_OF_DONE.md
   brand/                  Gantry brand assets (logotype, motion, tokens, preset)
   marketing/              Gantry marketing site (Vite). May fold into apps/site (K13).
-  legacy/board-express/   frozen pre-Paradigm Express/TS backend + Docker/compose.
-                          Reference for K10 (deploy) and K11 (backend rewrite). Delete after K11.
+  legacy/board-express/   pre-Paradigm Express/TS backend + Docker/compose.
+                          STILL THE LIVE BOARD BACKEND. Active until the FastAPI
+                          backend cutover (P1); deletion requires Drew's explicit
+                          go-ahead after cutover. Relabeled 2026-07-16 (was
+                          "delete after K11" -- K11 shipped auth only).
   verification/cards/     AC verification records (CARDS-001, CARDS-002, ...)
   DECISIONS.md            local stub recording the repo URL (K18 canonicalizes)
   .github/workflows/ci.yml  four-job CI (engine, board frontend, legacy board backend, fastapi)
