@@ -34,6 +34,7 @@ from cards_runner.daemon import worktree as worktree_mod
 from cards_runner.daemon.worktree import (
     WorktreeCreateError,
     _registered_worktrees,
+    attempt_branch_name,
     prepare_worktree,
 )
 
@@ -104,6 +105,49 @@ def test_registered_worktrees_returns_resolved_paths(
     registered = _registered_worktrees(real_repo)
     assert real_repo.resolve() in registered
     assert all(isinstance(p, Path) for p in registered)
+
+
+def test_attempt_branch_name_is_unique_per_attempt() -> None:
+    """Two attempts of the same card get distinct branches, both keeping
+    the card-identifying prefix. This is what lets a bounced card retry
+    instead of colliding on a lingering worktree's pinned branch."""
+    base = "card/b001-01-add-health-check"
+    a = attempt_branch_name(base, "aaaaaaaaaaaa1111")
+    b = attempt_branch_name(base, "bbbbbbbbbbbb2222")
+    assert a != b
+    assert a.startswith(base + "/")
+    assert b.startswith(base + "/")
+    # Deterministic for a given attempt id (the daemon and the merge gate
+    # derive it independently and MUST agree, or the gate pushes a branch
+    # prepare_worktree never created).
+    assert attempt_branch_name(base, "aaaaaaaaaaaa1111") == a
+
+
+def test_two_attempt_branches_coexist_in_one_repo(
+    paths: RuntimePaths, real_repo: Path
+) -> None:
+    """The retry case, end to end against real git: after attempt 1's
+    worktree is left in place (as the forensic TTL does), attempt 2 with a
+    different attempt id must still prepare successfully. Under the old
+    fixed-branch scheme this was the livelock."""
+    base = "card/b001-03-retry"
+    wt1 = paths.runs / "att-1" / "worktree"
+    wt2 = paths.runs / "att-2" / "worktree"
+
+    prepare_worktree(
+        paths=paths, project_dir=real_repo,
+        branch_name=attempt_branch_name(base, "1111" * 4),
+        base_branch="main", worktree_path=wt1, skip_git=False,
+    )
+    # attempt 1's worktree is deliberately NOT torn down (forensic TTL).
+    prepare_worktree(
+        paths=paths, project_dir=real_repo,
+        branch_name=attempt_branch_name(base, "2222" * 4),
+        base_branch="main", worktree_path=wt2, skip_git=False,
+    )
+    registered = _registered_worktrees(real_repo)
+    assert wt1.resolve() in registered
+    assert wt2.resolve() in registered
 
 
 def test_prepare_worktree_is_atomic_when_verification_fails(

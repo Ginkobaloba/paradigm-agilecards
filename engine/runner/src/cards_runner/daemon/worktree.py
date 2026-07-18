@@ -41,6 +41,30 @@ class WorktreeCreateError(Exception):
     """Raised when worktree creation or verification fails."""
 
 
+def attempt_branch_name(base_branch: str, attempt_trace_id: str) -> str:
+    """A per-attempt working branch name.
+
+    A card's working branch cannot be a fixed name. After a verify-fail
+    bounce the card returns to `backlog` and is re-claimed, but the prior
+    attempt's worktree is kept for the forensic run-dir TTL (default 24h)
+    and still pins the fixed branch. A fixed name therefore collides on the
+    next `git worktree add` ("branch already used by worktree") and the card
+    livelocks at poll cadence -- the claim-fail-bounce-retry loop the runner
+    is built around cannot actually retry.
+
+    Suffixing the attempt id makes each claim's branch unique, so a retry
+    proceeds instead of colliding, and each attempt's worktree and PR are
+    independently traceable. `base_branch` is used only as a prefix and is
+    never created as a bare ref, so no `card/<id>` vs `card/<id>/<attempt>`
+    directory/file ref conflict can arise.
+
+    Callers that create OR reference the branch for a given attempt (worktree
+    prep, and the merge gate's push + PR) must derive it here, so the name is
+    identical across the attempt's whole lifecycle.
+    """
+    return f"{base_branch}/{attempt_trace_id[:12]}"
+
+
 def prepare_worktree(
     *,
     paths: RuntimePaths,

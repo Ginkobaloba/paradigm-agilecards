@@ -195,47 +195,36 @@ that sound related but belong to other cards.
 ## Acceptance criteria
 
 Machine-checkable. The verifier dispatches each item to its registered
-handler (see `lib/verifier/types.py` for the canonical list). The card
-moves to `done/` only if every item passes. Subjective items route
-through the cascade evaluator described in RUNNER_CONTRACT.md
-"Cold-read verification".
+handler. The card moves to `done/` only if every item passes. A card
+with NO parseable acceptance criteria FAILS closed (a card that verifies
+nothing is never merged), so every card needs at least one real item.
+Subjective items route through the cascade evaluator described in
+RUNNER_CONTRACT.md "Cold-read verification".
 
-Canonical types (v1.3). The single source of truth is
-`lib/verifier/types.py`; this list is reproduced here for human
-readers but the runner imports from the registry.
+Canonical types. The single source of truth is the type the DAEMON runs:
+`cards_runner/verifier/types.py` (`CANONICAL_TYPES`). There are exactly
+six. Anything else -- including `command`, `python_assert`, `http_status`,
+`http_contains`, `file_absent_content` (names from the older
+`lib/verifier` reference implementation) -- is rejected with a
+`SchemaError` and the card fails. If you need a shell check, use `shell`,
+not `command`.
 
 Filesystem family:
 
 - `file_exists` -- path exists at worktree root (relative) or
   absolute. Required: `path`.
 - `file_absent` -- path does not exist. Required: `path`.
-- `file_contains` -- file contains a regex or substring. Required:
-  `path` and exactly one of `pattern` (regex) or `literal`
-  (substring). Optional: `case_sensitive` (default true).
-- `file_absent_content` -- file does NOT contain a regex or
-  substring. Same shape as `file_contains`. Missing files pass.
+- `file_contains` -- file contains a regex/substring. Required: `path`
+  and `pattern`. Optional: `case_sensitive` (default true).
+- `file_lacks` -- file does NOT contain `pattern`. Same shape as
+  `file_contains`. (Legacy alias: `grep_absent`.)
 
 Process family:
 
-- `command` -- run a shell command. Required: `command` (str or
-  list[str]). Optional: `expected_exit_code` (default 0), `cwd`,
-  `env`, `timeout_sec` (default 60s). Runs `shell=False` with a
-  scrubbed env baseline; see `lib/verifier/handlers/command.py`.
-- `python_assert` -- evaluate a Python expression that must return
-  truthy. Required: `expression`. Optional: `timeout_sec` (default 5).
-  Namespace is restricted to `os` (read-only), `json`, `pathlib`
-  (read-only), `re`, `sys`; write-mode `open`, `subprocess`, network
-  modules, etc., are blocked at AST inspection time.
-
-Network family. Project must opt in via `network_checks_allowed: true`:
-
-- `http_status` -- url returns expected status. Required: `url`,
-  `expected_status` (int or list[int]). Optional: `method`, `headers`,
-  `body`, `timeout_sec` (default 10), `retries` (default 2; backoff
-  is exponential 1s, 2s, fixed schedule).
-- `http_contains` -- response body matches a pattern or literal. Same
-  fields as `http_status` plus `pattern` or `literal` (one of), and
-  optional `case_sensitive`.
+- `shell` -- run a shell command; passes when it exits 0 (or matches
+  `expect_exit:`). Required: `command` (str). Optional: `expect_exit`
+  (default 0). Runs in the worktree with the scrubbed env block, via
+  `cmd.exe /c` on Windows and `sh -c` on POSIX. (Legacy alias: `shell`.)
 
 Human-judgment family. Tier 5 / 6 cards only:
 
@@ -248,15 +237,15 @@ Human-judgment family. Tier 5 / 6 cards only:
 ```yaml
 # Replace the items below. Every item needs `description` and `type`
 # plus the type-specific fields. The schema validator refuses a batch
-# where any item is malformed.
+# where any item declares an unknown type, and a card with zero items
+# fails closed -- so keep at least one real check here.
 acceptance_criteria:
   - description: "Lint passes"
-    type: command
+    type: shell
     command: "make lint"
   - description: "Unit tests pass"
-    type: command
+    type: shell
     command: "make test"
-    timeout_sec: 120
   - description: "Expected file was created"
     type: file_exists
     path: "src/example.py"
@@ -265,7 +254,7 @@ acceptance_criteria:
     path: "src/app.py"
     pattern: "example_function"
   - description: "No leaked api keys remain"
-    type: file_absent_content
+    type: file_lacks
     path: "src/config.py"
     pattern: "api_key\\s*=\\s*['\"][^'\"]+['\"]"
   # Tier 5 / 6 only. Executor populates the matching entry in the
