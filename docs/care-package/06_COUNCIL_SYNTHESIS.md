@@ -1,5 +1,7 @@
 # Council Synthesis -- AgileCards board-as-control-plane
 
+> **PARTIALLY SUPERSEDED (2026-07-17) by `08_SCOPE_UPDATE_AND_ENGINE_VALIDATION.md`.** Two of this document's conclusions no longer hold: the "internal dev-tool, cut Postgres/RLS/tenancy, ice Branch A" recommendation is reversed (Drew: AgileCards is not internal-only), and the "run the engine" recommendation has been executed -- the engine was found unable to run a card on Windows and is now fixed and validated (PRs #57, #58). The process findings, the disagreement map, and the raw transcript (`05`) all stand.
+
 **Companion to:** `05_COUNCIL_TRANSCRIPT_FULL.md` (raw, verbatim). This is the decision document.
 **Mode:** `/council deep` (3 rounds + 2 orchestrator verification passes)
 **Date:** 2026-07-16

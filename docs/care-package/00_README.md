@@ -1,5 +1,7 @@
 # Care Package -- AgileCards, 2026-07-16
 
+> **CURRENT AUTHORITY: `08_SCOPE_UPDATE_AND_ENGINE_VALIDATION.md` (2026-07-17).** Two conclusions in this package are overturned there: (1) AgileCards is **not** internal-only (Drew reversed it) -- multi-tenant Postgres/RLS is back in scope and Branch A comes off ice; (2) the engine has now been **run and validated** -- it could not execute a card on Windows until fixed (PRs #57, #58). Read `08` after `06`. The council record (`05`) and everything below stand as history.
+
 Everything from the reconciliation and the council deliberation, in one place, in reading order. Assembled for Drew.
 
 **The one-line result:** the council was asked to settle two architectural fault lines and a strategic pivot. It destroyed all three. What survived is a single uncontested fact and a single recommended action.

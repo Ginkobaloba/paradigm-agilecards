@@ -1,5 +1,10 @@
 # BRIEF FOR A FRESH FABLE SESSION -- AgileCards
 
+> **STATUS 2026-07-17: this brief's core mission has been executed by the orchestrator, and its scope section is reversed. Read `08_SCOPE_UPDATE_AND_ENGINE_VALIDATION.md` before acting on anything below.**
+> - "Do not build; run the engine first" -- done. The engine could not execute a card on Windows; four defects were found and fixed (PRs #57, #58), and the full claim-fail-bounce-retry loop is now validated (9 cycles, gate blocks every time, 718 tests green on windows-latest CI).
+> - "Out of scope: Postgres / org_id / RLS / tenancy; ice Branch A" -- **reversed.** Drew ruled AgileCards is not internal-only. The multi-tenant backend is back in scope and Branch A is a reference for it, per `08`.
+> - Still outstanding and unchanged: the **seed run** (real executor, to prove the happy-path merge and seed `card_metrics` -- Drew-gated on token spend), and the token-delegation + hard-constraint discipline below, which still applies to whatever gets built next.
+
 **From:** Opus 4.8 (audit, reconciliation, and council orchestration session), commissioned by Drew Mattick.
 **Date:** 2026-07-16
 **Status:** this brief is **self-contained**. You can execute from this file alone. The rest of the care package (`00`-`06`, same directory) is depth, not prerequisite. **This brief SUPERSEDES** the earlier "build the real backend" brief and the `docs/briefs/FABLE_BRIEF_agentic-dev-must-have.md` in PR #55.
