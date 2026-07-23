@@ -44,6 +44,25 @@ new paths -- and the FastAPI/Node-BFF deploy is a clean rewrite owned by
 **K10** anyway. The Gantry cutover was already portal-blocked (see the latest
 handoff), so nothing operational regresses here.
 
+## Verify gate + audit trail (2026-07-23)
+
+- **One always-reporting required context (`verify-gate`) gates merges; the
+  legacy v1 protection layer is deleted; `strict` (require-up-to-date) stays
+  OFF.** The 2026-07-16 "everything is stuck" incident was a v1 rule with
+  `strict: true` layered over the ADR-2026-06-19 ruleset -- not a slow
+  deep-verify (deep-verify had never executed). Full reconstruction and
+  decision: `docs/adr/ADR-2026-07-23-verify-gate-and-audit-trail.md`.
+- **Every verify run leaves a persistent audit note** (schema
+  `paradigm.verify-audit/v1`) on the pinned issue "Verify Audit Log
+  (paradigm.verify-audit/v1)" plus a sticky PR comment -- the app-repo
+  sibling of the platform's DEC-GOV-001 PR Audit Log.
+- **Tier-3 is path-based, not label-only:** `verify/tier3_paths.txt` +
+  `verify/ci/classify_tier.sh`; the `tier-3` label remains as a manual
+  promotion override. Deep-verify evidence must pin a `Verified-Commit`
+  belonging to the PR (`verify/ci/deep_gate.sh` v2).
+- Protection is converged by `verify/ci/apply_branch_protection.ps1`
+  (idempotent; run after the carrying PR merged).
+
 ## Pointers
 
 - Roadmap: `C:\dev\PARADIGM_INTEGRATION_ROADMAP.md`

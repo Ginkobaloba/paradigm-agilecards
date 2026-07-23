@@ -1,38 +1,64 @@
 # .github/workflows/verify.yml
-# Last updated: 2026-06-26
+# Last updated: 2026-07-23 (verify-gate rework; ADR-2026-07-23-verify-gate-and-audit-trail)
 #
 # BRANCH PROTECTION NOTE:
-# For the deep-verify gate to actually block merges, add "deep-verify" as a
-# Required status check in branch protection settings for your default branch
-# (Settings > Branches > branch protection rule > "Require status checks to pass
-# before merging"). Without this, the job runs but GitHub will still allow merge
-# if it fails or is skipped.
+# The ONLY context that should be marked Required for this workflow is
+# `verify-gate`. It runs on EVERY PR via `if: always()`, so it always reports
+# and can never leave a PR waiting on a context that never appears (the June
+# 2026 stuck-PR failure mode, see docs/adr/ADR-2026-06-19 and ADR-2026-07-23).
+# Do NOT mark quick-verify or deep-verify required directly -- they skip by
+# design and requiring a sometimes-skipping context is how PRs get stuck.
+# Apply/repair protection with: verify/ci/apply_branch_protection.ps1
+#
+# JOB NAME `verify-gate` IS LOAD-BEARING: it is a required status-check context
+# in the main ruleset. Do not rename it without updating the ruleset, or every
+# PR will hang waiting for a context that never reports.
 #
 # WINDOWS / HEADED NOTE:
-# The headed layer (Layer 5, Windows MCP / computer-use) and adversarial generation
-# (--adversarial) are LOCAL deep-verify steps -- they require a real Windows desktop
-# with Chrome and the computer-use MCP running. They cannot run in CI. CI covers
-# layers 1-4 and curated edge cases only. The human-gated local run covers layers 5-6.
-# Default to ubuntu-latest for network and headless layers.
+# The headed layer (Layer 5, Windows MCP / computer-use) and adversarial
+# generation (--adversarial) are LOCAL deep-verify steps -- they require a real
+# Windows desktop with Chrome and the computer-use MCP running. They cannot run
+# in CI. CI covers layers 1-4 and curated edge cases only. The tier-3 gate
+# therefore checks for a COMMITTED local deep-verify report pinned to this PR
+# (verify/ci/deep_gate.sh), it does not fake a deep run.
 #
 # PLACEHOLDER / SKIP NOTE:
-# quick-verify only runs when verify/smoke.yml has a real, reachable deploy_url.
-# A `detect` job reads deploy_url first; if it is a placeholder (no host yet, or a
-# deploy that is not publicly reachable), quick-verify is SKIPPED, not reported as a
-# pass. A skipped check is honest -- it shows the PR was not smoke-verified instead of
-# painting a green "pass" over a smoke run that tested nothing. Set a real deploy_url
-# to light up the live smoke.
+# quick-verify only runs when verify/smoke.yml has a real, reachable
+# deploy_url. While deploy_url is a placeholder, quick-verify is SKIPPED
+# (honest neutral, not a fake pass) -- and unlike the pre-2026-07-23 revision,
+# that skip no longer drags deep-verify down with it: deep-verify hangs off
+# `classify`, not `quick-verify`. The skip and its reason are recorded in the
+# verify audit note either way.
+#
+# AUDIT NOTE:
+# verify-gate leaves a persistent, structured record of every run
+# (schema paradigm.verify-audit/v1, the app-repo sibling of the platform's
+# DEC-GOV-001 pr-audit log):
+#   1. an append-only comment on the pinned issue "Verify Audit Log
+#      (paradigm.verify-audit/v1)" (auto-created on first run),
+#   2. an upserted sticky PR comment with the latest verdict,
+#   3. the job summary.
 
 name: Paradigm Verify
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: verify-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   detect:
     name: Detect deploy target
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       live: ${{ steps.check.outputs.live }}
       deploy_url: ${{ steps.check.outputs.deploy_url }}
@@ -59,11 +85,31 @@ jobs:
               echo "live=true" >> "$GITHUB_OUTPUT" ;;
           esac
 
+  classify:
+    name: Classify PR tier
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tier3: ${{ steps.classify.outputs.tier3 }}
+      tier_source: ${{ steps.classify.outputs.tier_source }}
+      matched: ${{ steps.classify.outputs.matched }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Classify (tier-3 label OR tier-3 paths touched)
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: bash verify/ci/classify_tier.sh verify/tier3_paths.txt
+
   quick-verify:
     name: Quick Verify (all PRs)
     needs: detect
     if: needs.detect.outputs.live == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -79,12 +125,181 @@ jobs:
 
   deep-verify:
     name: Deep Verify (tier-3 PRs only)
+    # Decoupled from quick-verify on purpose (2026-07-23). The old
+    # `needs: quick-verify` chain meant the placeholder deploy_url skip
+    # silently skipped deep-verify too -- the gate was inert for months.
+    needs: classify
+    if: needs.classify.outputs.tier3 == 'true'
     runs-on: ubuntu-latest
-    if: contains(github.event.pull_request.labels.*.name, 'tier-3')
-    needs: quick-verify
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Require committed local deep-verify report
+      - name: Require committed local deep-verify report pinned to this PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: bash verify/ci/deep_gate.sh
+
+  verify-gate:
+    # LOAD-BEARING NAME -- required status-check context in the main ruleset.
+    name: verify-gate
+    needs: [detect, classify, quick-verify, deep-verify]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DETECT_RESULT: ${{ needs.detect.result }}
+      CLASSIFY_RESULT: ${{ needs.classify.result }}
+      QUICK_RESULT: ${{ needs['quick-verify'].result }}
+      DEEP_RESULT: ${{ needs['deep-verify'].result }}
+      LIVE: ${{ needs.detect.outputs.live }}
+      DEPLOY_URL: ${{ needs.detect.outputs.deploy_url }}
+      TIER3: ${{ needs.classify.outputs.tier3 }}
+      TIER_SOURCE: ${{ needs.classify.outputs.tier_source }}
+      TIER3_MATCHED: ${{ needs.classify.outputs.matched }}
+    steps:
+      - name: Evaluate gate + write audit note
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const AUDIT_ISSUE_TITLE = 'Verify Audit Log (paradigm.verify-audit/v1)';
+            const STICKY_MARKER = '<!-- paradigm-verify-audit -->';
+
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            const e = process.env;
+            const tier3 = e.TIER3 === 'true';
+
+            // ---- verdict -------------------------------------------------
+            const reasons = [];
+            let verdict = 'PASS';
+            const fail = (why) => { verdict = 'FAIL'; reasons.push(`FAIL: ${why}`); };
+
+            if (e.DETECT_RESULT !== 'success')
+              fail(`detect job result=${e.DETECT_RESULT} (must succeed on every PR)`);
+            if (e.CLASSIFY_RESULT !== 'success')
+              fail(`classify job result=${e.CLASSIFY_RESULT} (must succeed on every PR)`);
+
+            let quickReason;
+            if (e.QUICK_RESULT === 'success') {
+              quickReason = `live smoke ran against ${e.DEPLOY_URL} and passed`;
+            } else if (e.QUICK_RESULT === 'skipped' && e.LIVE !== 'true') {
+              quickReason = `deploy_url is a placeholder (${e.DEPLOY_URL}); live smoke not run -- honest skip, not a pass`;
+            } else {
+              quickReason = `quick-verify result=${e.QUICK_RESULT}`;
+              fail(quickReason);
+            }
+
+            let deepReason;
+            if (!tier3 && e.DEEP_RESULT === 'skipped') {
+              deepReason = 'not tier-3 (no tier-3 label, no tier-3 paths touched); deep gate not applicable';
+            } else if (tier3 && e.DEEP_RESULT === 'success') {
+              deepReason = 'committed deep-verify report matched a commit in this PR (verify/ci/deep_gate.sh)';
+            } else {
+              deepReason = `tier3=${tier3} but deep-verify result=${e.DEEP_RESULT}`;
+              fail(tier3
+                ? `tier-3 PR without a satisfied deep gate (deep-verify=${e.DEEP_RESULT}). Run /verify deep locally, commit the report to verify/reports/ with a Verified-Commit line (see verify/REPORT_TEMPLATE.md).`
+                : `deep-verify result=${e.DEEP_RESULT} on a non-tier-3 PR (unexpected)`);
+            }
+            if (verdict === 'PASS') reasons.push('PASS: all applicable verify layers accounted for');
+
+            // ---- structured audit entry ---------------------------------
+            const entry = {
+              schema: 'paradigm.verify-audit/v1',
+              repo: `${owner}/${repo}`,
+              pr_number: pr.number,
+              pr_title: pr.title,
+              head_sha: pr.head.sha,
+              base_ref: pr.base.ref,
+              event_action: context.payload.action,
+              run_id: context.runId,
+              run_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+              tier: tier3 ? 'tier-3' : 'standard',
+              tier_source: e.TIER_SOURCE || 'none',
+              tier3_paths_matched: (e.TIER3_MATCHED || '').split('\n').filter(Boolean),
+              checks: {
+                detect: { result: e.DETECT_RESULT, live: e.LIVE === 'true', deploy_url: e.DEPLOY_URL },
+                quick_verify: { result: e.QUICK_RESULT, reason: quickReason },
+                deep_verify: { result: e.DEEP_RESULT, reason: deepReason },
+              },
+              verdict,
+              reasons,
+              created_at: new Date().toISOString(),
+            };
+            const fenced = '```json\n' + JSON.stringify(entry, null, 2) + '\n```';
+
+            const human = [
+              `### Paradigm Verify -- ${verdict} (${entry.tier})`,
+              '',
+              `| layer | result | why |`,
+              `|---|---|---|`,
+              `| quick smoke | ${e.QUICK_RESULT} | ${quickReason} |`,
+              `| deep gate | ${e.DEEP_RESULT} | ${deepReason} |`,
+              '',
+              `Head \`${pr.head.sha.slice(0, 12)}\` -- [run](${entry.run_url}) -- full history on the pinned issue "${AUDIT_ISSUE_TITLE}".`,
+            ].join('\n');
+
+            // ---- 1. append-only audit issue (DEC-GOV-001 sibling) --------
+            // Audit writes must not flip the gate verdict; log loudly on error.
+            try {
+              const found = await github.paginate(github.rest.issues.listForRepo, {
+                owner, repo, state: 'open', per_page: 100,
+              });
+              let issue = found.find(i => i.title === AUDIT_ISSUE_TITLE && !i.pull_request);
+              if (!issue) {
+                const created = await github.rest.issues.create({
+                  owner, repo,
+                  title: AUDIT_ISSUE_TITLE,
+                  body: [
+                    'Append-only audit log of every Paradigm Verify run on every PR.',
+                    '',
+                    'One comment per verify run. Each comment is a fenced `json` block',
+                    'conforming to schema `paradigm.verify-audit/v1` (the app-repo',
+                    'sibling of the platform pr-audit log, DEC-GOV-001).',
+                    'Do not edit or delete comments.',
+                    '',
+                    'Query: `gh issue view <this issue> --comments`, or filter the',
+                    'fenced JSON with jq.',
+                  ].join('\n'),
+                  labels: ['audit', 'do-not-close'],
+                });
+                issue = created.data;
+                core.info(`Created audit issue #${issue.number}`);
+              }
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: issue.number, body: fenced,
+              });
+              core.info(`Appended verify-audit entry to issue #${issue.number}`);
+            } catch (err) {
+              core.warning(`verify-audit issue append failed: ${err.message}`);
+            }
+
+            // ---- 2. sticky PR comment (latest verdict) -------------------
+            try {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: pr.number, per_page: 100,
+              });
+              const body = `${STICKY_MARKER}\n${human}\n\n<details><summary>audit entry</summary>\n\n${fenced}\n</details>`;
+              const existing = comments.find(c => c.body && c.body.startsWith(STICKY_MARKER));
+              if (existing) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+              } else {
+                await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
+              }
+            } catch (err) {
+              core.warning(`verify-audit PR comment failed: ${err.message}`);
+            }
+
+            // ---- 3. job summary -----------------------------------------
+            await core.summary
+              .addHeading(`Paradigm Verify -- ${verdict}`, 3)
+              .addRaw(human).addEOL()
+              .addCodeBlock(JSON.stringify(entry, null, 2), 'json')
+              .write();
+
+            // ---- gate ----------------------------------------------------
+            if (verdict === 'FAIL') {
+              core.setFailed(reasons.filter(r => r.startsWith('FAIL')).join(' | '));
+            }
