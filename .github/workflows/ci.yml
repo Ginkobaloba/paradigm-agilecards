@@ -83,9 +83,9 @@ jobs:
   board-backend:
     name: board backend battery (build + tests)
     runs-on: ubuntu-latest
-    # Legacy Express/TS backend, frozen reference for the K11 FastAPI rewrite.
-    # Still the currently-live board backend, so its coverage stays on until
-    # K11 replaces it. Repathed under legacy/ by chunk K2.
+    # Legacy Express/TS backend -- still the LIVE board. Active until the
+    # FastAPI backend cutover (P1); relabeled 2026-07-16. Its tests gate for
+    # real (audit S1: continue-on-error made 96 tests decorative).
     defaults:
       run:
         working-directory: legacy/board-express/backend
@@ -105,17 +105,38 @@ jobs:
         run: npm run build --if-present
 
       - name: Tests
-        continue-on-error: true
         run: npm test --if-present
 
   backend-fastapi:
     name: backend (fastapi scaffold)
     runs-on: ubuntu-latest
-    # New Python/FastAPI backend (chunk K2 scaffold). Not yet a required
-    # context; promote it in branch protection once K11 lands the real API.
+    # The real FastAPI backend (ADR-2026-07-16): Postgres persistence with
+    # DB-enforced RLS. This suite INCLUDES the RLS/org-isolation security
+    # tests, run against a live Postgres service container at the same
+    # privilege level as production (agilecards_app role). It MUST be
+    # promoted to a required status check in branch protection -- a security
+    # suite that can fail without blocking merges is the audit's S1 failure
+    # mode. (Job `name:` is a protection context once promoted; do not
+    # rename.)
     defaults:
       run:
         working-directory: backend
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          # Throwaway CI-only credential; the suite creates and drops a
+          # uniquely-named database per session (tests/conftest.py).
+          POSTGRES_PASSWORD: ci_admin_pw
+        ports:
+          - 5432:5432
+        # The runner only proceeds once Postgres accepts connections;
+        # without this the suite races the database boot.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -132,7 +153,35 @@ jobs:
         run: ruff check .
 
       - name: Tests (pytest)
+        env:
+          # Admin DSN for the Postgres service container above. conftest.py
+          # fails loudly (never skips) when it cannot reach this -- silent
+          # green on the security suite is exactly what S1 forbids.
+          AGILECARDS_TEST_ADMIN_DSN: postgresql+psycopg://postgres:ci_admin_pw@localhost:5432/postgres
         run: pytest -q
+
+      # Audit T17 (pyproject.toml [tool.mypy]): the auth-critical package is
+      # gated, not informational -- no continue-on-error.
+      - name: Type-check (mypy)
+        run: mypy
+
+  # Compliance seam #6 (2026-07-16 audit T1): a CycloneDX SBOM for the whole
+  # repo on every PR/push, attached as a workflow artifact. Generation only --
+  # no policy gate, no vulnerability scanning here; downstream consumers make
+  # those calls. anchore/sbom-action wraps syft and uploads the artifact.
+  sbom:
+    name: sbom (CycloneDX)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate SBOM (syft -> CycloneDX JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          artifact-name: paradigm-agilecards.cyclonedx.json
+          upload-artifact: true
 
   contracts:
     name: contracts (@paradigm/* consumer contract tests)

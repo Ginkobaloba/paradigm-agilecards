@@ -14,7 +14,7 @@ for dependency injection so tests can supply a mock JWK client (no network).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import jwt
 from jwt import PyJWKClient
@@ -46,7 +46,7 @@ class TokenError(Exception):
 class SigningKey(Protocol):
     """The shape ``jwt.decode`` needs: an object exposing the verifying key."""
 
-    key: object
+    key: Any
 
 
 class JWKClient(Protocol):

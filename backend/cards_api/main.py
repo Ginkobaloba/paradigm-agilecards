@@ -15,6 +15,7 @@ level. Validation errors surface as 400 ``{"error": ...}`` for the same reason.
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -62,7 +63,7 @@ def create_app(
     settings = settings or load_settings()
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
         if app.state.db is not None:
             app.state.db.dispose()

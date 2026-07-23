@@ -174,7 +174,9 @@ def _forge_hs256(payload: dict, *, secret: str, kid: str) -> str:
     on the algorithm alone.
     """
     header = {"alg": "HS256", "typ": "JWT", "kid": kid}
-    signing_input = f"{_b64url(json.dumps(header).encode())}.{_b64url(json.dumps(payload).encode())}"
+    header_b64 = _b64url(json.dumps(header).encode())
+    payload_b64 = _b64url(json.dumps(payload).encode())
+    signing_input = f"{header_b64}.{payload_b64}"
     sig = hmac.new(secret.encode(), signing_input.encode(), hashlib.sha256).digest()
     return f"{signing_input}.{_b64url(sig)}"
 

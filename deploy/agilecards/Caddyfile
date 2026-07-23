@@ -1,0 +1,80 @@
+# Caddy config for the AgileCards web container (frontend/Dockerfile bakes
+# this in at /etc/caddy/Caddyfile).
+#
+# Two TLS postures (docs/security/DATA_PROTECTION.md, seam #3):
+#
+#   1. DEFAULT (this :80 site): the container sits behind the Cloudflare edge
+#      via a cloudflared tunnel (docs/board/cloudflared-tunnel.md). Cloudflare
+#      terminates public TLS; the tunnel connector makes an outbound mTLS
+#      connection to the edge, so nothing here listens on the public internet.
+#   2. DIRECT HOSTING: uncomment the cards.paradigm.codes block below, publish
+#      443, and Caddy terminates TLS itself with automatic ACME certificates.
+#
+# Both postures serve the same routing: static SPA + same-origin proxy of the
+# API paths to the backend service, so the frontend never needs CORS.
+
+:80 {
+	# Applied to every response, static and proxied alike.
+	header {
+		# Browsers must not MIME-sniff their way around content types.
+		X-Content-Type-Options nosniff
+		# Send the origin only (never path/query) on cross-origin navigation;
+		# the SSE token rides in a query param, so tight referrer policy is
+		# part of that exception's mitigation set.
+		Referrer-Policy strict-origin-when-cross-origin
+		# Board UI never needs to be framed.
+		X-Frame-Options DENY
+		-Server
+	}
+
+	# Backend surface: API, SSE live channel, and the unauthenticated probes
+	# (deploy gates hit /healthz + /readyz through the same front door users do).
+	@backend path /api/* /events /healthz /readyz
+	handle @backend {
+		# flush_interval -1 disables response buffering -- required for the
+		# /events SSE stream to deliver frames as they are produced.
+		reverse_proxy api:8000 {
+			flush_interval -1
+		}
+	}
+
+	# Everything else is the built SPA. try_files sends unknown paths to
+	# index.html so React Router owns client-side routes on hard refresh.
+	handle {
+		root * /srv
+		encode gzip
+		try_files {path} /index.html
+		file_server
+	}
+}
+
+# ---------------------------------------------------------------------------
+# DIRECT HOSTING (no Cloudflare in front): uncomment, publish 443:443 and
+# 80:80 on the web service, and point DNS at this host. Caddy provisions and
+# renews the certificate automatically (ACME/Let's Encrypt).
+#
+# cards.paradigm.codes {
+# 	header {
+# 		# 6 months, subdomain-wide. Only enable once HTTPS is known-stable:
+# 		# HSTS is a one-way door for browsers that have seen it.
+# 		Strict-Transport-Security "max-age=15552000; includeSubDomains"
+# 		X-Content-Type-Options nosniff
+# 		Referrer-Policy strict-origin-when-cross-origin
+# 		X-Frame-Options DENY
+# 		-Server
+# 	}
+#
+# 	@backend path /api/* /events /healthz /readyz
+# 	handle @backend {
+# 		reverse_proxy api:8000 {
+# 			flush_interval -1
+# 		}
+# 	}
+#
+# 	handle {
+# 		root * /srv
+# 		encode gzip
+# 		try_files {path} /index.html
+# 		file_server
+# 	}
+# }

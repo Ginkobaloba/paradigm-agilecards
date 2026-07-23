@@ -1,0 +1,5 @@
+# The initdb script executes inside the postgres (Linux) container; a CRLF
+# checkout on a Windows host would break it with "bad interpreter". Pin LF
+# regardless of core.autocrlf.
+*.sh text eol=lf
+Caddyfile text eol=lf

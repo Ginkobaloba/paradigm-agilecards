@@ -70,6 +70,15 @@ outputs/
 # in-repo DB does not get committed).
 apps/board/backend/data/
 
+# Dev-only JWKS keypair for the compose dev profile. mint_dev_token.py
+# writes an RSA private key here; it must never be committed even though it
+# is a dev credential -- the whole directory stays out except the .gitkeep
+# that preserves it for the dev-idp volume mount.
+# (contents/*, not the dir itself: git will not descend into a fully ignored
+# directory, which would make the .gitkeep negation dead.)
+deploy/agilecards/dev-keys/*
+!deploy/agilecards/dev-keys/.gitkeep
+
 ##########################
 # Probe / Claude / Python build artifacts (added 2026-05-29 per retro auto-actionable batch)
 ##########################

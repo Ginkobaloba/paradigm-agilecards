@@ -25,6 +25,7 @@ dev = [
   "pytest>=8",
   "httpx>=0.27",
   "ruff>=0.5",
+  "mypy>=1.10",
 ]
 # AC-CARDS-008: secrets from Infisical at boot. Kept out of the base deps so CI
 # and local dev (which use env-var fallback) don't require it; the production
@@ -39,10 +40,16 @@ tools = [
 ]
 
 [tool.setuptools]
-packages = ["cards_api"]
 # app.py remains as a thin entrypoint shim (uvicorn app:app) re-exporting the
 # package's FastAPI instance.
 py-modules = ["app"]
+
+# find, not an explicit list: setuptools takes `packages = ["cards_api"]`
+# literally and silently DROPS subpackages (cards_api.routers) from
+# non-editable installs -- editable dev installs mask it, the production
+# image does not.
+[tool.setuptools.packages.find]
+include = ["cards_api*"]
 
 [tool.ruff]
 line-length = 100
@@ -58,3 +65,24 @@ ignore = ["B008"]
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+
+# Audit T17: the auth-critical package was the least type-checked code in the
+# repo. Gated in CI (no continue-on-error). Scope is the package, not tests.
+[tool.mypy]
+files = ["cards_api", "app.py"]
+python_version = "3.11"
+warn_unused_ignores = true
+warn_redundant_casts = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+# Alembic migration files use runtime-generated op bindings.
+module = "migrations.*"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+# Optional prod-only dependency; ships no stubs. The import is guarded.
+module = "infisical_client"
+ignore_missing_imports = true

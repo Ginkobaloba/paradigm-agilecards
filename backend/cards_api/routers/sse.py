@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
@@ -40,7 +41,7 @@ async def events(
     claims: ParadigmClaims = Depends(require_claims_header_or_query),
     bus: EventBus = Depends(get_bus),
 ) -> StreamingResponse:
-    async def stream():
+    async def stream() -> AsyncIterator[str]:
         token, queue = bus.subscribe(claims.org_id)
         try:
             yield _frame({"type": "heartbeat"})

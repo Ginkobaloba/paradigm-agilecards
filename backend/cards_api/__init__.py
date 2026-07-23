@@ -10,7 +10,7 @@ from __future__ import annotations
 __all__ = ["app"]
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> object:
     # Lazy so importing a single submodule (e.g. cards_api.auth in a unit test)
     # doesn't pull in the whole FastAPI app graph.
     if name == "app":

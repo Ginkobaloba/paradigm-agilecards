@@ -1,0 +1,121 @@
+# Paradigm AgileCards -- the NEW stack (FastAPI + Postgres RLS + Vite/Caddy).
+#
+# This replaces legacy/board-express/docker-compose.yml for the rewritten
+# backend (ADR-2026-07-16). Cutover from the legacy stack requires Drew's
+# explicit go-ahead; running this compose does NOT move traffic by itself.
+#
+# Usage (from this directory; see README.md for the full runbook):
+#   cp .env.example .env         # fill in real values, .env is gitignored
+#   docker compose up -d --build
+#   docker compose --profile dev up -d --build     # adds the dev JWKS server
+#
+# Startup ordering is encoded in depends_on: postgres becomes healthy ->
+# migrate runs `alembic upgrade head` to completion -> api starts. The api
+# never races an unmigrated schema.
+
+name: agilecards
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env -- superuser/owner password}
+      POSTGRES_DB: agilecards
+      # Read by initdb/01-app-role.sh (first boot of an empty data volume):
+      # creates the LOGIN role the API connects as. Migration 0001 only
+      # guarantees the role exists NOLOGIN; the login credential is deploy
+      # configuration, never migration content.
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?set in .env -- agilecards_app role password}
+    volumes:
+      # Named volume = survives `docker compose down`; destroyed only by
+      # `down -v`. Encryption at rest is a HOST property (LUKS/BitLocker on
+      # the volume backing store) -- see docs/security/DATA_PROTECTION.md.
+      - pgdata:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    # No host port published on purpose: only compose-internal services reach
+    # the database. For ad-hoc inspection: docker compose exec postgres psql
+    # -U postgres agilecards (or temporarily publish 5442:5432 in an override).
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d agilecards"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # One-shot: applies Alembic migrations with the OWNER credential, the only
+  # role allowed DDL (RLS policies, triggers, grants live in migrations).
+  # Same image as the api service -- the schema that migrated is byte-for-byte
+  # the schema the serving code was built against.
+  migrate:
+    image: agilecards-api:local
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      PARADIGM_DATABASE_MIGRATE_URL: postgresql+psycopg://postgres:${POSTGRES_PASSWORD}@postgres:5432/agilecards
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build:
+      context: ../../backend
+    image: agilecards-api:local
+    restart: unless-stopped
+    environment:
+      # Runtime DSN: the agilecards_app role (NOSUPERUSER, NOBYPASSRLS).
+      # Pointing this at an owner/superuser DSN would silently disable
+      # row-level security -- never do it (see backend/cards_api/db.py).
+      PARADIGM_DATABASE_URL: postgresql+psycopg://agilecards_app:${POSTGRES_APP_PASSWORD}@postgres:5432/agilecards
+      # JWT verification config. Defaults target the production Paradigm IdP;
+      # the dev profile overrides PARADIGM_JWKS_URL to the dev-idp service.
+      PARADIGM_JWT_ISSUER: ${PARADIGM_JWT_ISSUER:-https://auth.paradigm.codes}
+      PARADIGM_JWT_AUDIENCE: ${PARADIGM_JWT_AUDIENCE:-paradigm-agilecards}
+      PARADIGM_JWKS_URL: ${PARADIGM_JWKS_URL:-}
+      # env (default) reads the vars above; "infisical" fetches secrets at
+      # boot via a machine identity (INFISICAL_* vars, backend/.env.example).
+      PARADIGM_SECRETS_PROVIDER: ${PARADIGM_SECRETS_PROVIDER:-env}
+      # Same-origin deploys (Caddy proxies /api) need no CORS entries.
+      PARADIGM_CORS_ORIGINS: ${PARADIGM_CORS_ORIGINS:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  web:
+    build:
+      # Repo root: the image needs frontend/ AND deploy/agilecards/Caddyfile.
+      context: ../..
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_BASE_PATH: ${VITE_BASE_PATH:-/}
+    image: agilecards-web:local
+    restart: unless-stopped
+    ports:
+      # Host-facing HTTP. Behind cloudflared this stays loopback-ish; for
+      # direct hosting switch the Caddyfile to the HTTPS block and publish
+      # 443. WEB_PORT lets parallel stacks avoid collisions.
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # ------------------------------------------------------------------ dev ---
+  # DEV ONLY (--profile dev): a static JWKS endpoint so the full stack runs
+  # without the production IdP. backend/scripts/mint_dev_token.py writes the
+  # keypair + jwks.json into ./dev-keys (gitignored) and mints matching RS256
+  # tokens. To use it, set in .env:
+  #   PARADIGM_JWKS_URL=http://dev-idp/.well-known/jwks.json
+  # Issuer/audience stay at their defaults -- the dev tokens carry them.
+  # NEVER enable this profile, or that JWKS override, on a production host.
+  dev-idp:
+    image: caddy:2-alpine
+    profiles: ["dev"]
+    restart: unless-stopped
+    command: ["caddy", "file-server", "--root", "/srv", "--listen", ":80"]
+    volumes:
+      # dev-keys/jwks.json (public keys only) served at /.well-known/jwks.json.
+      - ./dev-keys:/srv/.well-known:ro
+
+volumes:
+  pgdata:

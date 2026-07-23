@@ -1,0 +1,17 @@
+# Keep the image build context to exactly what the Dockerfile copies.
+# The venv alone is hundreds of MB the daemon would otherwise upload.
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+tests/
+contracts/
+scripts/
+.env
+.env.*
+README.md
+Dockerfile
+.dockerignore

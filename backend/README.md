@@ -1,10 +1,10 @@
 # paradigm-agilecards backend (FastAPI)
 
 Python/FastAPI backend for Paradigm AgileCards. Locked to Python per the
-integration roadmap (Q2). Chunk **K11** lands the auth core
-(AC-CARDS-003/006/007/008): direct JWKS JWT verification, a bearer guard on
-every authed endpoint, org-scoped isolation + role authorization, and
-Infisical-sourced secrets at boot.
+integration roadmap (Q2). Chunk **K11** landed the auth core
+(AC-CARDS-003/006/007/008); ADR-2026-07-16 lands the rest for real: Postgres
+persistence with **database-enforced row-level security**, full board CRUD at
+legacy wire parity, an append-only audit trail, and the SSE live channel.
 
 ## Layout
 
@@ -13,11 +13,17 @@ backend/
   app.py                 entrypoint shim (uvicorn app:app) re-exporting the package
   cards_api/
     auth.py              TokenVerifier -- RS256 JWKS verification (AC-CARDS-003)
-    deps.py              require_claims / require_roles guards (AC-CARDS-006/007)
-    store.py             org-scoped in-memory card store (AC-CARDS-007)
+    deps.py              require_claims / require_roles guards + RLS-bound sessions
+    db.py                engine/sessions; binds the verified org_id to the RLS GUC
     config.py            boot-time settings + Infisical secret loading (AC-CARDS-008)
-    main.py              FastAPI app factory + routes
-  tests/                 offline auth/isolation/config suite (no network)
+    main.py              FastAPI app factory
+    routers/             cards, columns, ranks, sprints, retros, views, stories,
+                         triage, rates, SSE, audit admin, health probes
+  migrations/            Alembic; 0001 creates schema + roles + RLS policies
+  scripts/
+    mint_dev_token.py    DEV-ONLY RS256 token mint for the compose dev profile
+  tests/                 auth suite (offline) + RLS/org-isolation suite (real Postgres)
+  Dockerfile             production image (api + one-shot migrate roles)
   .env.example           placeholder config (no real secrets)
   pyproject.toml         deps + dev/infisical extras
 ```
@@ -42,19 +48,14 @@ The copy-paste seed is `paradigm-platform/docs/runbooks/python-jwt-verification.
 
 ## Endpoints
 
-| Method | Path               | Auth                | Notes                          |
-|--------|--------------------|---------------------|--------------------------------|
-| GET    | `/healthz`         | public              | liveness probe                 |
-| GET    | `/api/me`          | bearer              | echoes `{sub, org_id, roles}`  |
-| GET    | `/api/cards`       | bearer              | caller-org cards only          |
-| GET    | `/api/cards/{id}`  | bearer              | 404 for other orgs' cards      |
-| POST   | `/api/cards`       | bearer + `admin`    | org_id taken from the token    |
+Full legacy-parity surface: `/api/cards` CRUD + frontmatter/move/rank/events,
+`/api/columns`, `/api/ranks`, `/api/views`, `/api/sprints`, `/api/retros`,
+`/api/stories` + triage, `/api/rates`, `/events` (SSE), `/api/audit` (admin),
+plus unauthenticated `/healthz` (liveness) and `/readyz` (DB connectivity).
+Everything under `/api` and `/events` requires a Paradigm bearer token; wire
+shapes match the legacy Express contract (see `cards_api/routers/`).
 
-The card surface is intentionally narrow -- enough to prove the auth and
-isolation contract. The full card CRUD rewrite of the legacy Express backend
-(`../legacy/board-express/backend`) is a later chunk.
-
-## Run
+## Run locally
 
 ```powershell
 cd C:\dev\paradigm-agilecards\backend
@@ -62,9 +63,36 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e .[dev]          # add .[infisical] in production images
 
+# 1. Disposable dev Postgres (host port 5440; also what pytest expects).
+docker run -d --name agilecards-pg-dev -e POSTGRES_PASSWORD=devpassword `
+    -e POSTGRES_DB=agilecards -p 5440:5432 postgres:16-alpine
+
+# 2. Lint + tests. The suite creates a uniquely-named database per session,
+#    migrates it, and connects as the agilecards_app role, so RLS is proven
+#    for real. It FAILS (never skips) if Postgres is unreachable.
+#    Non-default Postgres? Set AGILECARDS_TEST_ADMIN_DSN to an admin DSN.
 ruff check .
 pytest -q
 
-# dev server (env-var config; defaults point at the Paradigm IdP)
-uvicorn app:app --reload       # http://127.0.0.1:8000/healthz
+# 3. Migrate the dev database (owner DSN -- migrations manage roles/RLS/DDL)
+#    and give the runtime role a login password (dev-only value):
+$env:PARADIGM_DATABASE_MIGRATE_URL = "postgresql+psycopg://postgres:devpassword@localhost:5440/agilecards"
+alembic upgrade head
+docker exec agilecards-pg-dev psql -U postgres -d agilecards `
+    -c "ALTER ROLE agilecards_app LOGIN PASSWORD 'devapppassword'"
+
+# 4. Serve. The app connects as agilecards_app -- NEVER point
+#    PARADIGM_DATABASE_URL at an owner/superuser DSN (it bypasses RLS).
+$env:PARADIGM_DATABASE_URL = "postgresql+psycopg://agilecards_app:devapppassword@localhost:5440/agilecards"
+uvicorn app:app --reload       # http://127.0.0.1:8000/healthz , /readyz
 ```
+
+Tokens for local calls: `python scripts/mint_dev_token.py --roles admin`
+(DEV-ONLY -- the server accepts these only when `PARADIGM_JWKS_URL` points at
+the matching dev JWKS; see the script docstring).
+
+## Deploy
+
+The production-shaped compose stack (Postgres + one-shot migrate + api + Caddy
+web, with a dev-profile JWKS server) lives in `../deploy/agilecards/` -- see
+its README for the runbook, TLS postures, and rollback notes.

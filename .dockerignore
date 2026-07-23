@@ -1,0 +1,23 @@
+# Context filter for builds that use the REPO ROOT as context (currently only
+# frontend/Dockerfile, which needs frontend/ + deploy/agilecards/Caddyfile).
+# Everything heavy or secret stays out of the daemon upload. backend/ builds
+# use backend/ as context and are governed by backend/.dockerignore instead.
+.git/
+.github/
+.claude/
+node_modules/
+**/node_modules/
+**/dist/
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/.ruff_cache/
+**/*.egg-info/
+legacy/
+engine/
+docs/
+outputs/
+.env
+.env.*
+# Dev-only JWKS keypair must never end up inside an image.
+deploy/agilecards/dev-keys/
