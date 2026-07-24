@@ -16,11 +16,29 @@ shared infrastructure. The skill is the engine; this directory is the spec.
 verify/
   smoke.yml              -- fast surface checks run on every PR
   tier_map.yml           -- surface risk classification (Tier 1-3)
+  tier3_paths.txt        -- machine-readable tier-3 path regexes (classify job)
+  REPORT_TEMPLATE.md     -- seed for committed deep-verify reports
+  reports/               -- committed deep-verify evidence (tier-3 gate input)
+  ci/
+    quick_smoke.sh       -- live smoke runner (quick-verify job)
+    classify_tier.sh     -- tier-3 classification (label OR tier3_paths.txt)
+    deep_gate.sh         -- tier-3 gate: PASS report pinned to a PR commit
+    apply_branch_protection.ps1 -- converge the main ruleset (ADR-2026-07-23)
   assertions/
     <surface>.yml        -- full assertion set per surface (deep verify)
     README.md            -- explains the assertions/ convention
   README.md              -- this file
 ```
+
+## CI shape (ADR-2026-07-23)
+
+`verify-gate` is the single required status check from this suite. It always
+reports, aggregating detect/classify/quick/deep results, and writes a
+persistent audit note per run (pinned issue "Verify Audit Log
+(paradigm.verify-audit/v1)" + sticky PR comment). quick-verify skips honestly
+while `smoke.yml` `deploy_url` is a placeholder; deep-verify fires on tier-3
+PRs (path-based via `tier3_paths.txt`, or the `tier-3` label) and demands a
+committed report whose `Verified-Commit` is a commit of the PR.
 
 ## How to run
 

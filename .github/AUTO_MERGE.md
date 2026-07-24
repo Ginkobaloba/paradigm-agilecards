@@ -47,6 +47,10 @@ can `hold PR #N` or `revert PR #N`.
 
 ## Tier-3 sensitivity list (this repo)
 
+> Machine-readable mirror: `verify/tier3_paths.txt` (consumed by the verify
+> workflow's `classify` job since 2026-07-23 -- CI now enforces this list;
+> keep the two in sync). The `tier-3` PR label promotes; it cannot demote.
+
 A PR touching any of these auto-promotes to Tier 3 (multi-Opus, Drew on
 dissent):
 
