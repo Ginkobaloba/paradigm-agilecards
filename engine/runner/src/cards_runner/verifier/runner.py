@@ -379,9 +379,19 @@ def _overall_status(
     items: tuple[ItemResult, ...], batch: SubjectiveBatchResult
 ) -> str:
     if not items:
-        # No AC items -> nothing to verify. Treat as pass (the daemon
-        # may still gate on `requires_pre_approval` etc., separately).
-        return VERDICT_PASS
+        # No AC items -> nothing was machine-checked. Fail closed.
+        #
+        # This used to return PASS ("nothing to verify"), which meant a card
+        # whose acceptance-criteria block was missing, empty, or failed to
+        # parse (e.g. malformed ```yaml fences -> zero parsed items) sailed
+        # straight through the merge gate on an `auto` decision. That is the
+        # exact inversion of the build-quality-in ("jidoka") contract the
+        # gate exists to enforce: "the detector found nothing to check" is
+        # not "the work is correct". A card that verifies nothing must not
+        # merge. This is consistent with `_overall_status`'s sibling path in
+        # `verify_card`, where an unknown AC `type:` already routes to FAIL:
+        # a malformed criterion and an absent one now fail the same way.
+        return VERDICT_FAIL
     if batch.standup_items:
         return VERDICT_STANDUP
     if any(not it.handler_result.passed for it in items):

@@ -99,7 +99,12 @@ from .sibling_reviewer import (
 )
 from .spawner import spawn_worker
 from .unblocker import UnblockDecision, unblock_merged_cards
-from .worktree import WorktreeCreateError, prepare_worktree, prune_git_worktrees
+from .worktree import (
+    WorktreeCreateError,
+    attempt_branch_name,
+    prepare_worktree,
+    prune_git_worktrees,
+)
 
 
 # How many times the daemon re-runs the verifier on a `VerifierError`
@@ -689,7 +694,10 @@ class Daemon:
             return False
 
         project = record.project
-        branch = record.field_value("branch") or f"card/{claim.card_id}"
+        base_branch_name = str(
+            record.field_value("branch") or f"card/{claim.card_id}"
+        )
+        branch = attempt_branch_name(base_branch_name, claim.attempt_trace_id)
         base = record.field_value("base_branch") or "main"
         try:
             prepare_worktree(
