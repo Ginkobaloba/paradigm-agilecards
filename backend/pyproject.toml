@@ -19,7 +19,11 @@ dependencies = [
 dev = [
   "pytest>=8",
   "httpx>=0.27",
-  "ruff>=0.5",
+  # Pinned exact: ruff 0.16.0 (2026-07-23) enabled isort/I001 by default, which
+  # this repo never selected, reddening previously-clean imports on unchanged
+  # code. Pin to last known-good for deterministic CI; bump deliberately in its
+  # own PR. Same pin lives in engine/runner/pyproject.toml and contracts/requirements.txt.
+  "ruff==0.15.22",
 ]
 # AC-CARDS-008: secrets from Infisical at boot. Kept out of the base deps so CI
 # and local dev (which use env-var fallback) don't require it; the production
