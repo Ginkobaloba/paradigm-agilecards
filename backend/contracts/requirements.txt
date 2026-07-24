@@ -7,4 +7,6 @@
 pyjwt>=2.8
 cryptography>=42
 pytest>=8
-ruff>=0.5
+# Pinned exact: ruff 0.16.0 (2026-07-23) enabled isort/I001 by default; pin to
+# last known-good for deterministic CI. Matches engine/runner + backend pyproject.
+ruff==0.15.22
