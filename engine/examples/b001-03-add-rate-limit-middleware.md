@@ -91,19 +91,19 @@ pass/fail, and the card moves to `done/` only if every check passes.
 ```yaml
 acceptance_criteria:
   - description: "Lint passes"
-    type: command
+    type: shell
     command: "make lint"
   - description: "Under-limit requests pass through unchanged"
-    type: command
+    type: shell
     command: "pytest tests/api/middleware/test_rate_limit.py::test_under_limit -q"
   - description: "At-limit boundary correct (Nth ok, N+1th 429)"
-    type: command
+    type: shell
     command: "pytest tests/api/middleware/test_rate_limit.py::test_at_limit_boundary -q"
   - description: "429 carries a valid Retry-After header"
-    type: command
+    type: shell
     command: "pytest tests/api/middleware/test_rate_limit.py::test_retry_after_header -q"
   - description: "Per-key isolation"
-    type: command
+    type: shell
     command: "pytest tests/api/middleware/test_rate_limit.py::test_per_key_isolation -q"
   - description: "Middleware file created"
     type: file_exists
@@ -113,9 +113,8 @@ acceptance_criteria:
     path: "src/api/app.py"
     pattern: "rate_limit"
   - description: "Full api test suite passes"
-    type: command
+    type: shell
     command: "make test-api"
-    timeout_sec: 300
 ```
 
 ## Pointers

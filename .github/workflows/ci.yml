@@ -5,10 +5,18 @@ name: CI
 # gating check. It runs on windows-latest to match the development host
 # (the runner suite is developed and verified on Windows).
 #
-# Job NAMES below are load-bearing: three of them are required status-check
+# Job NAMES below are load-bearing: FOUR of them are required status-check
 # contexts in main's branch protection. Do not rename them without updating
 # the protection rule too, or PRs will hang waiting for a context that never
 # reports.
+#
+# Required contexts (as of 2026-07-16):
+#   - engine runner battery (lint + tests)
+#   - board frontend battery (lint + vitest)
+#   - board backend battery (build + tests)
+#   - backend (fastapi scaffold)        <- promoted 2026-07-16 (audit S1)
+#
+# Not required (deliberate): "contracts" stays informational until it bakes.
 on:
   pull_request:
     branches: [main]
@@ -104,15 +112,31 @@ jobs:
       - name: Build (tsc)
         run: npm run build --if-present
 
+      # Gating, not informational. This is the currently-live board backend
+      # (96 tests: routes, DB, path-traversal guards). It ran with
+      # continue-on-error until 2026-07-16, which meant this required context
+      # reported green even when these tests failed -- only `tsc` actually
+      # gated. The 2026-07-16 alpha audit (S1) called that the single
+      # highest-ROI fix in the repo: "CI green" did not mean "the board's
+      # tests passed". The suite passes on main; it now has to.
       - name: Tests
-        continue-on-error: true
         run: npm test --if-present
 
   backend-fastapi:
     name: backend (fastapi scaffold)
     runs-on: ubuntu-latest
-    # New Python/FastAPI backend (chunk K2 scaffold). Not yet a required
-    # context; promote it in branch protection once K11 lands the real API.
+    # New Python/FastAPI backend. REQUIRED status context as of 2026-07-16.
+    #
+    # This suite is the security-critical one: JWKS/RS256 verification,
+    # HS256-confusion rejection, iss/aud/exp/nbf, org isolation, RBAC, and
+    # secret loading. It ran as a non-required context until 2026-07-16,
+    # which meant a PR breaking token verification or cross-org isolation
+    # could merge green. The 2026-07-16 alpha audit (S1) flagged it; the
+    # tests already passed, only the gate was missing.
+    #
+    # Job NAME is load-bearing (it is the protection context). Do not rename
+    # without updating main's branch protection, or PRs will hang forever
+    # waiting on a context that never reports.
     defaults:
       run:
         working-directory: backend

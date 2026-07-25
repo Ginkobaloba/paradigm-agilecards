@@ -112,14 +112,21 @@ def test_failing_deterministic_yields_overall_fail(tmp_path: Path) -> None:
     assert result.items[0].handler_result.passed is False
 
 
-def test_no_ac_items_is_pass(tmp_path: Path) -> None:
-    # Card body with no acceptance_criteria block -> verifier passes.
+def test_no_ac_items_fails_closed(tmp_path: Path) -> None:
+    # Card body with no acceptance_criteria block -> nothing is
+    # machine-checked, so the verifier must FAIL closed, not pass. A card
+    # that verifies nothing cannot be allowed through the merge gate; "the
+    # detector found nothing" is not "the work is correct".
+    #
+    # (Regression: this returned VERDICT_PASS until 2026-07-17, so a card
+    # whose AC block was missing or failed to parse merged on an `auto`
+    # decision -- found by the first real end-to-end rehearsal.)
     result = verify_card(
         card_id="bTST-90-empty",
         card_body="## Context\n\nplain card.",
         worktree=tmp_path,
     )
-    assert result.overall_status == VERDICT_PASS
+    assert result.overall_status == VERDICT_FAIL
 
 
 def test_schema_error_routes_to_fail(tmp_path: Path) -> None:

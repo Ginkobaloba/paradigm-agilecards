@@ -41,6 +41,30 @@ class WorktreeCreateError(Exception):
     """Raised when worktree creation or verification fails."""
 
 
+def attempt_branch_name(base_branch: str, attempt_trace_id: str) -> str:
+    """A per-attempt working branch name.
+
+    A card's working branch cannot be a fixed name. After a verify-fail
+    bounce the card returns to `backlog` and is re-claimed, but the prior
+    attempt's worktree is kept for the forensic run-dir TTL (default 24h)
+    and still pins the fixed branch. A fixed name therefore collides on the
+    next `git worktree add` ("branch already used by worktree") and the card
+    livelocks at poll cadence -- the claim-fail-bounce-retry loop the runner
+    is built around cannot actually retry.
+
+    Suffixing the attempt id makes each claim's branch unique, so a retry
+    proceeds instead of colliding, and each attempt's worktree and PR are
+    independently traceable. `base_branch` is used only as a prefix and is
+    never created as a bare ref, so no `card/<id>` vs `card/<id>/<attempt>`
+    directory/file ref conflict can arise.
+
+    Callers that create OR reference the branch for a given attempt (worktree
+    prep, and the merge gate's push + PR) must derive it here, so the name is
+    identical across the attempt's whole lifecycle.
+    """
+    return f"{base_branch}/{attempt_trace_id[:12]}"
+
+
 def prepare_worktree(
     *,
     paths: RuntimePaths,
@@ -101,7 +125,39 @@ def prepare_worktree(
     if skip_git:
         return
 
-    _verify_worktree(project_dir, worktree_path)
+    # Verification runs outside the mutex, but it must not be able to leave
+    # a half-created worktree behind. `git worktree add` has already
+    # succeeded and registered the worktree (and pinned `branch_name` to
+    # it). If verification then raises, the caller rolls the card back to
+    # `backlog` and the next poll re-claims it -- at which point
+    # `git worktree add` fails with "branch already used by worktree" and
+    # the card livelocks at poll cadence, forever, never reaching the
+    # executor or the verifier.
+    #
+    # So `prepare_worktree` is atomic: either it returns with a verified
+    # worktree, or it raises having removed the one it created.
+    try:
+        _verify_worktree(project_dir, worktree_path)
+    except WorktreeCreateError:
+        log.warning(
+            "worktree verification failed for %s; removing the worktree this "
+            "call created so the branch is not left pinned to it",
+            worktree_path,
+        )
+        try:
+            teardown_worktree(
+                paths=paths,
+                project_dir=project_dir,
+                worktree_path=worktree_path,
+                skip_git=False,
+            )
+        except Exception:  # noqa: BLE001 - teardown is best-effort
+            log.exception(
+                "worktree teardown after failed verification also failed for "
+                "%s; `git worktree prune` may be required",
+                worktree_path,
+            )
+        raise
 
 
 def prune_git_worktrees(
@@ -191,6 +247,32 @@ def _ensure_branch(project_dir: Path, branch_name: str, base_branch: str) -> Non
     )
 
 
+def _registered_worktrees(project_dir: Path) -> list[Path]:
+    """Return the worktree paths git currently has registered for a repo.
+
+    Parses `git worktree list --porcelain`, whose contract is one
+    `worktree <path>` line per entry. We use the porcelain form on
+    purpose: the human-readable form aligns columns and truncates, and
+    is explicitly not a stable interface.
+
+    Paths are resolved so callers can compare them to a `Path` without
+    caring about separators, case, or relative segments.
+    """
+    listing = _run_powershell_git(project_dir, ["worktree", "list", "--porcelain"])
+    found: list[Path] = []
+    for line in listing.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        raw = line[len("worktree "):].strip()
+        if not raw:
+            continue
+        try:
+            found.append(Path(raw).resolve())
+        except (OSError, ValueError):  # pragma: no cover - defensive
+            log.debug("unparseable worktree path from git: %r", raw)
+    return found
+
+
 def _verify_worktree(project_dir: Path, worktree_path: Path) -> None:
     """Run the four post-create checks. Raises `WorktreeCreateError` on miss."""
     if not worktree_path.exists():
@@ -198,10 +280,20 @@ def _verify_worktree(project_dir: Path, worktree_path: Path) -> None:
     if not any(worktree_path.iterdir()):
         raise WorktreeCreateError(f"{worktree_path} is empty after create")
 
-    listing = _run_powershell_git(project_dir, ["worktree", "list"])
-    if str(worktree_path) not in listing.stdout:
+    # Compare resolved Paths, NOT substrings of the listing.
+    #
+    # This check used to be `str(worktree_path) not in listing.stdout`, which
+    # could never pass on Windows: `str(Path(...))` yields backslashes
+    # (`C:\dev\...`) while git always reports worktree paths POSIX-style
+    # (`C:/dev/...`). Every worktree prep therefore failed its own
+    # post-condition on the development platform, rolled back, and (see
+    # `prepare_worktree`) livelocked the card. Path comparison is a
+    # path-level question; doing it on raw strings was the bug.
+    registered = _registered_worktrees(project_dir)
+    if worktree_path.resolve() not in registered:
         raise WorktreeCreateError(
-            f"{worktree_path} not present in `git worktree list`"
+            f"{worktree_path} not present in `git worktree list` "
+            f"(registered: {[str(p) for p in registered]})"
         )
 
     try:
