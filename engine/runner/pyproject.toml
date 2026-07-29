@@ -25,7 +25,13 @@ dev = [
     "pytest>=8.0",
     "pytest-timeout>=2.2",
     "mypy>=1.10",
-    "ruff>=0.5",
+    # Pinned exact, not `>=`. ruff 0.16.0 (released 2026-07-23) turned the isort
+    # rule (I001) on by default -- a rule this repo never selected -- which
+    # reddened ~200 previously-clean import blocks on unchanged code and broke the
+    # required `engine runner battery` gate for every open PR. Pin to the last
+    # known-good release so CI is deterministic; bump ruff (and decide whether to
+    # adopt import sorting) deliberately in its own PR, never by silent resolution.
+    "ruff==0.15.22",
     "types-PyYAML",
     "PyMySQL>=1.1",
 ]
