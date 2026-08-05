@@ -1,0 +1,42 @@
+# verify/tier3_paths.txt -- paths whose modification makes a PR tier-3.
+#
+# Consumed by verify/ci/classify_tier.sh (grep -E, one extended regex per
+# line; blank lines and # comments ignored). Matched against the PR's changed
+# file paths as reported by the GitHub API (forward slashes, repo-relative).
+#
+# KEEP IN SYNC with the prose sensitivity list in .github/AUTO_MERGE.md and
+# the surface classification in verify/tier_map.yml. This file is the
+# machine-readable half; AUTO_MERGE.md explains the why.
+#
+# Deliberately NOT listed: .github/workflows/** and verify/** themselves.
+# Making CI config tier-3 would demand a manual headed deep-verify run for
+# every CI tweak, which is how the gate got turned off last time. Those paths
+# are guarded by required CI + Drew's review instead (accepted residual risk,
+# ADR-2026-07-23).
+
+# Card store schema and migrations -- a bad write corrupts the canonical card
+# tree on disk.
+^engine/runner/src/cards_runner/store/
+
+# The merge gate and the confidence gate -- these decide what merges.
+^engine/runner/src/cards_runner/daemon/merge_gate\.py$
+^engine/runner/src/cards_runner/daemon/confidence_gate\.py$
+
+# The verifier decision surface.
+^engine/runner/src/cards_runner/verifier/
+^engine/lib/verifier/
+
+# Cost / tier contracts.
+^engine/RUNNER_CONTRACT\.md$
+^engine/DEFINITION_OF_DONE\.md$
+^engine/tier_pricing\.yaml$
+^engine/tier_map_claude\.yaml$
+
+# The currently-live board backend (frozen Express reference until K11 ships).
+^legacy/board-express/backend/src/
+
+# The FastAPI auth/API surface (K11): token verification, org isolation.
+^backend/cards_api/
+
+# The view-model contract the engine ledger feeds.
+^frontend/src/state/
