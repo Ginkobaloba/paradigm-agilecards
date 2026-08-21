@@ -20,6 +20,7 @@ import {
 } from "../lib/parseCard";
 import { relativeTime } from "../lib/relativeTime";
 import { selectUnmetDeps, useStore } from "../state/store";
+import { useShallow } from "zustand/react/shallow";
 import { stakesBadgeClass, tierBadgeClass } from "../lib/tierBadge";
 
 interface Props {
@@ -36,7 +37,11 @@ interface Props {
 export function CardTile({ card, onOpen, rates }: Props) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({ id: card.id });
-  const unmet = useStore((s) => selectUnmetDeps(s, card));
+  // selectUnmetDeps returns a fresh object each call, so selecting it raw
+  // gives useSyncExternalStore a new snapshot every render and React 18.3
+  // throws "getSnapshot should be cached" (blanking the tile). useShallow
+  // compares the {count, firstUnmetId} result by value and keeps it stable.
+  const unmet = useStore(useShallow((s) => selectUnmetDeps(s, card)));
   const [copied, setCopied] = useState(false);
 
   const style: React.CSSProperties = {
