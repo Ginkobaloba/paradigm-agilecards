@@ -29,6 +29,12 @@ class Settings:
     jwt_issuer: str
     jwt_audience: str
     jwks_url: str
+    # Postgres URL for the cards_app runtime role (NOBYPASSRLS, non-owner —
+    # see docs/adr/ADR-2026-07-16-cards-api-postgres-rls.md). Contains a
+    # credential, so it is sourced from the secret provider like everything
+    # else. None means "no database configured" (the app still boots and
+    # reports it via /healthz; data routes answer 503).
+    database_url: str | None = None
 
 
 def load_settings(source: Mapping[str, str] | None = None) -> Settings:
@@ -43,7 +49,12 @@ def load_settings(source: Mapping[str, str] | None = None) -> Settings:
     issuer = secrets.get("PARADIGM_JWT_ISSUER", _DEFAULT_ISSUER)
     audience = secrets.get("PARADIGM_JWT_AUDIENCE", _DEFAULT_AUDIENCE)
     jwks_url = secrets.get("PARADIGM_JWKS_URL") or f"{issuer}/.well-known/jwks.json"
-    return Settings(jwt_issuer=issuer, jwt_audience=audience, jwks_url=jwks_url)
+    return Settings(
+        jwt_issuer=issuer,
+        jwt_audience=audience,
+        jwks_url=jwks_url,
+        database_url=secrets.get("CARDS_DATABASE_URL") or None,
+    )
 
 
 def _load_secret_source() -> Mapping[str, str]:

@@ -1,0 +1,78 @@
+# AgileCards — the CURRENT stack (FastAPI + Postgres + Vite/Caddy).
+#
+# This replaces the legacy compose under legacy/board-express/ (which builds
+# the retired Express app for the old host). Audit M2.
+#
+#   cp .env.example .env   # fill in passwords
+#   docker compose up --build
+#   curl http://localhost:8080/healthz   -> {"ok": true, ...}
+#
+# Security posture (see deploy/README.md for the full runbook):
+# - Encryption at rest: the pgdata volume MUST live on an encrypted disk
+#   (BitLocker/LUKS) or use a managed Postgres with storage encryption.
+# - TLS: terminate at the Cloudflare tunnel or give Caddy a real hostname
+#   (SITE_ADDRESS) for automatic HTTPS. Nothing here listens on plaintext
+#   beyond the compose-internal network + the single published port.
+# - The API connects as cards_app (NOBYPASSRLS, non-owner); migrations run
+#   once as cards_owner. Roles are provisioned by init-db.sh on first boot.
+
+name: agilecards
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set in .env}
+      CARDS_OWNER_PASSWORD: ${CARDS_OWNER_PASSWORD:?set in .env}
+      CARDS_APP_PASSWORD: ${CARDS_APP_PASSWORD:?set in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init-db.sh:/docker-entrypoint-initdb.d/10-roles.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d cards"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: ../backend
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      CARDS_MIGRATIONS_DATABASE_URL: postgresql+psycopg://cards_owner:${CARDS_OWNER_PASSWORD}@postgres:5432/cards
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: ../backend
+    environment:
+      CARDS_DATABASE_URL: postgresql+psycopg://cards_app:${CARDS_APP_PASSWORD}@postgres:5432/cards
+      PARADIGM_JWT_ISSUER: ${PARADIGM_JWT_ISSUER:-https://auth.paradigm.codes}
+      PARADIGM_JWT_AUDIENCE: ${PARADIGM_JWT_AUDIENCE:-paradigm-agilecards}
+      PARADIGM_JWKS_URL: ${PARADIGM_JWKS_URL:-}
+      PARADIGM_SECRETS_PROVIDER: ${PARADIGM_SECRETS_PROVIDER:-env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ../frontend
+      args:
+        VITE_BASE_PATH: ${VITE_BASE_PATH:-/}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    ports:
+      - "${PUBLISH_ADDRESS:-127.0.0.1:8080}:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  pgdata:

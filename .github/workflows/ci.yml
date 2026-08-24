@@ -104,15 +104,34 @@ jobs:
       - name: Build (tsc)
         run: npm run build --if-present
 
+      # No continue-on-error here: these tests cover the backend testers
+      # currently touch. A red suite must be a red check (audit S1).
       - name: Tests
-        continue-on-error: true
         run: npm test --if-present
 
   backend-fastapi:
     name: backend (fastapi scaffold)
     runs-on: ubuntu-latest
-    # New Python/FastAPI backend (chunk K2 scaffold). Not yet a required
-    # context; promote it in branch protection once K11 lands the real API.
+    # The real Cards API: FastAPI over Postgres with DB-enforced RLS. The
+    # suite includes raw-SQL RLS proofs, so it runs against a real Postgres
+    # service container — no SQLite stand-in, no skipped security tests.
+    # (Job display name kept stable: it is safest to treat CI context names
+    # as load-bearing. Promote to a required context in branch protection —
+    # audit S1.)
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: ci_admin_pw
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      CARDS_TEST_ADMIN_URL: postgresql+psycopg://postgres:ci_admin_pw@127.0.0.1:5432/postgres
     defaults:
       run:
         working-directory: backend
@@ -131,7 +150,7 @@ jobs:
       - name: Lint (ruff)
         run: ruff check .
 
-      - name: Tests (pytest)
+      - name: Tests (pytest, against real Postgres)
         run: pytest -q
 
   contracts:
@@ -179,3 +198,20 @@ jobs:
       - name: TS llm-client contract (CARDS-014)
         working-directory: frontend
         run: npm run test:contracts
+
+  sbom:
+    name: sbom (CycloneDX, compliance seam 6)
+    runs-on: ubuntu-latest
+    # Software bill of materials for the shipped stack (backend + frontend).
+    # Generation-only by design ("cheap seams" charter): the artifact exists
+    # and is attached to every run; policy/scanning layers can come later.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate SBOM (syft -> CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          artifact-name: agilecards-sbom.cyclonedx.json
+          upload-artifact: true

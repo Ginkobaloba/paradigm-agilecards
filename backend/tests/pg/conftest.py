@@ -186,3 +186,34 @@ def set_org(conn, org_id: str) -> None:
     conn.execute(
         sa.text("SELECT set_config('app.current_org', :org, true)"), {"org": org_id}
     )
+
+
+# ---------------------------------------------------------------------------
+# Application fixtures (API tests): the real app over the real database,
+# with the offline JWKS verifier from tests/conftest.py.
+
+
+@pytest.fixture()
+def app(pg_urls, verifier):
+    from cards_api.main import create_app
+
+    return create_app(verifier=verifier, database_url=pg_urls["app"])
+
+
+@pytest.fixture()
+def client(app):
+    from fastapi.testclient import TestClient
+
+    # Context-managed so the lifespan runs (SSE bus loop attachment).
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+@pytest.fixture()
+def bearer(make_token):
+    """Header factory: bearer(org_id=..., roles=[...]) -> auth headers."""
+
+    def _headers(**kwargs) -> dict[str, str]:
+        return {"Authorization": f"Bearer {make_token(**kwargs)}"}
+
+    return _headers
