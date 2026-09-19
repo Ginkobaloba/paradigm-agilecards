@@ -4,7 +4,7 @@ Python/FastAPI backend for Paradigm AgileCards. Locked to Python per the
 integration roadmap (Q2). Chunk **K11** lands the auth core
 (AC-CARDS-003/006/007/008): direct JWKS JWT verification, a bearer guard on
 every authed endpoint, org-scoped isolation + role authorization, and
-Infisical-sourced secrets at boot.
+settings from environment variables at boot.
 
 ## Layout
 
@@ -15,11 +15,11 @@ backend/
     auth.py              TokenVerifier -- RS256 JWKS verification (AC-CARDS-003)
     deps.py              require_claims / require_roles guards (AC-CARDS-006/007)
     store.py             org-scoped in-memory card store (AC-CARDS-007)
-    config.py            boot-time settings + Infisical secret loading (AC-CARDS-008)
+    config.py            boot-time settings from env vars (AC-CARDS-008)
     main.py              FastAPI app factory + routes
   tests/                 offline auth/isolation/config suite (no network)
   .env.example           placeholder config (no real secrets)
-  pyproject.toml         deps + dev/infisical extras
+  pyproject.toml         deps + dev extra
 ```
 
 ## Auth model
@@ -33,8 +33,10 @@ backend/
 - **AC-CARDS-007** -- `org_id` and `roles` come from the verified token only.
   Reads/writes are org-scoped at the store boundary (cross-org reads => 404);
   `require_roles("admin")` gates mutation.
-- **AC-CARDS-008** -- `config.py` sources secrets from Infisical at boot when
-  `PARADIGM_SECRETS_PROVIDER=infisical`, else falls back to env vars (CI/dev).
+- **AC-CARDS-008** (amended 2026-09-19) -- `config.py` reads settings from
+  environment variables injected by the runtime. The Infisical provider was
+  removed (the vault is not running); `PARADIGM_SECRETS_PROVIDER=infisical`
+  now fails at boot with a fix-it message instead of silently falling back.
   No real secrets in the repo; `.env.example` is placeholders only.
 
 There is no Python `@paradigm/auth` SDK in v1; this is direct JWKS verification.
@@ -60,7 +62,7 @@ isolation contract. The full card CRUD rewrite of the legacy Express backend
 cd C:\dev\paradigm-agilecards\backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -e .[dev]          # add .[infisical] in production images
+pip install -e .[dev]
 
 ruff check .
 pytest -q
