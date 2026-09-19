@@ -1,0 +1,6 @@
+# 2026-09-19 03:35 CDT - Ledger: one file per entry
+- **Who:** Claude Opus 5 (1M context), rollout session, on Drew's request.
+- **Change:** Added `scripts/ledger.mjs` (new, check, print), `docs/ledger/README.md`, and `.github/workflows/ledger.yml` (runs `node scripts/ledger.mjs check` on pull_request and on push to main that touches docs/ledger/** or scripts/ledger.mjs). New ledger entries go in `docs/ledger/YYYY-MM-DD-HHMM-<slug>.md`, one file each.
+- **Why:** This repo had no committed `docs/LEDGER.md` on main, but open PRs #67, #68 and #69 each added or copied one, so they would have collided on the same file at merge time the way paradigm-site's PRs #91 to #96 did. Rolled out here as the pattern paradigm-site proved in its PR #97, adapted for this repo: since there was nothing to freeze, the README says so instead of describing a frozen file, and there is no root Node project here, so a new `.github/workflows/ledger.yml` runs the check instead of an npm test hook.
+- **State after:** `node scripts/ledger.mjs check` passes locally. PRs #67, #68, and #69 are being converted in the same pass so none of them touches `docs/LEDGER.md` any more.
+- **Refs:** paradigm-site PR #97 (source of this pattern), docs/ledger/README.md, scripts/ledger.mjs, .github/workflows/ledger.yml.
