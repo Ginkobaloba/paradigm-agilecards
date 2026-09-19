@@ -9,9 +9,13 @@ on DREWSPC, `gantry-board-backend` and `gantry-board-frontend` (compose project
 
 The containers record their compose working directory as
 `C:\dev\agile-cards\apps\board`. That directory no longer exists. The repo was
-renamed and restructured in #44 (`apps/board` became `legacy/board-express`),
-and the restructure **deleted `frontend/`** (and `marketing/`) from that path.
-So neither the recorded path nor current `main` can rebuild the live frontend.
+renamed and restructured in #44, which split `apps/board` apart: the Express
+backend, `docker/` and the compose files went to `legacy/board-express/`, while
+the frontend **moved** to `frontend/` at the repo root (history preserved;
+today it differs from what Gantry runs by only 6 files). The compose files
+still assume the old layout (build context = the folder holding both
+`frontend/` and `backend/`), so neither the recorded path nor any compose file
+on `main` can rebuild Gantry as-is.
 
 ## The source that matches, proven
 
@@ -74,7 +78,8 @@ Rules:
 ## Open follow-up
 
 This makes Gantry **rebuildable**, not **maintainable**. Dependency bumps on
-`main` (#45, #63) touched `legacy/board-express` but can't reach a frontend that
-no longer exists there. Two options: restore `frontend/` under
-`legacy/board-express` from `8d43b7a`, or move Gantry onto the new
-paradigm-agilecards frontend. That call is for Drew and is not made here.
+`main` (#45, #63) land in `frontend/` and `legacy/board-express/backend/`, but
+no compose file on `main` builds them together. Options memo for Drew:
+`C:\dev\GANTRY_FRONTEND_OPTIONS_2026-09-19.md`. The recommendation there is to
+add a compose file that builds from the repo root (`frontend/` plus the legacy
+backend). That is the "clean rewrite" of the Gantry deploy that #44 assigned to K10.
