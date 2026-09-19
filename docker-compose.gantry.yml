@@ -58,8 +58,12 @@ services:
       # Host card store, read/write. This folder must exist on the host.
       - "C:/dev/todo:/cards:rw"
       - "board-data:/data"
-    ports:
-      - "4070:4070"
+    # No host port. The frontend's nginx reaches the backend over the compose
+    # network as http://backend:4070, and nothing on the host needs :4070.
+    # The live 8d43b7a stack published 4070:4070 on 0.0.0.0, which Docker
+    # Desktop's firewall rule exposed to the LAN (cloudflare-config #18).
+    expose:
+      - "4070"
 
   frontend:
     build:
@@ -76,8 +80,11 @@ services:
     depends_on:
       - backend
     ports:
-      # Host port the demo-proxy reaches via host.docker.internal:8110.
-      - "8110:80"
+      # Loopback only. demo-proxy reaches it via host.docker.internal:8110,
+      # which works with a 127.0.0.1 bind on Docker Desktop (verified in
+      # cloudflare-config #18). A 0.0.0.0 bind would expose the board to the
+      # LAN through Docker Desktop's inbound firewall allow rule.
+      - "127.0.0.1:8110:80"
 
 volumes:
   # Resolves to board_board-data under project "board" (the live SQLite DB).

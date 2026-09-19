@@ -1,10 +1,12 @@
 # Gantry: build and deploy from main
 
 Gantry is the agile-cards board served at `https://portal.paradigm.codes/gantry/`.
-It runs as two containers on DREWSPC, `gantry-board-backend` (host port 4070)
-and `gantry-board-frontend` (host port 8110), compose project `board`. The
-shared tunnel and demo-proxy route `/gantry/` to port 8110; this stack has no
-tunnel of its own.
+It runs as two containers on DREWSPC, `gantry-board-backend` (no host port;
+the frontend reaches it as `backend:4070` on the compose network) and
+`gantry-board-frontend` (host port `127.0.0.1:8110`), compose project `board`.
+The shared tunnel and demo-proxy route `/gantry/` to port 8110 through
+`host.docker.internal`, which works with a loopback bind (verified in
+cloudflare-config #18). This stack has no tunnel of its own.
 
 The recipe lives in [`docker-compose.gantry.yml`](../../docker-compose.gantry.yml)
 at the repo root. It builds:
@@ -19,10 +21,16 @@ compatible.
 
 The live containers (as of 2026-09-19) were built on 2026-06-26 from commit
 `8d43b7a`, `apps/board` (see `docs/board/GANTRY_BUILD_SOURCE.md`, PR #67).
-This file reproduces that service shape. The only runtime difference is
-`PORTAL_JWKS_URL`, which now points at `https://portal.paradigm.codes/.well-known/jwks.json`
-(same keys as the old host). `PORTAL_ISSUER` stays the old-host string on
-purpose; see the comments in the compose file.
+This file reproduces that service shape, with two intended runtime
+differences:
+
+- `PORTAL_JWKS_URL` now points at `https://portal.paradigm.codes/.well-known/jwks.json`
+  (same keys as the old host). `PORTAL_ISSUER` stays the old-host string on
+  purpose; see the comments in the compose file.
+- **Ports are loopback only.** The live stack published `4070:4070` and
+  `8110:80` on `0.0.0.0`. Docker Desktop's inbound firewall allow rule exposed
+  those to the LAN (and the tailnet). The backend now has no host port, and
+  the frontend binds `127.0.0.1:8110`.
 
 **Do not deploy to the live Gantry without Drew's go-ahead.**
 
@@ -53,7 +61,7 @@ runs):
 ```powershell
 $old = "$env:TEMP\gantry-8d43b7a"
 New-Item -ItemType Directory -Force $old | Out-Null
-git archive 8d43b7a apps/board/docker-compose.yml apps/board/docker-compose.gantry.yml -o "$old\old.tar"
+git -c core.autocrlf=false archive 8d43b7a apps/board/docker-compose.yml apps/board/docker-compose.gantry.yml -o "$old\old.tar"
 tar -xf "$old\old.tar" -C $old
 Push-Location "$old\apps\board"
 $env:TUNNEL_TOKEN = "unused-render-only"
@@ -65,8 +73,10 @@ git diff --no-index "$old\old.yml" "$old\new.yml"
 ```
 
 Expected differences only: build `context` / `dockerfile` paths, the added
-path build args, and `PORTAL_JWKS_URL`. Anything else (ports, container names,
-volumes, `BASE_PATH`, `PORTAL_ISSUER`, `CORS_ORIGIN`) means stop.
+path build args, `PORTAL_JWKS_URL`, the backend's `ports` replaced by
+`expose: 4070`, and the frontend's port gaining `host_ip: 127.0.0.1`. Anything
+else (container names, volumes, `BASE_PATH`, `PORTAL_ISSUER`, `CORS_ORIGIN`)
+means stop.
 
 ## 2. Optional: throwaway build and smoke test
 
@@ -80,14 +90,14 @@ services:
   backend:
     container_name: gantry-verify-backend
     ports: !override
-      - "14070:4070"
+      - "127.0.0.1:14070:4070"
     volumes: !override
       - "<scratch copy of C:/dev/todo>:/cards:rw"
       - "board-data:/data"
   frontend:
     container_name: gantry-verify-frontend
     ports: !override
-      - "18110:80"
+      - "127.0.0.1:18110:80"
 ```
 
 ```powershell
