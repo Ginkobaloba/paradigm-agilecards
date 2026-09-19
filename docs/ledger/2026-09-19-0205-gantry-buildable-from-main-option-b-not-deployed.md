@@ -1,0 +1,11 @@
+# 2026-09-19 02:05 CDT - Gantry buildable from main (option B), not deployed
+- **Who:** Subagent of the Orchestrator session, assignment "Option B" from `C:\dev\GANTRY_FRONTEND_OPTIONS_2026-09-19.md`.
+- **Change:** Added `docker-compose.gantry.yml` at the repo root (context = repo root; frontend from `frontend/`, backend from `legacy/board-express/backend/`), path build args `BACKEND_DIR` / `FRONTEND_DIR` / `DOCKER_DIR` in `legacy/board-express/docker/Dockerfile.{backend,frontend}` (defaults keep the old layout), per-Dockerfile `.dockerignore` files, and `docs/board/GANTRY_DEPLOY.md`.
+- **Why:** #44 split `apps/board`, and no compose file on main could build Gantry, so the Dependabot fixes on main never reached it. Hard calls:
+  - **Repo-root file, not `legacy/board-express/docker-compose.gantry-main.yml`.** It composes two top-level trees and `legacy/` is slated for deletion after K11; the live recipe should not live in a doomed folder.
+  - **One flattened file, not base + overlay.** The old base defines `cloudflared` with a required `TUNNEL_TOKEN`; Gantry never runs it.
+  - **Build args, not copied Dockerfiles.** One Dockerfile per image to keep patched; the frozen `8d43b7a` recipe uses that commit's own Dockerfiles, so it stays valid.
+  - **No `image:` and no explicit volume `name:`.** Both keep `-p board` resolving to the live names (`board-backend`, `board_board-data`) and keep a throwaway `-p` run from touching them.
+  - **`PORTAL_JWKS_URL` moved to the new host; `PORTAL_ISSUER` left on the old-host string** (must equal the portal's configured issuer).
+- **State after:** Rendered with `-p board`, the config differs from `8d43b7a:apps/board` only in build paths/args and `PORTAL_JWKS_URL`. Built and smoke-tested under throwaway project `gantry-verify-20260919` (ports 14070/18110, scratch cards, throwaway volume): `/gantry/` 200 with `/gantry/assets/` URLs, `/gantry/healthz` and backend `/healthz` 200, `/gantry/api/cards` 401 without a token. Torn down; live containers and images untouched. **Not deployed.** Portal token handoff through the new JWKS URL is unverified until a real deploy. Deploy needs Drew's go-ahead.
+- **Refs:** PR #67 (build source doc, this ledger's first entries); #44; `docs/board/GANTRY_DEPLOY.md`.
