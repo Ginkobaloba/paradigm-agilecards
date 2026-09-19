@@ -2,22 +2,27 @@
 # Stage 1 compiles TypeScript. Stage 2 ships only the runtime deps.
 
 FROM node:20-alpine AS build
+# BACKEND_DIR is the backend source path inside the build context. The default
+# keeps the original layout (context = legacy/board-express). The repo-root
+# docker-compose.gantry.yml passes legacy/board-express/backend.
+ARG BACKEND_DIR=backend
 WORKDIR /app
 
 # better-sqlite3 needs build tools to compile its native binding.
 RUN apk add --no-cache python3 make g++
 
-COPY backend/package.json backend/package-lock.json* ./
+COPY ${BACKEND_DIR}/package.json ${BACKEND_DIR}/package-lock.json* ./
 RUN npm install --include=dev
 
-COPY backend/tsconfig.json ./
-COPY backend/src ./src
-COPY backend/scripts ./scripts
+COPY ${BACKEND_DIR}/tsconfig.json ./
+COPY ${BACKEND_DIR}/src ./src
+COPY ${BACKEND_DIR}/scripts ./scripts
 RUN npm run build
 
 # ----- runtime -----
 
 FROM node:20-alpine
+ARG BACKEND_DIR=backend
 WORKDIR /app
 
 # better-sqlite3 still wants libstdc++ at runtime.
@@ -25,7 +30,7 @@ RUN apk add --no-cache libstdc++
 
 ENV NODE_ENV=production
 
-COPY backend/package.json backend/package-lock.json* ./
+COPY ${BACKEND_DIR}/package.json ${BACKEND_DIR}/package-lock.json* ./
 RUN npm install --omit=dev && npm cache clean --force
 
 COPY --from=build /app/dist ./dist

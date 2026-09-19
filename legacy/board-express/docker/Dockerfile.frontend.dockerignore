@@ -1,0 +1,8 @@
+# Applies only to builds that use this Dockerfile (BuildKit reads
+# <Dockerfile>.dockerignore next to the Dockerfile). The repo-root build in
+# docker-compose.gantry.yml sends the whole repo as context, so keep host
+# installs and build output out of it: a Windows node_modules copied over the
+# image's Linux one would break native modules (better-sqlite3, rolldown).
+**/node_modules
+**/dist
+.git
