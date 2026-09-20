@@ -20,6 +20,20 @@
 //   - **Refs:** ...
 // The file name's date and time must match the heading's. Append only: to
 // correct an entry, add a new one whose Why starts "Supersedes <file name>".
+//
+// Provenance: the `runCheck` zero-entry guard below is ported verbatim from
+// Ginkobaloba/paradigm-site scripts/ledger.mjs at commit c23fd8052c0f0c0ed914030b08a6ad4bcc24fac5
+// ("fix(ledger): check fails when it finds zero entries", PR #104). That
+// repo is the source all one-file-per-entry ledger copies derive from. This
+// repo's own copy (this PR, pre-fix) had the earlier inline `check` handler
+// with no existsSync guard and no zero-entry guard, so a renamed or empty
+// docs/ledger printed "0 entries, 0 problem(s)" and exited 0. Paths and CI
+// wiring are unchanged from this repo's existing convention; only the
+// zero-entry behavior is adopted from paradigm-site. paradigm-site wires the
+// same function into vitest (scripts/ledger.test.mjs); this repo has no root
+// test runner for scripts/, so that test file is not ported here, and
+// .github/workflows/ledger.yml keeps invoking `node scripts/ledger.mjs
+// check` directly.
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -63,6 +77,32 @@ export function checkAll(dir = LEDGER_DIR) {
   return listEntries(dir).flatMap((f) => checkEntry(f, readFileSync(join(dir, f), "utf8")));
 }
 
+/**
+ * Exit code for `check`, given the ledger directory.
+ *
+ * Zero entries is a FAILURE, not a pass: after a move, a rename or a wrong
+ * path the old code printed "0 entries, 0 problem(s)" and exited 0, so the
+ * check went green while inspecting nothing. The two zero cases are reported
+ * differently, because "the directory is gone" and "the directory is empty"
+ * have different causes. `log`/`err` are injectable so this is testable
+ * against a temp directory with no console spying required.
+ */
+export function runCheck(dir = LEDGER_DIR, log = console.log, err = console.error) {
+  if (!existsSync(dir)) {
+    err(`ledger: ${dir} does not exist; nothing was checked (moved, renamed, or wrong path?)`);
+    return 1;
+  }
+  const entries = listEntries(dir);
+  if (entries.length === 0) {
+    err(`ledger: no entries found in ${dir}; nothing was checked (every change needs an entry)`);
+    return 1;
+  }
+  const problems = checkAll(dir);
+  for (const p of problems) err(`ledger: ${p}`);
+  log(`ledger: ${entries.length} entries, ${problems.length} problem(s).`);
+  return problems.length ? 1 : 0;
+}
+
 /** Slug from a title: lowercase kebab, ASCII only, at most 60 characters. */
 export function slugify(title) {
   const s = title
@@ -101,10 +141,7 @@ export function scaffold(title, when = new Date()) {
 
 function main([cmd, ...rest]) {
   if (cmd === "check") {
-    const problems = checkAll();
-    for (const p of problems) console.error(`ledger: ${p}`);
-    console.log(`ledger: ${listEntries().length} entries, ${problems.length} problem(s).`);
-    return problems.length ? 1 : 0;
+    return runCheck();
   }
   if (cmd === "print") {
     for (const f of listEntries()) process.stdout.write(`${readFileSync(join(LEDGER_DIR, f), "utf8").trimEnd()}\n\n`);

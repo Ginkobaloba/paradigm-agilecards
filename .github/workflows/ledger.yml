@@ -5,12 +5,14 @@ on:
     paths:
       - "docs/ledger/**"
       - "scripts/ledger.mjs"
+      - ".github/workflows/ledger.yml"
   push:
     branches:
       - main
     paths:
       - "docs/ledger/**"
       - "scripts/ledger.mjs"
+      - ".github/workflows/ledger.yml"
 
 jobs:
   check:
