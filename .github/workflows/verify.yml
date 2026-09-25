@@ -108,6 +108,18 @@ jobs:
               echo "live=true" >> "$GITHUB_OUTPUT" ;;
           esac
 
+      # The deployed smoke lives HERE now, and can never block a PR.
+      #
+      # It reports on whatever is deployed, which is PROD's health, not this PR's;
+      # quick-verify is the PR's own evidence. continue-on-error is at STEP level
+      # deliberately: a failing or unreachable deploy must not fail this job, which
+      # verify-gate requires to succeed. While deploy_url is a placeholder this
+      # step does not run at all, and the notice above records why.
+      - name: Smoke the deployed site (reports prod, never blocks the PR)
+        if: steps.check.outputs.live == 'true'
+        continue-on-error: true
+        run: bash verify/ci/quick_smoke.sh verify/smoke.yml
+
   classify:
     name: Classify PR tier
     runs-on: ubuntu-latest
@@ -140,23 +152,41 @@ jobs:
         run: bash verify/ci/classify_tier.sh verify/tier3_paths.txt
 
   quick-verify:
+    # THIS JOB MUST NEVER SKIP. No `needs:`, no `if:`. Do not re-add either.
+    #
+    # WHAT WAS WRONG, measured: it carried `needs: detect` and
+    # `if: needs.detect.outputs.live == 'true'`, and verify/smoke.yml has held a
+    # PLACEHOLDER deploy_url for months (the board's old tunnel host stopped
+    # resolving, and every current path answers only behind the portal auth wall).
+    # So detect set live=false and this job SKIPPED on every PR: a context named
+    # "Quick Verify (all PRs)" reported "skipping" and verified nothing. It feeds
+    # verify-gate, which is now a REQUIRED context, so that is no longer merely
+    # untidy.
+    #
+    # There is no external target left to be a placeholder, so there is nothing to
+    # skip around: it boots THIS PR's own backend and smokes it over HTTP. The
+    # deployed smoke moved into `detect` as a non-blocking step, where prod's
+    # health cannot fail a PR.
     name: Quick Verify (all PRs)
-    needs: detect
-    if: needs.detect.outputs.live == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install yq
-        run: |
-          sudo wget -qO /usr/local/bin/yq \
-            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Run quick smoke against verify/smoke.yml
-        run: bash verify/ci/quick_smoke.sh verify/smoke.yml
+      # Installs the backend as a WHEEL with runtime deps only, and boots uvicorn
+      # from outside the source tree, so this tests the ARTIFACT and not the
+      # working copy. That is what separates it from the `backend (fastapi
+      # scaffold)` pytest job. boot_local.sh's header names the two defect classes
+      # it catches that pytest structurally cannot, both demonstrated by injecting
+      # them (see the PR body).
+      - name: Boot this PR's backend and smoke it
+        run: bash verify/ci/boot_local.sh
+
 
   deep-verify:
     name: Deep Verify (tier-3 PRs only)
@@ -220,13 +250,22 @@ jobs:
             if (e.CLASSIFY_RESULT !== 'success')
               fail(`classify job result=${e.CLASSIFY_RESULT} (must succeed on every PR)`);
 
+            // quick-verify MUST NEVER SKIP as of this PR: it no longer depends on
+            // detect and no longer needs a reachable deploy_url, because it boots
+            // this PR's own artifact. So a skip is now a DEFECT, not an honest
+            // neutral, and this gate fails on it.
+            //
+            // The old code had a branch treating `skipped` with a placeholder
+            // deploy_url as "honest skip, not a pass". That was correct while the
+            // skip was unavoidable. Left in place it would be a latent fail-open:
+            // anyone re-adding an `if:` to quick-verify would get a green
+            // verify-gate over a job that verified nothing, which is exactly the
+            // false pass this PR removes. Deleted deliberately, not overlooked.
             let quickReason;
             if (e.QUICK_RESULT === 'success') {
-              quickReason = `live smoke ran against ${e.DEPLOY_URL} and passed`;
-            } else if (e.QUICK_RESULT === 'skipped' && e.LIVE !== 'true') {
-              quickReason = `deploy_url is a placeholder (${e.DEPLOY_URL}); live smoke not run -- honest skip, not a pass`;
+              quickReason = 'quick-verify booted the backend artifact for this PR and smoked it';
             } else {
-              quickReason = `quick-verify result=${e.QUICK_RESULT}`;
+              quickReason = `quick-verify result=${e.QUICK_RESULT} (it must never skip: it has no needs and no if)`;
               fail(quickReason);
             }
 
