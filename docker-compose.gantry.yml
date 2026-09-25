@@ -1,0 +1,91 @@
+# Gantry: the agile-cards board embedded in the Paradigm portal at
+# https://portal.paradigm.codes/gantry/, built from main.
+#
+# Why this file is at the repo root: Gantry is built from two top-level trees,
+# frontend/ (moved there from apps/board/frontend by #44) and the legacy Express
+# backend in legacy/board-express/backend/. The build context therefore has to
+# be the repo root, and legacy/ is slated for deletion after K11, so the live
+# deploy recipe does not live inside it.
+#
+# This is ONE self-contained file (no base + overlay) and it reproduces the
+# live service shape of the 2026-06-26 build from 8d43b7a:apps/board
+# (docker-compose.yml + docker-compose.gantry.yml). It deliberately has no
+# cloudflared service: the shared tunnel and demo-proxy route /gantry/.
+#
+# ALWAYS use project name "board" for the live deploy (set below, and pass
+# -p board explicitly). The named volume below then resolves to
+# board_board-data, which holds the board's SQLite DB. Do not give the volume
+# an explicit `name:`; that would make a throwaway -p verification run mount
+# the live DB.
+#
+# Render and diff before deploying, and deploy only the two services:
+#   docker compose -p board -f docker-compose.gantry.yml config
+#   docker compose -p board -f docker-compose.gantry.yml up -d --build --no-deps backend frontend
+# Full runbook, verification and rollback: docs/board/GANTRY_DEPLOY.md
+
+name: board
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: legacy/board-express/docker/Dockerfile.backend
+      args:
+        BACKEND_DIR: legacy/board-express/backend
+    container_name: gantry-board-backend
+    restart: unless-stopped
+    environment:
+      PORT: "4070"
+      CARDS_DIR: "/cards"
+      DB_PATH: "/data/board.sqlite"
+      CORS_ORIGIN: "${CORS_ORIGIN:-https://portal.projectnexuscode.org,https://portal.paradigm.codes}"
+      LOG_LEVEL: "info"
+      # Paradigm portal federation. Verifies portal-minted RS256 JWTs.
+      #
+      # PORTAL_JWKS_URL: the one intended change vs the 8d43b7a build, which
+      # fetched keys from the OLD host (portal.projectnexuscode.org). The new
+      # host serves the same keys (checked 2026-09-19), and pointing here means
+      # Gantry keeps working when the old hostname is retired.
+      PORTAL_JWKS_URL: "${PORTAL_JWKS_URL:-https://portal.paradigm.codes/.well-known/jwks.json}"
+      # PORTAL_ISSUER: intentionally still the old-host STRING. The backend
+      # requires the token `iss` to equal this exactly, and the portal's
+      # configured issuer (env.portalIssuer, a logical identity per
+      # ADR-2026-07-18 Decision 0) is still this value. Change it only in the
+      # same deploy in which the portal changes its issuer.
+      PORTAL_ISSUER: "${PORTAL_ISSUER:-https://portal.projectnexuscode.org}"
+      PORTAL_AUDIENCE: "gantry"
+    volumes:
+      # Host card store, read/write. This folder must exist on the host.
+      - "C:/dev/todo:/cards:rw"
+      - "board-data:/data"
+    # No host port. The frontend's nginx reaches the backend over the compose
+    # network as http://backend:4070, and nothing on the host needs :4070.
+    # The live 8d43b7a stack published 4070:4070 on 0.0.0.0, which Docker
+    # Desktop's firewall rule exposed to the LAN (cloudflare-config #18).
+    expose:
+      - "4070"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: legacy/board-express/docker/Dockerfile.frontend
+      args:
+        FRONTEND_DIR: frontend
+        DOCKER_DIR: legacy/board-express/docker
+        BASE_PATH: "${BASE_PATH:-/gantry/}"
+        APP_BRAND: "Gantry"
+        APP_TAGLINE: "board"
+    container_name: gantry-board-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      # Loopback only. demo-proxy reaches it via host.docker.internal:8110,
+      # which works with a 127.0.0.1 bind on Docker Desktop (verified in
+      # cloudflare-config #18). A 0.0.0.0 bind would expose the board to the
+      # LAN through Docker Desktop's inbound firewall allow rule.
+      - "127.0.0.1:8110:80"
+
+volumes:
+  # Resolves to board_board-data under project "board" (the live SQLite DB).
+  board-data:
