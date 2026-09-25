@@ -10,9 +10,32 @@
 # design and requiring a sometimes-skipping context is how PRs get stuck.
 # Apply/repair protection with: verify/ci/apply_branch_protection.ps1
 #
-# JOB NAME `verify-gate` IS LOAD-BEARING: it is a required status-check context
-# in the main ruleset. Do not rename it without updating the ruleset, or every
-# PR will hang waiting for a context that never reports.
+# JOB NAME `verify-gate` IS LOAD-BEARING *IF* IT IS EVER REQUIRED. It is NOT
+# required today, and this comment used to say it was.
+#
+# Measured 2026-09-25 against the live repo, both mechanisms:
+#   classic protection contexts : engine runner battery (lint + tests)
+#                                 board frontend battery (lint + vitest)
+#                                 board backend battery (build + tests)
+#   ruleset required checks     : the same three, plus backend (fastapi scaffold)
+# `verify-gate` appears in NEITHER. So nothing in this workflow blocks a merge on
+# this repo right now: the whole tier-3 gate is advisory here, and a reader of the
+# old comment would have believed a tier-3 PR could not merge without a
+# deep-verify report. It can.
+#
+# Two consequences worth keeping straight:
+#   - The careful `if: always()` on verify-gate is correct and currently moot. It
+#     exists so the context can ALWAYS report once required, which is the thing
+#     that stops a PR hanging on a context that never appears.
+#   - Making it required is a branch-protection change, which is Drew's click, not
+#     something this file can do. `verify/ci/apply_branch_protection.ps1` is the
+#     tool for it. Until then, do not rename the job either: the rename becomes a
+#     silent break the moment someone does require it.
+#
+# The two mechanisms also DISAGREE with each other: `backend (fastapi scaffold)`
+# is required by the ruleset and not by classic protection. GitHub enforces the
+# UNION, so nothing is currently unprotected, but there are two places to edit
+# and changing one looks like changing the requirement. Also Drew's call.
 #
 # WINDOWS / HEADED NOTE:
 # The headed layer (Layer 5, Windows MCP / computer-use) and adversarial
@@ -97,11 +120,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The gate's OWN regression tests. This repo had NO test for its
+      # classifier at all before now, which is the same defect one level up: the
+      # thing that decides whether the deep gate fires was not itself checked.
+      # Offline, no network, seconds.
+      - name: Gate self-tests (classification)
+        run: bash verify/ci/classify_tier_test.sh
+
       - name: Classify (tier-3 label OR tier-3 paths touched)
         id: classify
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          # Read by classify_tier.sh to union the BASE branch's tier3_paths.txt
+          # with this PR's copy, so a PR cannot delete the pattern that covers the
+          # path it is touching. Without this variable the union silently does not
+          # happen, which is a fail-open that looks like a working gate.
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: bash verify/ci/classify_tier.sh verify/tier3_paths.txt
 
   quick-verify:
@@ -143,7 +178,10 @@ jobs:
         run: bash verify/ci/deep_gate.sh
 
   verify-gate:
-    # LOAD-BEARING NAME -- required status-check context in the main ruleset.
+    # LOAD-BEARING NAME, but NOT a required context today: measured 2026-09-25,
+    # neither classic protection nor the ruleset lists `verify-gate` (see the
+    # header). The name still must not change, because the break would only show
+    # up after someone makes it required.
     name: verify-gate
     needs: [detect, classify, quick-verify, deep-verify]
     if: always()
