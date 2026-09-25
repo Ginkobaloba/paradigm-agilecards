@@ -263,7 +263,7 @@ jobs:
             // false pass this PR removes. Deleted deliberately, not overlooked.
             let quickReason;
             if (e.QUICK_RESULT === 'success') {
-              quickReason = 'quick-verify booted this PR's backend artifact and smoked it';
+              quickReason = 'quick-verify booted the backend artifact for this PR and smoked it';
             } else {
               quickReason = `quick-verify result=${e.QUICK_RESULT} (it must never skip: it has no needs and no if)`;
               fail(quickReason);
