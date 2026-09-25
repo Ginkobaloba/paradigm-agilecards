@@ -31,9 +31,26 @@ on:
 permissions:
   contents: read
 
+# PULL-REQUEST ONLY. On a pull request there is one question, "can this merge?",
+# and only the newest answer matters, so cancelling a superseded run is free. On a
+# push to main there is no gate: there is a HISTORY, and each merge's run is the
+# verdict for that commit. Cancelling it leaves a merged commit on main with no
+# verdict, which is what someone bisecting a regression later goes looking for.
+#
+# THIS FILE CARRIES MORE OF THE GATE THAN ANY OTHER IN THE FLEET: four of this
+# repo's five required status-check contexts come from jobs here (the engine, board
+# frontend, board backend and fastapi batteries). A cancelled main run left that
+# commit with no verdict from four of the five checks that gate every PR.
+#
+# The cost of not cancelling on main is two overlapping runs when two merges land
+# minutes apart. Rare, because main only moves on merge, and free here anyway
+# because this repo is PUBLIC and its Actions minutes are unmetered.
+#
+# Same construction as portal-shell (its #92), iep-coach, paradigm-skills and
+# paradigm-platform, so the fleet has one shape rather than several.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   engine-runner:
