@@ -23,7 +23,7 @@
     "cors": "^2.8.5",
     "express": "^4.21.1",
     "jose": "^5.10.0",
-    "js-yaml": "^4.2.0"
+    "js-yaml": "^4.3.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",

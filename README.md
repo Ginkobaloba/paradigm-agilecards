@@ -66,7 +66,7 @@ pytest -q
 uvicorn app:app --reload   # http://127.0.0.1:8000/healthz
 ```
 
-The real Cards API (JWKS verify, org isolation, Infisical secrets) is owned by
+The real Cards API (JWKS verify, org isolation, env-var secrets) is owned by
 **chunk K11**. See [`backend/README.md`](./backend/README.md).
 
 ### Frontend (Boards UI)

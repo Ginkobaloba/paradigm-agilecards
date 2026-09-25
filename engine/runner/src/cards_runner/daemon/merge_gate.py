@@ -36,6 +36,7 @@ from ..common.project_config import MergeGateRelaxation, ProjectConfig
 from ..common.types import ClaimedCard, DaemonConfig
 from ..store import CardRecord, CardStatus
 from .pr_lifecycle import GhRunner, NullGhRunner
+from .worktree import attempt_branch_name
 
 
 log = logging.getLogger(__name__)
@@ -153,7 +154,15 @@ class MergeGate:
                 skipped=True,
             )
 
-        branch = str(record.field_value("branch") or f"card/{record.card_id}")
+        # The working branch is per-attempt (see `attempt_branch_name`): it
+        # MUST match the branch `prepare_worktree` created for this claim, or
+        # the push targets a branch that does not exist. Derive it the same
+        # way, from the same attempt id, not from the card's fixed `branch:`
+        # field alone.
+        base_branch_name = str(
+            record.field_value("branch") or f"card/{record.card_id}"
+        )
+        branch = attempt_branch_name(base_branch_name, claim.attempt_trace_id)
         # Base branch precedence: card frontmatter > project.yaml > daemon
         # default. The card-level field wins so a one-off (e.g., a
         # back-port to a release branch) is still possible without

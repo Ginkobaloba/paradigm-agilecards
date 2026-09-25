@@ -1,0 +1,4 @@
+# Scripts run on Linux (CI, containers). Keep LF in every checkout, even with
+# core.autocrlf=true on Windows, or bash/node see CRLF and fail.
+*.sh text eol=lf
+*.mjs text eol=lf

@@ -92,3 +92,26 @@ gitleaks detect --no-git --source cards_api
 
 PASS -- Infisical-at-boot wiring present (env fallback for CI/dev), no real
 secrets in the tree, gitleaks clean.
+
+## Amendment 2026-09-19: Infisical provider removed
+
+The Infisical half of this AC is withdrawn. Paradigm's Infisical vault is not
+running (its database was lost on 2026-07-29 and never restored), so the
+`infisical` path could only fail at boot, and no deploy uses it (no running
+container or deploy config sets `PARADIGM_SECRETS_PROVIDER`).
+
+- `config.py` reads settings from environment variables only. `load_from_infisical()`
+  and the `[infisical]` extra (`infisical-python`) are gone.
+- `PARADIGM_SECRETS_PROVIDER` unset / blank / `env` (any case) -> `os.environ`.
+- `PARADIGM_SECRETS_PROVIDER=infisical` -> `RuntimeError` with a fix-it message.
+  It fails closed so a deploy still expecting Infisical can't boot on env vars
+  or defaults by accident.
+- Any other value -> `ValueError` (previously it silently read `os.environ`).
+- The unchanged half still holds: no real secrets in the tree, `.env.example`
+  is placeholders only, and no committed `backend/.env`.
+
+Verified: `tests/test_config_secrets.py` 16/16 (was 6), full backend suite
+42/42, `ruff check` clean (ruff 0.15.22), `import app` boots on env defaults.
+
+Result (amended): PASS -- settings from env vars at boot; removed provider
+fails closed; no real secrets in the tree.

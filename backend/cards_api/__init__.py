@@ -2,7 +2,7 @@
 
 Owns AC-CARDS-003 (JWKS JWT verification), AC-CARDS-006 (bearer guard on every
 authed endpoint), AC-CARDS-007 (org_id/roles extraction + isolation), and
-AC-CARDS-008 (secrets from Infisical at boot).
+AC-CARDS-008 (settings from env vars at boot; Infisical removed 2026-09-19).
 """
 
 from __future__ import annotations

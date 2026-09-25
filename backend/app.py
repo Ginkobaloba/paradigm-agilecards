@@ -3,7 +3,7 @@
 The real application lives in the ``cards_api`` package (chunk K11): direct
 JWKS JWT verification (AC-CARDS-003), a bearer guard on every authed endpoint
 (AC-CARDS-006), org_id/roles isolation and authorization (AC-CARDS-007), and
-Infisical-sourced secrets at boot (AC-CARDS-008).
+settings from environment variables at boot (AC-CARDS-008).
 
 This module exists so ``uvicorn app:app`` and the original import path keep
 working.
