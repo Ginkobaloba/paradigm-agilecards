@@ -139,6 +139,17 @@ jobs:
       - name: Gate self-tests (classification)
         run: bash verify/ci/classify_tier_test.sh
 
+      # verify-gate's verdict logic is JavaScript embedded in YAML and run by
+      # actions/github-script, so a syntax error in it only surfaces as a failed CI
+      # run. THIS REPO IS WHERE THAT BIT: #74 wrote a bare apostrophe inside a
+      # single-quoted JS string, github-script died with
+      # `SyntaxError: Unexpected identifier 's'`, and verify-gate (now a required
+      # context) blocked the PR over its own quoting bug. `node --check` parses the
+      # block without running it. Ported verbatim from paradigm-skills (its #11);
+      # fix the template and re-port.
+      - name: Gate script parses (node --check on the github-script body)
+        run: bash verify/ci/gate_script_syntax.sh .github/workflows/verify.yml
+
       - name: Classify (tier-3 label OR tier-3 paths touched)
         id: classify
         env:
