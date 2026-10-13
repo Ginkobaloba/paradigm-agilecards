@@ -21,12 +21,16 @@ compatible.
 
 The live containers (as of 2026-09-19) were built on 2026-06-26 from commit
 `8d43b7a`, `apps/board` (see `docs/board/GANTRY_BUILD_SOURCE.md`, PR #67).
-This file reproduces that service shape, with two intended runtime
+This file reproduces that service shape, with three intended runtime
 differences:
 
 - `PORTAL_JWKS_URL` now points at `https://portal.paradigm.codes/.well-known/jwks.json`
-  (same keys as the old host). `PORTAL_ISSUER` stays the old-host string on
-  purpose; see the comments in the compose file.
+  (same keys as the old host, which stops resolving when projectnexuscode.org
+  lapses on 2026-11-18).
+- `PORTAL_ISSUER` is `https://auth.paradigm.codes`, the portal's logical issuer
+  since 2026-07-20 (portal-shell `env.portalIssuer`, ADR-2026-07-18 Decision 0).
+  The live 8d43b7a containers still expect the old-host string, so they reject
+  every portal token on `iss`; see the comments in the compose file.
 - **Ports are loopback only.** The live stack published `4070:4070` and
   `8110:80` on `0.0.0.0`. Docker Desktop's inbound firewall allow rule exposed
   those to the LAN (and the tailnet). The backend now has no host port, and
@@ -73,10 +77,10 @@ git diff --no-index "$old\old.yml" "$old\new.yml"
 ```
 
 Expected differences only: build `context` / `dockerfile` paths, the added
-path build args, `PORTAL_JWKS_URL`, the backend's `ports` replaced by
+path build args, `PORTAL_JWKS_URL`, `PORTAL_ISSUER` (old-host string to
+`https://auth.paradigm.codes`), the backend's `ports` replaced by
 `expose: 4070`, and the frontend's port gaining `host_ip: 127.0.0.1`. Anything
-else (container names, volumes, `BASE_PATH`, `PORTAL_ISSUER`, `CORS_ORIGIN`)
-means stop.
+else (container names, volumes, `BASE_PATH`, `CORS_ORIGIN`) means stop.
 
 ## 2. Optional: throwaway build and smoke test
 
@@ -166,8 +170,11 @@ The SQLite data in `board_board-data` is untouched by either direction.
 
 ## When the portal changes its issuer
 
-Change `PORTAL_ISSUER` in `docker-compose.gantry.yml` in the same deploy in
-which the portal changes `env.portalIssuer`, then redeploy with step 3 (a
-`--force-recreate` is enough; the federation env is runtime-only). Before the
-old portal host is retired, confirm Gantry is on this recipe so it no longer
-fetches keys from that host.
+The portal changed its issuer to `https://auth.paradigm.codes` on 2026-07-20
+and Gantry was not redeployed, which is how the two drifted apart. Next time,
+change `PORTAL_ISSUER` here in the same window in which the portal changes
+`env.portalIssuer` (read the live value with
+`docker inspect portal-shell --format '{{json .Config.Env}}'`, filtered to
+`PORTAL_ISSUER`), then redeploy with step 3 (a `--force-recreate` is enough;
+the federation env is runtime-only). Before the old portal host is retired,
+confirm Gantry is on this recipe so it no longer fetches keys from that host.

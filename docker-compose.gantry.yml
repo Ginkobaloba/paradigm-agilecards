@@ -42,17 +42,20 @@ services:
       LOG_LEVEL: "info"
       # Paradigm portal federation. Verifies portal-minted RS256 JWTs.
       #
-      # PORTAL_JWKS_URL: the one intended change vs the 8d43b7a build, which
-      # fetched keys from the OLD host (portal.projectnexuscode.org). The new
-      # host serves the same keys (checked 2026-09-19), and pointing here means
-      # Gantry keeps working when the old hostname is retired.
+      # PORTAL_JWKS_URL: changed vs the 8d43b7a build, which fetched keys from
+      # the OLD host (portal.projectnexuscode.org). The new host serves the same
+      # keys (same kid and bytes, checked 2026-09-19 and 2026-10-12), and the
+      # old host stops resolving when projectnexuscode.org lapses (2026-11-18).
       PORTAL_JWKS_URL: "${PORTAL_JWKS_URL:-https://portal.paradigm.codes/.well-known/jwks.json}"
-      # PORTAL_ISSUER: intentionally still the old-host STRING. The backend
-      # requires the token `iss` to equal this exactly, and the portal's
-      # configured issuer (env.portalIssuer, a logical identity per
-      # ADR-2026-07-18 Decision 0) is still this value. Change it only in the
-      # same deploy in which the portal changes its issuer.
-      PORTAL_ISSUER: "${PORTAL_ISSUER:-https://portal.projectnexuscode.org}"
+      # PORTAL_ISSUER: the backend requires the token `iss` to equal this
+      # exactly. The portal signs every token with its logical issuer
+      # `https://auth.paradigm.codes` (portal-shell env.portalIssuer =
+      # PORTAL_ISSUER, ADR-2026-07-18 Decision 0), live since 2026-07-20. It is
+      # an identity string, not a host: it has no DNS record and nothing fetches
+      # it. The 8d43b7a build expected the old-host string, so since 2026-07-20
+      # every portal token has failed this check (live env read 2026-10-12;
+      # not yet confirmed by opening the tile).
+      PORTAL_ISSUER: "${PORTAL_ISSUER:-https://auth.paradigm.codes}"
       PORTAL_AUDIENCE: "gantry"
     volumes:
       # Host card store, read/write. This folder must exist on the host.
