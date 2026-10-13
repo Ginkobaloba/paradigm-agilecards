@@ -46,6 +46,19 @@ export const NAME_RE = /^(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})-([a-z0-9]+(?:-[a
 const HEADING_RE = /^# (\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2}) ([A-Z]{2,5}) - (\S.*)$/;
 const EM_DASH = "—";
 
+/**
+ * Does the field labelled on lines[at] say anything?
+ *
+ * A label with nothing after it is not a field: `new` scaffolds exactly that,
+ * so before this check an untouched scaffold (every field blank) passed as a
+ * valid entry. Found 2026-10-13 when one was committed and `check` went green.
+ * Content may instead start on an indented continuation line under the label
+ * (some entries put a numbered list there), so that counts too.
+ */
+function fieldHasContent(lines, at, label) {
+  return Boolean(lines[at].slice(label.length).trim()) || /^\s+\S/.test(lines[at + 1] ?? "");
+}
+
 /** Problems with one entry; empty array means valid. */
 export function checkEntry(name, text) {
   const problems = [];
@@ -60,7 +73,10 @@ export function checkEntry(name, text) {
     problems.push(`${name}: heading date/time ${h[1]} ${h[2]}:${h[3]} does not match the file name`);
   }
   for (const field of FIELDS) {
-    if (!lines.some((l) => l.startsWith(`- **${field}:**`))) problems.push(`${name}: missing "- **${field}:**"`);
+    const label = `- **${field}:**`;
+    const at = lines.findIndex((l) => l.startsWith(label));
+    if (at < 0) problems.push(`${name}: missing "${label}"`);
+    else if (!fieldHasContent(lines, at, label)) problems.push(`${name}: "${label}" is empty`);
   }
   if (text.includes(EM_DASH)) problems.push(`${name}: contains an em dash`);
   return problems;
