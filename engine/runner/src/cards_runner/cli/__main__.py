@@ -24,8 +24,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ..common.envfile import ENV_FILE_VAR, load_dotenv
 from ..common.locks import FileLock, pid_alive
 from ..common.types import DaemonConfig, RuntimePaths
+from ..daemon import llm_capability
 from ..daemon.daemon import Daemon, DaemonAlreadyRunning
 from ..daemon.orphan import force_reclaim
 from ..store import CardStatus, build_repository, default_store_spec
@@ -43,6 +45,9 @@ _STATUS_ORDER: tuple[str, ...] = (
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Entry point only; never overrides a variable already set. The key used
+    # to come from a User-scope variable, removed 2026-10-21.
+    load_dotenv()
     parser = argparse.ArgumentParser(
         prog="cards-runner",
         description="agile-cards runner CLI (chunk 2b)",
@@ -376,7 +381,8 @@ def _cmd_start(args: argparse.Namespace) -> int:
     if args.invoker in ("sdk", "sdk-tools") and not os.environ.get("ANTHROPIC_API_KEY"):
         print(
             "error: --invoker sdk/sdk-tools needs ANTHROPIC_API_KEY in "
-            "the environment",
+            "the environment (or in a gitignored .env in the working "
+            f"directory, or the file named by {ENV_FILE_VAR})",
             file=sys.stderr,
         )
         return 2
@@ -446,6 +452,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
         total = repo.count_cards()
     finally:
         repo.close()
+    # The DAEMON's capability, recorded by the daemon at boot. This process's
+    # own environment says nothing about the daemon's, so it is not consulted.
+    record = llm_capability.read_for_daemon(
+        paths.capabilities, pid if running else None
+    )
+    llm_reviews = record["llm_reviews"] if record else "unknown"
     payload: dict[str, Any] = {
         "todo_root": str(paths.todo_root),
         "store": store_spec,
@@ -453,6 +465,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
         "daemon_running": running,
         "card_total": total,
         "counts": counts,
+        "llm_reviews": llm_reviews,
+        "llm_reviews_reason": record.get("reason") if record else None,
     }
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -468,6 +482,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
         "counts: "
         + " ".join(f"{status}={counts[status]}" for status in _STATUS_ORDER)
     )
+    if llm_reviews == "degraded":
+        print(f"llm reviews: DEGRADED ({payload['llm_reviews_reason']})")
+    elif llm_reviews == "live":
+        print("llm reviews: live")
+    else:
+        print("llm reviews: unknown (no record from the running daemon)")
     return 0
 
 

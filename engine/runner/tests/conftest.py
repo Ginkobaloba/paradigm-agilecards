@@ -112,6 +112,16 @@ def _make_card_text(
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_real_dotenv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`cli.main()` loads a `.env`. Point it at a file that does not exist,
+    so a developer's real `.env` can never feed a key into a test (a test
+    that deletes ANTHROPIC_API_KEY and expects a refusal would otherwise
+    pass or fail on the machine, not the code). Tests of the loader pass
+    explicit paths or set the variable themselves."""
+    monkeypatch.setenv("CARDS_RUNNER_ENV_FILE", str(tmp_path / "no-such.env"))
+
+
 @pytest.fixture
 def todo_root(tmp_path: Path) -> Path:
     root = tmp_path / "todo"

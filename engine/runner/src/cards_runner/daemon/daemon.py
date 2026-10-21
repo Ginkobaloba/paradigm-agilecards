@@ -74,6 +74,7 @@ from ..metrics.writer import LedgerWriter
 from ..store.projection import ProjectionError, parse_card_text, project_card_file
 from ..verifier import VerifierError, VerifierResult, verify_card
 from ..verifier.runner import VERDICT_FAIL, VERDICT_PASS, VERDICT_STANDUP
+from . import llm_capability
 from .eligibility import EligibilityResult, evaluate_eligibility
 from .merge_gate import MergeGate, MergeOutcome, build_default_gh_runner
 from .amendment_editor_client import (
@@ -315,6 +316,7 @@ class Daemon:
             "daemon booting todo_root=%s poll=%.1fs max_parallel=%d",
             self.paths.todo_root, self.cfg.poll_interval_sec, self.cfg.max_parallel,
         )
+        self._report_llm_capability()
         if self._repo is None:
             spec = self.cfg.resolved_store_spec()
             log.info("opening card store %s", spec)
@@ -1835,6 +1837,31 @@ class Daemon:
                 "could not route %s to blocked after verifier crash: %s",
                 claim.card_id, exc,
             )
+
+    def _report_llm_capability(self) -> llm_capability.LlmCapability:
+        """Say at boot whether LLM reviews are live, and record it for `status`.
+
+        The client builders below degrade quietly by design (a missing key
+        routes work to humans rather than failing it). This is where that
+        degrade stops being quiet: a WARNING naming each affected feature,
+        and `<todo_root>/daemon_capabilities.json` for `cards-runner status`.
+        A failed write is logged, never fatal: it costs the status line, not
+        the daemon.
+        """
+        cap = llm_capability.detect()
+        if cap.live:
+            log.info("LLM reviews live (anthropic key present, sdk installed)")
+        else:
+            log.warning("%s", llm_capability.warning_text(cap))
+        try:
+            self.paths.todo_root.mkdir(parents=True, exist_ok=True)
+            llm_capability.write_record(
+                self.paths.capabilities,
+                llm_capability.to_record(cap, pid=os.getpid()),
+            )
+        except OSError as exc:
+            log.error("could not write %s: %s", self.paths.capabilities, exc)
+        return cap
 
     def _build_subjective_client(self) -> Any | None:
         """Return an Anthropic client for the subjective cascade, or None.

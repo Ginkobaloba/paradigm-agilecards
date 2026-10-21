@@ -88,6 +88,10 @@ DAEMON_LOCK_NAME: Final[str] = ".daemon.lock"
 # Global worktree-creation mutex.
 RUNNER_LOCK_NAME: Final[str] = ".runner.lock"
 
+# What the running daemon can do with an LLM (written at boot, read by
+# `cards-runner status`). See daemon/llm_capability.py.
+CAPABILITIES_NAME: Final[str] = "daemon_capabilities.json"
+
 # Per-worktree halt sentinel (chunk 2b-ii cost-cap fallback).
 HALT_SENTINEL: Final[str] = ".cards-halt"
 
@@ -152,6 +156,7 @@ class RuntimePaths:
     signals: Path
     daemon_lock: Path
     runner_lock: Path
+    capabilities: Path
 
     @classmethod
     def from_root(cls, todo_root: Path) -> "RuntimePaths":
@@ -162,6 +167,7 @@ class RuntimePaths:
             signals=root / SIGNALS_DIRNAME,
             daemon_lock=root / DAEMON_LOCK_NAME,
             runner_lock=root / RUNNER_LOCK_NAME,
+            capabilities=root / CAPABILITIES_NAME,
         )
 
     def ensure(self) -> None:
