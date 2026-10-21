@@ -16,7 +16,9 @@
 // Terraform repo would make that false.
 //
 // Run: node --test scripts/ledger.test.mjs
-import { test } from "node:test";
+// Runs under `node --test` and under vitest: several repos collect scripts/**/*.test.mjs
+// with vitest, which ignores tests registered with node:test and fails the file.
+const { test } = process.env.VITEST ? await import("vitest") : await import("node:test");
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
