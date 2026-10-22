@@ -66,7 +66,7 @@ runs):
 $old = "$env:TEMP\gantry-8d43b7a"
 New-Item -ItemType Directory -Force $old | Out-Null
 git -c core.autocrlf=false archive 8d43b7a apps/board/docker-compose.yml apps/board/docker-compose.gantry.yml -o "$old\old.tar"
-tar -xf "$old\old.tar" -C $old
+& C:\Windows\System32\tar.exe -xf "$old\old.tar" -C $old   # not plain tar: Git's GNU tar reads "C:" as a remote host
 Push-Location "$old\apps\board"
 $env:TUNNEL_TOKEN = "unused-render-only"
 docker compose -p board -f docker-compose.yml -f docker-compose.gantry.yml config backend frontend > "$old\old.yml"

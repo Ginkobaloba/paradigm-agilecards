@@ -4,9 +4,12 @@ Thumbs.db
 desktop.ini
 
 # Secrets. A real API key in a committed .env file is a credential
-# leak. Both the engine and the board read secrets straight from the
-# process environment, never from a .env file, but ignore the pattern
-# anyway so a stray local override does not land in a commit.
+# leak. The board reads secrets straight from the process environment.
+# The engine runner's CLI also reads ONE gitignored .env at its entry
+# point (./.env, or the path in CARDS_RUNNER_ENV_FILE) into that same
+# environment, never overriding a variable already set: see
+# engine/runner/src/cards_runner/common/envfile.py. Either way the file
+# must never be committed, so the pattern is ignored here.
 .env
 .env.*
 *.local.env
