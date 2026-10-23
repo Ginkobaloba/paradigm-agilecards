@@ -4,6 +4,8 @@
  * to localStorage later if you want persistent sessions.
  */
 
+// Pre-rename key kept on purpose (S11): changing it would silently log out
+// every existing session. Do not rebrand this string.
 const KEY = "agile-cards-board.token";
 
 export function getToken(): string | null {

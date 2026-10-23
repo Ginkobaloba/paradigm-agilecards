@@ -49,7 +49,7 @@ export function TokenGate({ onAuthed }: Props) {
       >
         <div>
           <h1 className="text-base font-semibold text-text mb-1">
-            agile-cards-board
+            AgileCards
           </h1>
           <p className="text-xs text-muted">
             Paste a bearer token. Don't have one? Run{" "}

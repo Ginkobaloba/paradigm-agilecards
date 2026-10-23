@@ -1,5 +1,5 @@
 /**
- * Deployment branding. The board is a single product (agile-cards-board)
+ * Deployment branding. The board is a single product (AgileCards)
  * but a given deployment can present under a customer-facing brand -- the
  * Paradigm portal embed runs as "Gantry". Brand is build-time config so
  * the product itself is not renamed; only this deployment's image carries
@@ -15,7 +15,7 @@ function envTrimmed(v: unknown, fallback: string): string {
 
 export const APP_BRAND: string = envTrimmed(
   import.meta.env.VITE_APP_BRAND,
-  "agile-cards",
+  "AgileCards",
 );
 
 export const APP_TAGLINE: string = envTrimmed(
