@@ -9,6 +9,7 @@ it the scrub drops the variable and the worker loads the Claude map.
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,7 @@ from cards_runner.cli.__main__ import _cmd_start
 from cards_runner.common.canonical_config import ENV_TIER_MAP_PATH
 from cards_runner.common.types import ClaimedCard, DaemonConfig
 from cards_runner.daemon import spawner
-from cards_runner.providers.registry import anthropic_tiers
+from cards_runner.providers.registry import credential_in_url, tiers_needing_a_key
 
 
 @pytest.fixture
@@ -70,19 +71,20 @@ def no_key(monkeypatch: pytest.MonkeyPatch) -> None:
 
 # ---- which tiers count as Anthropic -----------------------------------------
 
-def test_anthropic_tiers_follows_provider_routing() -> None:
-    hosted = anthropic_tiers({
+def test_tiers_needing_a_key_follows_provider_routing() -> None:
+    hits = tiers_needing_a_key({
         1: "ollama/qwen3:30b", 2: "vllm/x", 3: "claude-sonnet-4-6",
-        4: "anthropic/claude-opus", 5: "claude/claude-haiku", 6: "openai/gpt",
+        4: "anthropic/claude-opus", 5: "local/y", 6: "openai/gpt",
     })
-    assert hosted == [
-        (3, "claude-sonnet-4-6"), (4, "anthropic/claude-opus"),
-        (5, "claude/claude-haiku"),
+    assert hits == [
+        (3, "claude-sonnet-4-6", "anthropic"),
+        (4, "anthropic/claude-opus", "anthropic"),
+        (6, "openai/gpt", "openai"),
     ]
 
 
-def test_anthropic_tiers_empty_for_all_local() -> None:
-    assert anthropic_tiers(ALL_LOCAL) == []
+def test_tiers_needing_a_key_empty_for_keyless_local() -> None:
+    assert tiers_needing_a_key({1: "ollama/a", 2: "vllm/b", 3: "local/c"}) == []
 
 
 # ---- the CLI refusal, both directions --------------------------------------
@@ -105,7 +107,7 @@ def test_one_anthropic_tier_still_refuses_and_names_it(
     assert _cmd_start(_args()) == 2
     assert patched_daemon == []
     err = capsys.readouterr().err
-    assert "tier 5 (claude-opus-4-7)" in err
+    assert "tier 5 (claude-opus-4-7, provider anthropic)" in err
     assert "tier 1" not in err  # only the offending tier is named
 
 
@@ -176,3 +178,137 @@ def test_spawner_passes_the_tier_map_and_local_endpoint_not_keys(
     assert seen["CARDS_RUNNER_OLLAMA_BASE_URL"] == "http://ollama.invalid:11434/v1"
     assert "CARDS_RUNNER_OLLAMA_API_KEY" not in seen
     assert "ANTHROPIC_API_KEY" not in seen
+
+
+# ---- deep verify of #84: W2 (relative path), W1 (credentials), W3, W4 -------
+
+def test_a_relative_tier_map_is_pinned_absolute_for_the_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_key: None,
+    patched_daemon: list[DaemonConfig],
+) -> None:
+    # W2: the worker runs in the card worktree, not the CLI cwd. A relative
+    # path would miss there and fall through to the repo-root Claude map.
+    cli_cwd = tmp_path / "cli"
+    (cli_cwd / "maps").mkdir(parents=True)
+    _tier_map(cli_cwd / "maps", ALL_LOCAL)
+    monkeypatch.chdir(cli_cwd)
+    monkeypatch.setenv(ENV_TIER_MAP_PATH, "maps/tier_map.yaml")
+    assert _cmd_start(_args()) == 0
+    pinned = Path(os.environ[ENV_TIER_MAP_PATH])
+    assert pinned.is_absolute()
+    monkeypatch.chdir(tmp_path)  # anywhere else, as the worker would be
+    assert pinned.is_file()
+
+
+def test_a_relative_tier_map_reaches_the_spawned_worker_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_key: None,
+    patched_daemon: list[DaemonConfig],
+) -> None:
+    cli_cwd = tmp_path / "cli"
+    (cli_cwd / "maps").mkdir(parents=True)
+    _tier_map(cli_cwd / "maps", ALL_LOCAL)
+    monkeypatch.chdir(cli_cwd)
+    monkeypatch.setenv(ENV_TIER_MAP_PATH, "maps/tier_map.yaml")
+    assert _cmd_start(_args()) == 0
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    monkeypatch.chdir(worktree)
+    env = _spawn_env(tmp_path, monkeypatch)
+    assert Path(env[ENV_TIER_MAP_PATH]).is_absolute()
+    assert Path(env[ENV_TIER_MAP_PATH]).is_file()
+
+
+@pytest.mark.parametrize("with_key", [False, True])
+def test_a_tier_map_path_naming_no_file_is_refused(
+    with_key: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    patched_daemon: list[DaemonConfig], capsys: pytest.CaptureFixture[str],
+) -> None:
+    # With a key this was the silent case: the miss fell through to Claude.
+    if with_key:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-not-a-real-key")
+    else:
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv(ENV_TIER_MAP_PATH, str(tmp_path / "missing.yaml"))
+    assert _cmd_start(_args()) == 2
+    assert patched_daemon == []
+    assert "not a file" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://user:pw@ollama.invalid:11434/v1",
+        "http://user@ollama.invalid:11434/v1",
+        "http://ollama.invalid:11434/v1?api_key=abc",
+        "http://ollama.invalid:11434/v1?x=1&Token=abc",
+        "ftp://ollama.invalid/v1",
+    ],
+)
+def test_a_base_url_carrying_a_credential_is_refused(
+    url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_key: None,
+    patched_daemon: list[DaemonConfig], capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv(ENV_TIER_MAP_PATH, str(_tier_map(tmp_path, ALL_LOCAL)))
+    monkeypatch.setenv("CARDS_RUNNER_OLLAMA_BASE_URL", url)
+    assert _cmd_start(_args()) == 2
+    err = capsys.readouterr().err
+    assert "CARDS_RUNNER_OLLAMA_BASE_URL" in err
+    assert "abc" not in err and "pw" not in err  # the secret is not echoed
+
+
+def test_a_clean_base_url_with_a_harmless_query_is_allowed() -> None:
+    assert credential_in_url("http://127.0.0.1:11434/v1?timeout=30") is None
+
+
+def test_the_spawner_drops_a_credentialed_url_even_if_the_cli_was_bypassed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_key: None,
+) -> None:
+    monkeypatch.setenv(ENV_TIER_MAP_PATH, str(_tier_map(tmp_path, ALL_LOCAL)))
+    monkeypatch.setenv("CARDS_RUNNER_OLLAMA_BASE_URL", "http://u:secretpw@ollama.invalid/v1")
+    env = _spawn_env(tmp_path, monkeypatch)
+    assert "CARDS_RUNNER_OLLAMA_BASE_URL" not in env
+    assert all("secretpw" not in v for v in env.values())
+
+
+def test_every_offending_tier_is_named_not_just_the_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_key: None,
+    patched_daemon: list[DaemonConfig], capsys: pytest.CaptureFixture[str],
+) -> None:
+    # W3: mutant M8 named only the first hit and survived the 1-tier test.
+    mixed = {**ALL_LOCAL, 3: "claude-sonnet-4-6", 6: "claude-opus-4-7"}
+    monkeypatch.setenv(ENV_TIER_MAP_PATH, str(_tier_map(tmp_path, mixed)))
+    assert _cmd_start(_args()) == 2
+    err = capsys.readouterr().err
+    assert "tier 3 (claude-sonnet-4-6" in err
+    assert "tier 6 (claude-opus-4-7" in err
+
+
+@pytest.mark.parametrize("model", ["openai/gpt-x", "gemini/g-1", "azure/dep"])
+def test_a_keyed_non_anthropic_provider_is_not_keyless(
+    model: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_key: None,
+    patched_daemon: list[DaemonConfig], capsys: pytest.CaptureFixture[str],
+) -> None:
+    # W4: these pass a "not Anthropic" test but need a key the spawner
+    # never forwards, so they would fail at the first call.
+    monkeypatch.setenv(ENV_TIER_MAP_PATH, str(_tier_map(tmp_path, {**ALL_LOCAL, 2: model})))
+    assert _cmd_start(_args()) == 2
+    assert f"tier 2 ({model}" in capsys.readouterr().err
+
+
+def _spawn_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    seen: dict[str, str] = {}
+
+    def fake_spawn(args: list[str], *, env: dict[str, str], **_: object) -> object:
+        seen.update(env)
+        return object()
+
+    monkeypatch.setattr(spawner, "spawn_in_job", fake_spawn)
+    run_dir = tmp_path / "run-spawn"
+    claim = ClaimedCard(
+        card_id="c2", attempt_trace_id="a2", trace_id="t2", run_dir=run_dir,
+        worktree_path=tmp_path, card_file=run_dir / "card.md",
+    )
+    spawner.spawn_worker(
+        cfg=DaemonConfig(todo_root=tmp_path, invoker="sdk"), claim=claim, run_dir=run_dir,
+    )
+    return seen

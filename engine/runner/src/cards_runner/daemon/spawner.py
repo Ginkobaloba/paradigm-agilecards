@@ -21,6 +21,7 @@ from ..common.canonical_config import ENV_TIER_MAP_PATH
 from ..common.env_scrub import scrub_environment
 from ..common.process_group import ManagedProcess, spawn_in_job
 from ..common.types import ClaimedCard, DaemonConfig
+from ..providers.registry import LOCAL_BASE_URL_ENV, credential_in_url
 
 
 log = logging.getLogger(__name__)
@@ -111,18 +112,27 @@ def spawn_worker(
             # sets this in the daemon environment.
             "CARDS_RUNNER_USE_TOOLS",
             "CARDS_RUNNER_MAX_TOOL_TURNS",
-            # Which tier map the worker loads, and where the local
-            # providers listen. Without these the scrub drops them, so
-            # the worker silently loads the default (Claude) map while
-            # the CLI checked a local one. Endpoints only; no keys.
+            # Which tier map the worker loads. Without it the scrub drops
+            # it, so the worker silently loads the default (Claude) map
+            # while the CLI checked a local one. The CLI made it absolute
+            # (cli._pin_worker_env): the worker's cwd is the worktree.
             ENV_TIER_MAP_PATH,
-            "CARDS_RUNNER_OLLAMA_BASE_URL",
-            "CARDS_RUNNER_VLLM_BASE_URL",
-            "CARDS_RUNNER_LOCAL_BASE_URL",
         ):
             value = os.environ.get(passthrough)
             if value:
                 injected[passthrough] = value
+        # Where the keyless local providers listen. Endpoints only: a URL
+        # carrying a credential is never forwarded (the CLI refuses one at
+        # start; this guards any other caller of spawn_worker).
+        for name in LOCAL_BASE_URL_ENV:
+            url = os.environ.get(name)
+            if not url:
+                continue
+            why = credential_in_url(url)
+            if why:
+                log.error("not passing %s to the worker: %s", name, why)
+                continue
+            injected[name] = url
     if extra_env:
         injected.update(extra_env)
 

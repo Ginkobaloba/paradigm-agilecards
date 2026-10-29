@@ -9,8 +9,10 @@ secrets), with safe defaults for the well-known local ones.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 
 from .anthropic_adapter import AnthropicAdapter
 from .base import PostJson, ProviderAdapter, urllib_post_json
@@ -59,19 +61,52 @@ def split_model(model_id: str) -> tuple[str, str]:
     return "anthropic", model_id
 
 
-def anthropic_tiers(points_to_model: Mapping[int, str]) -> list[tuple[int, str]]:
-    """The `(points, model_id)` tiers that would call Anthropic.
+# Providers a worker can call with no credential at all. openai, gemini
+# and azure are NOT here: they need a key the spawner never forwards, so a
+# map using them is not keyless even though it is not Anthropic.
+KEYLESS_LOCAL_PROVIDERS: frozenset[str] = frozenset({"ollama", "vllm", "local"})
 
-    Empty means no tier of the map needs `ANTHROPIC_API_KEY`, so an
-    all-local map can start without one. Decided by `split_model`, the same
+# Their endpoints, the only provider env the spawner forwards to a worker.
+LOCAL_BASE_URL_ENV: tuple[str, ...] = tuple(
+    f"CARDS_RUNNER_{p.upper()}_BASE_URL" for p in sorted(KEYLESS_LOCAL_PROVIDERS)
+)
+
+
+def tiers_needing_a_key(points_to_model: Mapping[int, str]) -> list[tuple[int, str, str]]:
+    """The `(points, model_id, provider)` tiers a keyless worker cannot run.
+
+    Empty means every tier routes to a keyless local provider, so the map
+    can start without ANTHROPIC_API_KEY. Decided by `split_model`, the same
     routing `build_adapter` uses, so this cannot drift from where a call
     actually goes.
     """
-    return [
-        (points, model)
-        for points, model in sorted(points_to_model.items())
-        if split_model(model)[0] == "anthropic"
-    ]
+    hits = []
+    for points, model in sorted(points_to_model.items()):
+        provider = split_model(model)[0]
+        if provider not in KEYLESS_LOCAL_PROVIDERS:
+            hits.append((points, model, provider))
+    return hits
+
+
+_CREDENTIAL_QUERY = re.compile(r"key|token|secret|pass|auth|sig", re.IGNORECASE)
+
+
+def credential_in_url(url: str) -> str | None:
+    """Why `url` must not be passed to a worker, or None if it is clean.
+
+    A base URL is forwarded to the worker verbatim, past the env scrub
+    that exists to keep credentials out, so it may carry none: no
+    `user:pw@` userinfo, and no query parameter that looks like a secret.
+    """
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https"):
+        return "scheme must be http or https"
+    if parts.username is not None or parts.password is not None:
+        return "carries userinfo (user:password@)"
+    for name, _ in parse_qsl(parts.query, keep_blank_values=True):
+        if _CREDENTIAL_QUERY.search(name):
+            return f"carries a credential-like query parameter ({name})"
+    return None
 
 
 def _env(provider: str, suffix: str) -> str | None:
