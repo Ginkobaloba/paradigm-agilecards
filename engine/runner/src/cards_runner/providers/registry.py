@@ -9,6 +9,7 @@ secrets), with safe defaults for the well-known local ones.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from typing import Any
 
 from .anthropic_adapter import AnthropicAdapter
@@ -56,6 +57,21 @@ def split_model(model_id: str) -> tuple[str, str]:
         if low.startswith(prefix):
             return provider, model_id[len(prefix):]
     return "anthropic", model_id
+
+
+def anthropic_tiers(points_to_model: Mapping[int, str]) -> list[tuple[int, str]]:
+    """The `(points, model_id)` tiers that would call Anthropic.
+
+    Empty means no tier of the map needs `ANTHROPIC_API_KEY`, so an
+    all-local map can start without one. Decided by `split_model`, the same
+    routing `build_adapter` uses, so this cannot drift from where a call
+    actually goes.
+    """
+    return [
+        (points, model)
+        for points, model in sorted(points_to_model.items())
+        if split_model(model)[0] == "anthropic"
+    ]
 
 
 def _env(provider: str, suffix: str) -> str | None:

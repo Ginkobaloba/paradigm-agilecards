@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 
 import cards_runner
+from ..common.canonical_config import ENV_TIER_MAP_PATH
 from ..common.env_scrub import scrub_environment
 from ..common.process_group import ManagedProcess, spawn_in_job
 from ..common.types import ClaimedCard, DaemonConfig
@@ -92,9 +93,11 @@ def spawn_worker(
         if api_key:
             injected["ANTHROPIC_API_KEY"] = api_key
         else:
-            log.error(
-                "invoker=sdk but ANTHROPIC_API_KEY is not set in the "
-                "daemon environment; the SDK worker will fail to start"
+            # The CLI already refused unless every tier is non-Anthropic
+            # (cli._anthropic_key_problem), so this is an all-local run.
+            log.info(
+                "invoker=sdk without ANTHROPIC_API_KEY; only "
+                "non-Anthropic tiers can run"
             )
         # Optional executor knobs: pass through only when set, so the
         # worker's `SdkInvoker.from_env` defaults otherwise apply.
@@ -108,6 +111,14 @@ def spawn_worker(
             # sets this in the daemon environment.
             "CARDS_RUNNER_USE_TOOLS",
             "CARDS_RUNNER_MAX_TOOL_TURNS",
+            # Which tier map the worker loads, and where the local
+            # providers listen. Without these the scrub drops them, so
+            # the worker silently loads the default (Claude) map while
+            # the CLI checked a local one. Endpoints only; no keys.
+            ENV_TIER_MAP_PATH,
+            "CARDS_RUNNER_OLLAMA_BASE_URL",
+            "CARDS_RUNNER_VLLM_BASE_URL",
+            "CARDS_RUNNER_LOCAL_BASE_URL",
         ):
             value = os.environ.get(passthrough)
             if value:

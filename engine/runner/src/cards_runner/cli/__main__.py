@@ -24,12 +24,14 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ..common.canonical_config import load_tier_map
 from ..common.envfile import ENV_FILE_VAR, load_dotenv
 from ..common.locks import FileLock, pid_alive
 from ..common.types import DaemonConfig, RuntimePaths
 from ..daemon import llm_capability
 from ..daemon.daemon import Daemon, DaemonAlreadyRunning
 from ..daemon.orphan import force_reclaim
+from ..providers.registry import anthropic_tiers
 from ..store import CardStatus, build_repository, default_store_spec
 from ..store.repository import CardRepository
 
@@ -338,6 +340,31 @@ def _open_store(args: argparse.Namespace) -> CardRepository:
     return repo
 
 
+def _anthropic_key_problem(args: argparse.Namespace) -> str | None:
+    """Why this `start` needs ANTHROPIC_API_KEY and lacks it, or None.
+
+    The key may be absent only when nothing would call Anthropic: the
+    reasoning-only `sdk` executor, no Claude reviewer, and every tier of
+    the map the WORKER will load resolving to a non-Anthropic provider
+    (the worker calls `load_tier_map()` with the same env, which the
+    spawner passes through). `sdk-tools` always needs it: the tool loop
+    is Anthropic-only, as the OpenAI-compatible adapter has no tool turns.
+    """
+    if args.invoker not in ("sdk", "sdk-tools") or os.environ.get("ANTHROPIC_API_KEY"):
+        return None
+    if args.invoker == "sdk-tools":
+        return "--invoker sdk-tools needs ANTHROPIC_API_KEY (the tool loop is Anthropic-only)"
+    for flag in ("sibling_reviewer", "amendment_reviewer"):
+        if getattr(args, flag, False):
+            return f"--{flag.replace('_', '-')} uses a Claude reviewer and needs ANTHROPIC_API_KEY"
+    tier_map = load_tier_map()
+    hosted = anthropic_tiers(tier_map.points_to_model_map())
+    if hosted:
+        named = ", ".join(f"tier {points} ({model})" for points, model in hosted)
+        return f"--invoker sdk needs ANTHROPIC_API_KEY: {named} in {tier_map.source} routes to Anthropic"
+    return None
+
+
 def _cmd_start(args: argparse.Namespace) -> int:
     cfg_kwargs: dict[str, Any] = dict(
         todo_root=args.todo_root,
@@ -378,9 +405,10 @@ def _cmd_start(args: argparse.Namespace) -> int:
         if value is not None:
             cfg_kwargs[cfg_name] = value
     cfg = DaemonConfig(**cfg_kwargs)
-    if args.invoker in ("sdk", "sdk-tools") and not os.environ.get("ANTHROPIC_API_KEY"):
+    key_problem = _anthropic_key_problem(args)
+    if key_problem is not None:
         print(
-            "error: --invoker sdk/sdk-tools needs ANTHROPIC_API_KEY in "
+            f"error: {key_problem}; set ANTHROPIC_API_KEY in "
             "the environment (or in a gitignored .env in the working "
             f"directory, or the file named by {ENV_FILE_VAR})",
             file=sys.stderr,
