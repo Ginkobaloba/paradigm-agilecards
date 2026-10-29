@@ -521,3 +521,41 @@ def test_trust_repo_cli_lifts_a_quarantine(tmp_path: Path, capsys: pytest.Captur
     assert main(["trust-repo", "--todo-root", str(todo), str(work)]) == 0
     assert "quarantine lifted" in capsys.readouterr().out
     git_safety.assert_trusted(work)
+
+
+def test_the_credential_helper_list_is_reset_before_gh_is_pinned() -> None:
+    env = git_safety.hardened_git_env({"PATH": "x"}, gh_path="C:/gh.exe")
+    pairs = [(env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"])
+             for i in range(int(env["GIT_CONFIG_COUNT"]))]
+    helpers = [v for k, v in pairs if k == "credential.helper"]
+    assert helpers[0] == ""  # drops every helper a config file named
+    assert helpers[1:] == ['!"C:/gh.exe" auth git-credential']
+    no_gh = git_safety.hardened_git_env({"PATH": "x"}, keep_gh_credentials=False)
+    assert [no_gh[f"GIT_CONFIG_VALUE_{i}"] for i in range(int(no_gh["GIT_CONFIG_COUNT"]))
+            if no_gh[f"GIT_CONFIG_KEY_{i}"] == "credential.helper"] == [""]
+
+
+@needs_git
+def test_git_cannot_walk_up_from_a_worktree_whose_dot_git_was_deleted(tmp_path: Path) -> None:
+    parent = tmp_path / "parent"
+    _git(tmp_path, "init", str(parent))
+    child = parent / "child"
+    child.mkdir()
+    # Positive control: plain git in a dir with no .git finds the parent repo.
+    assert _git(child, "rev-parse", "--show-toplevel").strip()
+    proc = git_safety.run_git([GIT, "rev-parse", "--show-toplevel"], cwd=child)
+    assert proc.returncode != 0 and "not a git repository" in proc.stderr.lower()
+
+
+@pytest.mark.parametrize("args", [
+    ["config", "--global", "--get", "user.email"],
+    ["config", "-f", "C:/elsewhere/secrets.ini", "--list"],
+    ["config", "--file", "C:/elsewhere/secrets.ini", "--get", "a.b"],
+    ["config", "--system", "--list"],
+    ["config", "get", "--global", "user.email"],
+    ["config", "list", "--file=C:/elsewhere/secrets.ini"],
+])
+def test_the_git_tool_reads_only_the_repos_own_config(args: list[str]) -> None:
+    # F10: a read of ANOTHER config file is a way to read arbitrary files.
+    assert _git_config_is_read_only(args[1:]) is False
+    assert _git_config_is_read_only(["--get", "user.email"]) is True  # control

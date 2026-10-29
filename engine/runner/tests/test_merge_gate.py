@@ -596,3 +596,52 @@ def test_daemon_blocks_before_verifying_when_the_git_surface_changed(
         # control: an unchanged surface routes exactly as before
         assert verified == [card_id]
         assert card.status == CardStatus.DONE.value
+
+
+def test_prepare_and_spawn_baselines_once_and_a_later_card_cannot_absorb_a_plant(
+    repo: SqliteRepository, paths: RuntimePaths, todo_root: Path,
+    store_spec: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # F3/F6: the baseline is taken at the daemon's first touch of the
+    # project, before any executor ran, and never re-taken at claim. So a
+    # plant left by card A blocks card A AND every later card from that repo.
+    from cards_runner.common.types import EXIT_CLEAN, WORKER_RESULT_NAME
+
+    git = shutil.which("git")
+    assert git is not None
+    project = todo_root.parent / "proj-spawn"
+    project.mkdir()
+    def _g(*a: str) -> None:
+        subprocess.run([git, *a], cwd=project, check=True, capture_output=True)
+    _g("init", "-b", "main")
+    _g("-c", "user.email=t@example.test", "-c", "user.name=t",
+       "commit", "--allow-empty", "-m", "init")
+
+    for cid in ("bTST-MG-spawnA", "bTST-MG-spawnB"):
+        text = _card_text(cid).replace("project: /tmp/test-project", f"project: {project.as_posix()}")
+        repo.create_card(card_text_to_record(text, card_id_fallback=cid))
+    cfg = replace(_cfg_pr_on(todo_root, store_spec), skip_worktree=False)
+    monkeypatch.setattr("cards_runner.daemon.daemon.spawn_worker", lambda **kw: object())
+    gh = FakeGhRunner()
+    daemon = Daemon(cfg, repo=repo, gh=gh)
+
+    claim_a = _claim(repo, paths, "bTST-MG-spawnA")
+    assert git_safety.trust_record(project / ".git") is None
+    assert daemon._prepare_and_spawn(claim_a) is True
+    assert git_safety.trust_record((project / ".git").resolve()) is not None  # baselined at prep
+    assert (claim_a.worktree_path / ".git").is_file()  # a real worktree
+
+    # Card A's executor plants a hook in the shared .git.
+    (project / ".git" / "hooks" / "post-checkout").write_text("#!/bin/sh\nexit 0\n", newline="\n")
+    (claim_a.run_dir / WORKER_RESULT_NAME).write_text('{"exit_code": 0}', encoding="utf-8")
+    daemon._post_worker_exit(daemon._workers[claim_a.attempt_trace_id], EXIT_CLEAN)
+    card_a = repo.get_card("bTST-MG-spawnA")
+    assert card_a is not None and card_a.status == CardStatus.BLOCKED.value
+    assert gh.calls == []
+
+    # Card B: its claim must not re-baseline over the plant.
+    claim_b = _claim(repo, paths, "bTST-MG-spawnB")
+    assert daemon._prepare_and_spawn(claim_b) is False
+    card_b = repo.get_card("bTST-MG-spawnB")
+    assert card_b is not None and card_b.status == CardStatus.BLOCKED.value  # not a backlog livelock
+    assert not (claim_b.worktree_path / ".git").exists()  # no git ran for it
