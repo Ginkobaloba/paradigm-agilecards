@@ -18,7 +18,7 @@ from cards_runner.cli.__main__ import _cmd_start
 from cards_runner.common.canonical_config import ENV_TIER_MAP_PATH
 from cards_runner.common.types import ClaimedCard, DaemonConfig
 from cards_runner.daemon import spawner
-from cards_runner.providers.registry import credential_in_url, tiers_needing_a_key
+from cards_runner.providers.registry import base_url_problem, tiers_needing_a_key
 
 
 @pytest.fixture
@@ -253,11 +253,35 @@ def test_a_base_url_carrying_a_credential_is_refused(
     assert _cmd_start(_args()) == 2
     err = capsys.readouterr().err
     assert "CARDS_RUNNER_OLLAMA_BASE_URL" in err
-    assert "abc" not in err and "pw" not in err  # the secret is not echoed
+    # X1: the var is named, no part of the URL is echoed (not even the host)
+    assert "abc" not in err and "pw" not in err and "ollama.invalid" not in err and "11434" not in err
 
 
-def test_a_clean_base_url_with_a_harmless_query_is_allowed() -> None:
-    assert credential_in_url("http://127.0.0.1:11434/v1?timeout=30") is None
+@pytest.mark.parametrize(
+    "url",
+    ["http://127.0.0.1:11434/v1", "https://ollama.local:8443/v1/", "http://[::1]:8000/v1", "http://gpu-box"],
+)
+def test_a_plain_local_endpoint_is_allowed(url: str) -> None:
+    assert base_url_problem(url) is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # X2: an allowlist, so these go regardless of the parameter's name
+        "http://127.0.0.1:11434/v1?timeout=30",
+        "http://127.0.0.1:11434/v1?jwt=eyJabc",
+        "http://127.0.0.1:11434/v1?bearer=abc",
+        "http://127.0.0.1:11434/v1?sv=2024&sig=abc",
+        "http://127.0.0.1:11434/v1#tok=abc",
+        "http://127.0.0.1:11434/v1;sas=abc",
+        "http://:pw@127.0.0.1/v1",
+        "http://127.0.0.1:notaport/v1",
+        "http://127.0.0.1/v1?",
+    ],
+)
+def test_anything_beyond_host_port_path_is_refused(url: str) -> None:
+    assert base_url_problem(url) is not None
 
 
 def test_the_spawner_drops_a_credentialed_url_even_if_the_cli_was_bypassed(
@@ -312,3 +336,88 @@ def _spawn_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str
         cfg=DaemonConfig(todo_root=tmp_path, invoker="sdk"), claim=claim, run_dir=run_dir,
     )
     return seen
+
+# ---- deep verify of #84 r2: X3 (pin at worker load), X4, X5 ----------------
+
+def test_a_set_tier_map_var_is_a_pin_at_worker_load_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # X3: deleted or broken AFTER start, the worker must fail, not load Claude.
+    from cards_runner.common.canonical_config import CanonicalConfigMissing, load_tier_map
+
+    path = _tier_map(tmp_path, ALL_LOCAL)
+    monkeypatch.setenv(ENV_TIER_MAP_PATH, str(path))
+    assert load_tier_map().model_for(1) == "ollama/qwen3:30b"
+    path.write_text("tiers: [this is not a mapping\n", encoding="utf-8")
+    with pytest.raises(CanonicalConfigMissing):
+        load_tier_map()
+    path.unlink()
+    with pytest.raises(CanonicalConfigMissing):
+        load_tier_map()
+
+
+def test_an_unset_tier_map_var_still_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    from cards_runner.common.canonical_config import load_tier_map
+
+    monkeypatch.delenv(ENV_TIER_MAP_PATH, raising=False)
+    assert load_tier_map().tiers  # repo-root or embedded map, no raise
+
+
+def test_a_broken_pinned_map_is_refused_at_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    patched_daemon: list[DaemonConfig], capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-not-a-real-key")
+    broken = tmp_path / "broken.yaml"
+    broken.write_text("version: 1\n", encoding="utf-8")  # no tiers section
+    monkeypatch.setenv(ENV_TIER_MAP_PATH, str(broken))
+    assert _cmd_start(_args()) == 2
+    assert patched_daemon == []
+    assert ENV_TIER_MAP_PATH in capsys.readouterr().err
+
+
+def test_spawn_worker_absolutizes_a_relative_map_path_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_key: None,
+) -> None:
+    # X5: a direct caller of spawn_worker, with no CLI in front of it.
+    (tmp_path / "maps").mkdir()
+    _tier_map(tmp_path / "maps", ALL_LOCAL)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(ENV_TIER_MAP_PATH, "maps/tier_map.yaml")
+    env = _spawn_env(tmp_path, monkeypatch)
+    assert Path(env[ENV_TIER_MAP_PATH]) == (tmp_path / "maps" / "tier_map.yaml").resolve()
+
+
+def test_the_worker_passthrough_set_is_exactly_this(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # X4: pins the set. Adding GH_TOKEN, an *_API_KEY, or any new name to
+    # what the worker receives must be a deliberate change to this test.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-not-a-real-key")
+    for name in (
+        "CARDS_RUNNER_CASCADE_THRESHOLD", "CARDS_RUNNER_MAX_OUTPUT_TOKENS",
+        "CARDS_RUNNER_MAX_ESCALATIONS", "CARDS_RUNNER_PRICING_JSON",
+        "CARDS_RUNNER_USE_TOOLS", "CARDS_RUNNER_MAX_TOOL_TURNS",
+    ):
+        monkeypatch.setenv(name, "1")
+    monkeypatch.setenv(ENV_TIER_MAP_PATH, str(_tier_map(tmp_path, ALL_LOCAL)))
+    for name in ("CARDS_RUNNER_OLLAMA_BASE_URL", "CARDS_RUNNER_VLLM_BASE_URL", "CARDS_RUNNER_LOCAL_BASE_URL"):
+        monkeypatch.setenv(name, "http://127.0.0.1:11434/v1")
+    # decoys that must never pass
+    for name in ("GH_TOKEN", "GITHUB_TOKEN", "OPENAI_API_KEY", "GEMINI_API_KEY",
+                 "CARDS_RUNNER_OLLAMA_API_KEY", "CARDS_RUNNER_OPENAI_BASE_URL",
+                 "CARDS_RUNNER_SOMETHING_NEW", "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.setenv(name, "decoy-not-a-real-secret")
+    env = _spawn_env(tmp_path, monkeypatch)
+    assert {k for k in env if k.startswith("CARDS_RUNNER_") or k.startswith("ANTHROPIC_")} == {
+        "CARDS_RUNNER_CARD_PATH", "CARDS_RUNNER_WORKTREE", "CARDS_RUNNER_ATTEMPT_TRACE_ID",
+        "CARDS_RUNNER_TRACE_ID", "CARDS_RUNNER_HEARTBEAT_INTERVAL_SEC",
+        "CARDS_RUNNER_STUB_SLEEP_SEC", "CARDS_RUNNER_RUN_DIR", "CARDS_RUNNER_INVOKER",
+        "ANTHROPIC_API_KEY",
+        "CARDS_RUNNER_CASCADE_THRESHOLD", "CARDS_RUNNER_MAX_OUTPUT_TOKENS",
+        "CARDS_RUNNER_MAX_ESCALATIONS", "CARDS_RUNNER_PRICING_JSON",
+        "CARDS_RUNNER_USE_TOOLS", "CARDS_RUNNER_MAX_TOOL_TURNS",
+        ENV_TIER_MAP_PATH,
+        "CARDS_RUNNER_OLLAMA_BASE_URL", "CARDS_RUNNER_VLLM_BASE_URL", "CARDS_RUNNER_LOCAL_BASE_URL",
+    }
+    assert "decoy-not-a-real-secret" not in env.values()

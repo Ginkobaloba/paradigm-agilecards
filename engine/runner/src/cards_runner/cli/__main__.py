@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..common.canonical_config import ENV_TIER_MAP_PATH, load_tier_map
+from ..common.canonical_config import ENV_TIER_MAP_PATH, CanonicalConfigMissing, load_tier_map
 from ..common.envfile import ENV_FILE_VAR, load_dotenv
 from ..common.locks import FileLock, pid_alive
 from ..common.types import DaemonConfig, RuntimePaths
@@ -34,7 +34,7 @@ from ..daemon.orphan import force_reclaim
 from ..providers.registry import (
     KEYLESS_LOCAL_PROVIDERS,
     LOCAL_BASE_URL_ENV,
-    credential_in_url,
+    base_url_problem,
     tiers_needing_a_key,
 )
 from ..store import CardStatus, build_repository, default_store_spec
@@ -396,10 +396,14 @@ def _pin_worker_env() -> str | None:
         if not path.is_file():
             return f"{ENV_TIER_MAP_PATH} points at {path}, which is not a file"
         os.environ[ENV_TIER_MAP_PATH] = str(path)
+        try:
+            load_tier_map()  # a set var is a pin: broken YAML raises, never falls back
+        except CanonicalConfigMissing as exc:
+            return f"{ENV_TIER_MAP_PATH}: {exc}"
     for name in LOCAL_BASE_URL_ENV:
         url = os.environ.get(name)
         if url:
-            why = credential_in_url(url)
+            why = base_url_problem(url)
             if why:
                 return f"{name} {why}; it reaches the worker, so it must be an endpoint only"
     return None

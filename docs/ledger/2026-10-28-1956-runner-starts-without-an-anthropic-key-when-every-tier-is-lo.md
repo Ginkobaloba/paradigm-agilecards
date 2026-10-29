@@ -9,4 +9,10 @@
   - W3: a test now names two offending tiers.
   - W4: the skip is narrowed from "not Anthropic" to keyless local providers only (`KEYLESS_LOCAL_PROVIDERS`: ollama, vllm, local), since openai/gemini/azure need keys the spawner never forwards.
   - Suite 758/0; six more mutants (pin removed, missing-file guard removed, CLI and spawner URL checks removed, first-tier-only naming, not-Anthropic predicate) each turn a test red.
+- **Deep verify r2 at d13f402: PASS WITH WARNINGS, fixed in the next commit.**
+  - X3: a SET `CARDS_RUNNER_TIER_MAP_YAML` is now a pin in `load_tier_map`: only that file counts, and a missing or broken one raises `CanonicalConfigMissing` instead of falling back. Before this, a map deleted or broken while the daemon ran turned the next worker into a Claude worker. Fallback remains for an unset var. The CLI also loads the pinned map once at start, so broken YAML is refused up front.
+  - X2/X1: the base-URL check is an allowlist (`base_url_problem`: http(s), host[:port], path only; any userinfo, query, fragment or `;` refused, whatever it is named). The refusal names the env var and never any part of the URL.
+  - X4: a test pins the exact `CARDS_RUNNER_*`/`ANTHROPIC_*` set a worker receives, with decoys (GH_TOKEN, *_API_KEY, an unknown CARDS_RUNNER_ var) that must not pass.
+  - X5: `spawn_worker` absolutizes the map path itself, covering direct callers.
+  - Suite 775/0, ruff clean; eight more mutants each turn a test red.
 - **Refs:** cli/__main__.py `_anthropic_key_problem`; providers/registry.py `anthropic_tiers`; daemon/spawner.py passthrough; tests/test_local_map_no_key.py; C:\dev\_status\LOCAL_MODEL_AND_RAM_PLAN_2026-10-28.md

@@ -21,7 +21,7 @@ from ..common.canonical_config import ENV_TIER_MAP_PATH
 from ..common.env_scrub import scrub_environment
 from ..common.process_group import ManagedProcess, spawn_in_job
 from ..common.types import ClaimedCard, DaemonConfig
-from ..providers.registry import LOCAL_BASE_URL_ENV, credential_in_url
+from ..providers.registry import LOCAL_BASE_URL_ENV, base_url_problem
 
 
 log = logging.getLogger(__name__)
@@ -120,6 +120,11 @@ def spawn_worker(
         ):
             value = os.environ.get(passthrough)
             if value:
+                if passthrough == ENV_TIER_MAP_PATH:
+                    # Absolute here too, not only in the CLI, so any direct
+                    # caller of spawn_worker is covered: the worker's cwd is
+                    # the worktree, where a relative path would miss.
+                    value = str(Path(value).expanduser().resolve())
                 injected[passthrough] = value
         # Where the keyless local providers listen. Endpoints only: a URL
         # carrying a credential is never forwarded (the CLI refuses one at
@@ -128,7 +133,7 @@ def spawn_worker(
             url = os.environ.get(name)
             if not url:
                 continue
-            why = credential_in_url(url)
+            why = base_url_problem(url)
             if why:
                 log.error("not passing %s to the worker: %s", name, why)
                 continue

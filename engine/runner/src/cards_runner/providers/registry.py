@@ -12,7 +12,7 @@ import os
 import re
 from collections.abc import Mapping
 from typing import Any
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import urlsplit
 
 from .anthropic_adapter import AnthropicAdapter
 from .base import PostJson, ProviderAdapter, urllib_post_json
@@ -88,24 +88,35 @@ def tiers_needing_a_key(points_to_model: Mapping[int, str]) -> list[tuple[int, s
     return hits
 
 
-_CREDENTIAL_QUERY = re.compile(r"key|token|secret|pass|auth|sig", re.IGNORECASE)
+_HOST_PORT = re.compile(r"^[A-Za-z0-9.\-]+(:[0-9]{1,5})?$|^\[[0-9A-Fa-f:.]+\](:[0-9]{1,5})?$")
 
 
-def credential_in_url(url: str) -> str | None:
+def base_url_problem(url: str) -> str | None:
     """Why `url` must not be passed to a worker, or None if it is clean.
 
-    A base URL is forwarded to the worker verbatim, past the env scrub
-    that exists to keep credentials out, so it may carry none: no
-    `user:pw@` userinfo, and no query parameter that looks like a secret.
+    An ALLOWLIST, not a list of suspicious names: a base URL is forwarded
+    to the worker verbatim, past the env scrub that exists to keep
+    credentials out, and a local endpoint is only ever
+    `http(s)://host[:port][/path]`. So any userinfo, query, fragment or
+    `;` parameter is refused outright, whatever it is called (key, jwt,
+    bearer, sas, ...). The reasons never quote the URL.
     """
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "is not a parseable URL"
     if parts.scheme not in ("http", "https"):
-        return "scheme must be http or https"
-    if parts.username is not None or parts.password is not None:
-        return "carries userinfo (user:password@)"
-    for name, _ in parse_qsl(parts.query, keep_blank_values=True):
-        if _CREDENTIAL_QUERY.search(name):
-            return f"carries a credential-like query parameter ({name})"
+        return "must use http or https"
+    if "@" in parts.netloc:
+        return "must not carry userinfo"
+    if not _HOST_PORT.match(parts.netloc):
+        return "must name only a host and optional port"
+    if parts.query or "?" in url:
+        return "must not carry a query string"
+    if parts.fragment or "#" in url:
+        return "must not carry a fragment"
+    if ";" in parts.path:
+        return "must not carry ';' parameters"
     return None
 
 
