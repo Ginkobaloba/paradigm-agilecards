@@ -6,7 +6,9 @@ both negative controls, through the real verifier and real pytest.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import shutil
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -136,15 +138,90 @@ def test_the_verifier_env_is_the_protocol_one(monkeypatch: pytest.MonkeyPatch) -
     assert len(env["PATH"].split(";")) == 2
 
 
-def test_the_frozen_tree_check(tmp_path: Path) -> None:
+def test_the_pinned_digest_is_the_exam_on_disk() -> None:
     assert rb.frozen_tree_problems() == []
-    stray = rb.CARDS / "zz-unfrozen.md"
-    stray.write_text("---\nid: zz\n---\n", encoding="utf-8")
+    assert len(rb.exam_files()) == 55 and "canary/test_canary.py" in rb.exam_files()
+    assert not any(p.startswith("harness/") for p in rb.exam_files())
+
+
+@pytest.fixture
+def exam_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A byte copy of the exam, outside git, that main() is pointed at."""
+    bench = tmp_path / "bench"
+    shutil.copytree(rb.BENCH, bench, ignore=shutil.ignore_patterns("harness"))
+    monkeypatch.setattr(rb, "BENCH", bench)
+    monkeypatch.setattr(rb, "scorer_problems", lambda: [])
+    monkeypatch.setattr(rb, "results_problems", lambda: [])
+    return bench
+
+
+def _crlf(path: Path) -> None:
+    path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+
+
+TREE_EDITS = {
+    "edit a tracked card": lambda b: (b / "cards/bk-01.md").write_text(
+        (b / "cards/bk-01.md").read_text(encoding="utf-8") + "\nHint: negate first.\n",
+        encoding="utf-8"),
+    "delete a card": lambda b: (b / "cards/bk-12.md").unlink(),
+    "delete a control": lambda b: (b / "cards/bk-04.md").unlink(),
+    "CRLF-rewrite PROTOCOL.md": lambda b: _crlf(b / "PROTOCOL.md"),
+    "edit the system prompt": lambda b: (b / "SYSTEM_PROMPT.txt").write_text("Be brief.\n"),
+    "edit a seed file": lambda b: (b / "seed_repo/tally/money.py").write_text("x = 1\n"),
+    "edit a reference solution": lambda b: (b / "solutions/bk-01/tally/money.py").write_text("\n"),
+    "edit the canary": lambda b: (b / "canary/test_canary.py").write_text("def test_x(): pass\n"),
+    "add an untracked card": lambda b: (b / "cards/zz.md").write_text("---\nid: zz\n---\n"),
+    "plant a cache file in the seed": lambda b: (
+        (b / "seed_repo/tally/__pycache__").mkdir(),
+        (b / "seed_repo/tally/__pycache__/money.cpython-311.pyc").write_bytes(b"\0")),
+    "rename a card": lambda b: (b / "cards/bk-07.md").rename(b / "cards/bk-07x.md"),
+}
+
+
+@pytest.mark.parametrize("edit", TREE_EDITS, ids=list(TREE_EDITS))
+def test_main_refuses_any_change_to_the_exam(edit: str, exam_copy: Path,
+                                            monkeypatch: pytest.MonkeyPatch,
+                                            capsys: pytest.CaptureFixture[str]) -> None:
+    assert rb.exam_digest(exam_copy) == rb.EXAM_DIGEST  # control: the copy is the exam
+    TREE_EDITS[edit](exam_copy)
+    monkeypatch.setattr(rb, "run_arm", lambda **kw: pytest.fail("reached run_arm"))
+    assert rb.main(["--arm", "A", "--no-lease"]) == 2
+    assert "the exam is not the frozen one" in capsys.readouterr().out
+
+
+def test_main_reaches_the_arm_on_the_unedited_copy(exam_copy: Path,
+                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    """The positive control for the refusals above."""
+    reached = []
+    monkeypatch.setattr(rb, "run_arm", lambda **kw: reached.append(kw) or {"arm_valid": True})
+    monkeypatch.setattr(rb, "render_md", lambda s: "")
+    assert rb.main(["--arm", "A", "--no-lease"]) == 0
+    assert reached and reached[0]["arm"] == "A"
+
+
+def test_harness_and_runner_edits_refuse_and_ignored_results_do_not() -> None:
+    assert not any("zz_planted" in p for p in rb.scorer_problems())
+    planted = rb.HERE / "zz_planted.py"
+    ignored = rb.HERE / "results" / "zz_planted.txt"
+    ignored.parent.mkdir(exist_ok=True)
+    planted.write_text("x = 1\n")
+    ignored.write_text("x\n")
     try:
-        assert any("zz-unfrozen.md" in p for p in rb.frozen_tree_problems())
+        problems = rb.scorer_problems()
+        assert any("zz_planted.py" in p for p in problems)
+        assert not any("zz_planted.txt" in p for p in problems)
     finally:
-        stray.unlink()
-    assert rb.frozen_tree_problems() == []
+        planted.unlink()
+        ignored.unlink()
+
+
+def test_results_from_another_exam_refuse(tmp_path: Path) -> None:
+    (tmp_path / "A-1").mkdir()
+    (tmp_path / "A-1" / "runs.jsonl").write_text(json.dumps({"exam_digest": rb.EXAM_DIGEST}) + "\n")
+    assert rb.results_problems(tmp_path) == []
+    (tmp_path / "A-0").mkdir()
+    (tmp_path / "A-0" / "runs.jsonl").write_text(json.dumps({"exam_freeze": "f814f9c"}) + "\n")
+    assert rb.results_problems(tmp_path) == ["A-0: exam_digest None"]
 
 
 def test_the_refusal_heuristic_both_ways() -> None:
@@ -246,16 +323,19 @@ def test_a_decoy_in_think_does_not_count_against_the_real_answer(tmp_path: Path)
     assert summary["inline_think_runs"] == 1
 
 
-def test_every_row_and_the_summary_carry_both_commits(tmp_path: Path) -> None:
+def test_every_row_and_the_summary_carry_the_exam_and_the_scorer(tmp_path: Path) -> None:
     cards = [c for c in rb.load_cards() if c.card_id == "bk-01"]
     summary = _run(tmp_path, lambda user: "nothing", cards=cards)
-    head, _ = rb.verifier_commit()
-    for line in (tmp_path / "out" / "runs.jsonl").read_text().splitlines():
-        row = json.loads(line)
-        assert row["exam_freeze"] == rb.FREEZE_COMMIT and row["verifier_commit"] == head
-    assert summary["exam_freeze"] == rb.FREEZE_COMMIT and summary["verifier_commit"] == head
+    head = rb._git("rev-parse", "HEAD").strip()
+    scorer = {name: hashlib.sha256((rb.HERE / name).read_bytes()).hexdigest()
+              for name in ("run_bakeoff.py", "reply_parser.py")}
+    for item in [json.loads(line) for line in
+                 (tmp_path / "out" / "runs.jsonl").read_text().splitlines()] + [summary]:
+        assert item["exam_digest"] == rb.EXAM_DIGEST and item["exam_version"] == "v2"
+        assert item["repo_head"] == head and item["scorer"] == scorer
+        assert item["pytest"] and item["python"]
     md = (tmp_path / "out" / "summary.md").read_text(encoding="utf-8")
-    assert rb.FREEZE_COMMIT in md and head in md
+    assert rb.EXAM_DIGEST in md and head in md
 
 
 def test_an_arm_is_pinned_to_its_tag(capsys: pytest.CaptureFixture[str]) -> None:

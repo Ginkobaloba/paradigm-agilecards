@@ -47,9 +47,14 @@ SYSTEM_PROMPT = BENCH / "SYSTEM_PROMPT.txt"
 RUNNER_SRC = BENCH.parents[1] / "runner" / "src"
 WITH_LEASE = Path(r"C:\dev\paradigm-ops\tools\gpu\with_lease.py")
 
-# The exam's freeze: 8447e14, moved to amendment A1 (PROTOCOL.md) before any
-# model output existed.
-FREEZE_COMMIT = "f814f9c7860f3cfcc5dd7d8bb934735fbe14b193"
+# PROTOCOL.md v2 "Exam identity": the content digest of every exam file on
+# disk (everything here but harness/). Frozen at 2594c81, pushed before any
+# arm ran (server push time in README.md). A digest, not a commit, so it
+# survives a squash or rebase merge.
+EXAM_VERSION = "v2"
+EXAM_DIGEST = "b7d43b25d8e0b05595f5db761c5bdc65f529b65990f26adf343b3552be4205df"
+# The harness files that decide a score; their hashes label every result.
+SCORER_FILES = ("run_bakeoff.py", "reply_parser.py")
 # The arms, exactly as given to Drew (Daedalus, 2026-10-29). B and E share a
 # quant family so B vs E isolates the abliteration.
 ARMS = {
@@ -77,35 +82,83 @@ from reply_parser import ApplyError, apply_blocks, parse_reply  # noqa: E402
 # ---- the frozen exam ----------------------------------------------------
 
 
-def _git(*args: str) -> str:
-    return subprocess.run(["git", *args], cwd=BENCH, check=True, capture_output=True,
-                          text=True).stdout
+def _git(*args: str, cwd: Path | None = None, stdin: str | None = None) -> str:
+    return subprocess.run(["git", *args], cwd=cwd or HERE, check=True, capture_output=True,
+                          text=True, input=stdin).stdout
 
 
-def frozen_tree_problems(commit: str = FREEZE_COMMIT) -> list[str]:
+def exam_files(bench: Path | None = None) -> list[str]:
+    """Every file under the bench but harness/, from disk (not git), so an
+    untracked, ignored or cache file is part of what is checked."""
+    bench = bench or BENCH
+    return sorted(p.relative_to(bench).as_posix() for p in bench.rglob("*")
+                  if p.is_file() and p.relative_to(bench).parts[0] not in UNFROZEN)
+
+
+def exam_manifest(bench: Path | None = None) -> dict[str, str]:
+    """{path: git blob id of the bytes on disk}. `--no-filters` hashes the raw
+    bytes, which is what the model sees (.gitattributes turns conversion off,
+    so this equals the committed blob on every machine)."""
+    bench = bench or BENCH
+    paths = exam_files(bench)
+    # Absolute paths: inside a repo git reads --stdin-paths from the top level.
+    blobs = _git("hash-object", "--no-filters", "--stdin-paths", cwd=bench,
+                 stdin="".join(f"{bench / p}\n" for p in paths)).split()
+    return dict(zip(paths, blobs, strict=True))
+
+
+def exam_digest(bench: Path | None = None) -> str:
+    lines = "".join(f"{p}\0{b}\n" for p, b in exam_manifest(bench).items())
+    return hashlib.sha256(lines.encode("utf-8")).hexdigest()
+
+
+def frozen_tree_problems(bench: Path | None = None) -> list[str]:
     """Why the exam on disk is not the frozen one (empty list: it is)."""
-    rel = _git("rev-parse", "--show-prefix").strip().rstrip("/")
-    excludes = [f":(exclude){rel}/{name}" for name in UNFROZEN]
-    problems = []
-    changed = _git("diff", "--name-only", commit, "--", rel, *excludes).split()
-    problems += [f"changed since {commit}: {p}" for p in changed]
-    untracked = _git("ls-files", "--others", "--exclude-standard", "--", ".",
-                     *[f":(exclude){n}" for n in UNFROZEN]).split()
-    problems += [f"untracked in the exam: {p}" for p in untracked]
+    digest = exam_digest(bench)
+    if digest == EXAM_DIGEST:
+        return []
+    problems = [f"exam digest {digest} is not the pinned {EXAM_DIGEST}"]
+    try:  # a hint at what moved; the digest is the decision
+        status = _git("status", "--porcelain", "--ignored", "--", ".",
+                      *[f":(exclude){n}" for n in UNFROZEN], cwd=bench or BENCH)
+        problems += [f"  {line}" for line in status.splitlines()]
+    except subprocess.CalledProcessError:
+        pass
     return problems
 
 
-def verifier_commit() -> tuple[str, bool]:
-    """(HEAD sha, whether the runner source differs from it). The verifier
-    that scores a run is the runner at this commit."""
-    head = _git("rev-parse", "HEAD").strip()
-    dirty = bool(_git("status", "--porcelain", "--", str(RUNNER_SRC)).strip())
-    return head, dirty
+def scorer_problems() -> list[str]:
+    """The runner source (the verifier) and the harness (the scorer) must be
+    exactly HEAD, or the labels would not name what scored the run. Absolute
+    pathspecs: a repo-relative one resolved against cwd matched nothing."""
+    status = _git("status", "--porcelain", "--", str(RUNNER_SRC), str(HERE))
+    return [f"differs from HEAD: {line}" for line in status.splitlines()]
 
 
-def tree_hash(commit: str = FREEZE_COMMIT) -> str:
-    rel = _git("rev-parse", "--show-prefix").strip().rstrip("/")
-    return _git("rev-parse", f"{commit}:{rel}").strip()
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def labels() -> dict[str, Any]:
+    """What every result row and summary carries (PROTOCOL.md v2)."""
+    from importlib.metadata import version
+    return {"exam_version": EXAM_VERSION, "exam_digest": EXAM_DIGEST,
+            "repo_head": _git("rev-parse", "HEAD").strip(),
+            "scorer": {name: _sha256(HERE / name) for name in SCORER_FILES},
+            "python": sys.version.split()[0], "pytest": version("pytest")}
+
+
+def results_problems(results: Path | None = None) -> list[str]:
+    """PROTOCOL.md v2: refuse while the results dir holds rows from another
+    exam, so a v1 or edited-exam run cannot sit next to a v2 one."""
+    results = results or HERE / "results"
+    problems = []
+    for runs in sorted(results.glob("*/runs.jsonl")):
+        first = runs.read_text(encoding="utf-8").partition("\n")[0]
+        digest = json.loads(first).get("exam_digest") if first.strip() else None
+        if digest != EXAM_DIGEST:
+            problems.append(f"{runs.parent.name}: exam_digest {digest}")
+    return problems
 
 
 @dataclass(frozen=True)
@@ -413,8 +466,7 @@ def run_arm(*, arm: str, client: ModelClient, runs: int, out_dir: Path,
             verify=None, cards: list[Card] | None = None,  # noqa: ANN001
             vram: VramSampler | None = None, probe: bool = True) -> dict[str, Any]:
     cards = cards if cards is not None else load_cards()
-    head, dirty = verifier_commit()
-    labels = {"exam_freeze": FREEZE_COMMIT, "verifier_commit": head, "verifier_dirty": dirty}
+    label_set = labels()
     system = SYSTEM_PROMPT.read_text(encoding="utf-8")
     out_dir.mkdir(parents=True, exist_ok=True)
     vram = vram or VramSampler()
@@ -437,7 +489,7 @@ def run_arm(*, arm: str, client: ModelClient, runs: int, out_dir: Path,
                               "model_error": reply.error,
                               "reply_sha256": hashlib.sha256(reply.content.encode()).hexdigest()}
                     stripped, inline_think = strip_inline_think(reply.content)
-                    record.update(labels, inline_think=inline_think)
+                    record.update(label_set, inline_think=inline_think)
                     record.update(score_reply(card, stripped, verify=verify))  # A1: primary
                     # A1 sensitivity: the raw reply, scored only when it differs.
                     record["raw_passed"] = (score_reply(card, reply.content, verify=verify)["passed"]
@@ -456,7 +508,7 @@ def run_arm(*, arm: str, client: ModelClient, runs: int, out_dir: Path,
         vram_stats = vram.stop()
         client.unload()
     summary = summarize(arm, client.name, records, runs)
-    summary.update(labels, load=load, vram={"baseline_mib": baseline, **vram_stats},
+    summary.update(label_set, load=load, vram={"baseline_mib": baseline, **vram_stats},
                    refusal_probes=probes)
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     (out_dir / "summary.md").write_text(render_md(summary), encoding="utf-8")
@@ -467,9 +519,9 @@ def render_md(s: dict[str, Any]) -> str:
     def pct(x: float | None) -> str:
         return "n/a" if x is None else f"{x:.0%}"
     lines = [f"# Bake-off arm {s['arm']}: {s['model']}", "", f"_{s['label']}_", "",
-             f"- Exam freeze: {s.get('exam_freeze')} (tree {s.get('tree_hash', 'n/a')})",
-             f"- Verifier: {s.get('verifier_commit')}"
-             f"{' (DIRTY runner source)' if s.get('verifier_dirty') else ''}",
+             f"- Exam {s.get('exam_version')}: digest {s.get('exam_digest')}",
+             f"- Scored at {s.get('repo_head')}; scorer {s.get('scorer')}; "
+             f"python {s.get('python')}, pytest {s.get('pytest')}",
              f"- **Valid:** {'yes' if s['arm_valid'] else 'NO, a negative control passed'}",
              f"- pass@1: {pct(s['pass_at_1'])} over {s['card_runs']} card-runs; "
              f"pass^3: {pct(s['pass_pow_3'])}",
@@ -515,14 +567,14 @@ def main(argv: list[str] | None = None) -> int:
     elif pinned is not None and args.model != pinned and not args.allow_off_tag:
         print(f"refusing: arm {args.arm} is pinned to {pinned!r}, not {args.model!r}")
         return 2
-    if verifier_commit()[1]:
-        print("refusing: the runner source differs from HEAD, so the verifier commit "
-              "would not label what scored the run")
-        return 2
-    problems = frozen_tree_problems()
-    if problems:
-        print("refusing: the exam is not the frozen one:\n  " + "\n  ".join(problems))
-        return 2
+    for why, problems in (
+            ("the runner or harness source differs from HEAD, so the labels would not "
+             "name what scored the run", scorer_problems()),
+            ("the exam is not the frozen one", frozen_tree_problems()),
+            ("the results dir holds rows from another exam", results_problems())):
+        if problems:
+            print(f"refusing: {why}:\n  " + "\n  ".join(problems))
+            return 2
     if args.lease_gb is not None and not os.environ.get("BAKEOFF_LEASED"):
         cmd = [sys.executable, str(WITH_LEASE), "--owner", "PromptBuilder",
                "--workload", f"bakeoff-{args.arm}", "--model", args.model,
@@ -534,9 +586,6 @@ def main(argv: list[str] | None = None) -> int:
     client = OllamaClient(args.model, host=args.host, num_ctx=args.num_ctx,
                           temperature=args.temperature)
     summary = run_arm(arm=args.arm, client=client, runs=args.runs, out_dir=out)
-    summary["tree_hash"] = tree_hash()
-    (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    (out / "summary.md").write_text(render_md(summary), encoding="utf-8")
     print(render_md(summary))
     return 0 if summary["arm_valid"] else 3
 
