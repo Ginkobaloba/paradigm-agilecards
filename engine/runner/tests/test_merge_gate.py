@@ -523,3 +523,60 @@ def test_daemon_lands_the_card_blocked_not_stuck_when_the_map_vanishes(
     assert card.status == CardStatus.BLOCKED.value  # visible, not stuck in active
     assert card.merge_status == "blocked"
     assert gh.calls == []
+
+
+# ---- git exec-surface tamper check (security PR) ---------------------
+
+
+@pytest.mark.parametrize("changed", [True, False])
+def test_daemon_blocks_before_verifying_when_the_git_surface_changed(
+    changed: bool, repo: SqliteRepository, paths: RuntimePaths, todo_root: Path,
+    store_spec: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cards_runner.common.types import EXIT_CLEAN, WORKER_RESULT_NAME, PROJECTED_CARD_NAME
+    from cards_runner.daemon.daemon import _WorkerHandle
+    from cards_runner.store.projection import project_card_file
+
+    cfg = _cfg_pr_on(todo_root, store_spec)
+    card_id = f"bTST-MG-tamper-{changed}"
+    _insert(repo, card_id, points=2)
+    attempt = f"att-tamper-{changed}"
+    repo.claim_card(card_id, claimed_by="tester", attempt_trace_id=attempt)
+    run_dir = paths.runs / attempt
+    worktree = run_dir / "worktree"
+    worktree.mkdir(parents=True, exist_ok=True)
+    card_file = run_dir / PROJECTED_CARD_NAME
+    project_card_file(repo.get_card(card_id), card_file, verbatim=False)
+    (worktree / "anything").write_text("present", encoding="utf-8")
+    (run_dir / WORKER_RESULT_NAME).write_text('{"exit_code": 0}', encoding="utf-8")
+    claim = ClaimedCard(
+        card_id=card_id, attempt_trace_id=attempt, trace_id=attempt,
+        run_dir=run_dir, worktree_path=worktree, card_file=card_file,
+    )
+    monkeypatch.setattr(
+        "cards_runner.daemon.daemon.git_exec_surface",
+        lambda wt, git_path="git": "after" if changed else "before",
+    )
+    gh = FakeGhRunner()
+    daemon = Daemon(cfg, repo=repo, gh=gh)
+    verified: list[str] = []
+    real_dispatch = daemon._dispatch_verifier
+    monkeypatch.setattr(
+        daemon, "_dispatch_verifier",
+        lambda claim, **kw: (verified.append(claim.card_id), real_dispatch(claim, **kw))[1],
+    )
+    handle = _WorkerHandle(claim=claim, process=object(), spawned_at=0.0, git_surface="before")  # type: ignore[arg-type]
+    daemon._post_worker_exit(handle, EXIT_CLEAN)
+
+    card = repo.get_card(card_id)
+    assert card is not None
+    if changed:
+        assert card.status == CardStatus.BLOCKED.value
+        assert verified == []        # the verifier never ran in the rigged repo
+        assert gh.calls == []        # and neither did any git push or gh
+        blocked = [e for e in repo.list_events(card_id) if e.type == "blocked"]
+        assert blocked and blocked[-1].payload.get("error") == "git_surface_changed"
+    else:
+        # control: an unchanged surface routes exactly as before
+        assert verified == [card_id]
+        assert card.status == CardStatus.DONE.value

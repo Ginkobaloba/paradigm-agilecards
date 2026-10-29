@@ -39,6 +39,7 @@ from typing import Any
 from pathlib import Path
 
 from ..common.canonical_config import TierMap, load_tier_map
+from ..common.env_scrub import scrub_environment
 from ..common.types import now_utc_iso
 from ..providers import (
     CompletionRequest,
@@ -313,8 +314,12 @@ class SdkInvoker:
 
         use_tools = os.environ.get("CARDS_RUNNER_USE_TOOLS", "0").strip().lower()
         use_tools_bool = use_tools in ("1", "true", "yes", "on")
+        # Take the key OUT of the process env once it is held here, so no
+        # child this worker starts (tool shells, git) can inherit it. The
+        # invoker keeps it in `api_key` for its own client only.
+        api_key = os.environ.pop("ANTHROPIC_API_KEY", None)
         return cls(
-            api_key=os.environ.get("ANTHROPIC_API_KEY"),
+            api_key=api_key,
             max_output_tokens=_int("CARDS_RUNNER_MAX_OUTPUT_TOKENS", 2048),
             cascade_threshold=_float("CARDS_RUNNER_CASCADE_THRESHOLD", 0.6),
             max_escalations=_int("CARDS_RUNNER_MAX_ESCALATIONS",
@@ -657,10 +662,13 @@ class SdkInvoker:
         return transcript, confidence, tool_log
 
     def _build_tool_belt(self, request: InvokeRequest) -> ToolBelt:
+        # The tool shell runs MODEL-WRITTEN commands, so it gets a fresh
+        # allowlist scrub, never dict(os.environ): no Anthropic or cloud
+        # keys, no tokens, nothing the scrub does not explicitly keep.
         env = (
             self.tool_env
             if self.tool_env is not None
-            else dict(os.environ)
+            else scrub_environment(base=dict(os.environ))
         )
         worktree = Path(request.worktree)
         return ToolBelt(worktree=worktree, env=env)

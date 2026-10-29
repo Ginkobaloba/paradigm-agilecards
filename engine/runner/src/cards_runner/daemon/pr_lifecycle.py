@@ -27,12 +27,13 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+
+from ..common.git_safety import hardened_git_env
 
 
 log = logging.getLogger(__name__)
@@ -340,7 +341,10 @@ class SubprocessGhRunner:
         return self._run(args, cwd=worktree)
 
     def _run(self, args: list[str], *, cwd: Path | None) -> GhCallResult:
-        env = os.environ.copy()
+        # Not os.environ.copy(): these run in a worktree the executor wrote
+        # to, so git (and the git gh spawns) must not inherit the daemon's
+        # keys or run repo-configured hooks and helpers. See git_safety.
+        env = hardened_git_env()
         if self.env is not None:
             env.update(self.env)
         try:

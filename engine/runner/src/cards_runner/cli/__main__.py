@@ -464,6 +464,20 @@ def _cmd_start(args: argparse.Namespace) -> int:
         if value is not None:
             cfg_kwargs[cfg_name] = value
     cfg = DaemonConfig(**cfg_kwargs)
+    if args.invoker == "sdk-tools" and getattr(args, "pr_gate", False):
+        # Tool mode lets the executor write anything in its worktree,
+        # including git config and hooks; the PR gate then runs `git push`
+        # and `gh` there with real credentials. common/git_safety.py
+        # hardens that path, but same-user processes are not isolated on
+        # Windows, so the pair stays refused until a deliberate later
+        # change lifts it (Drew's call, with tool-shell network policy).
+        print(
+            "error: --invoker sdk-tools with --pr-gate is refused: the "
+            "merge gate would run git and gh with credentials in a "
+            "worktree the executor could have rigged",
+            file=sys.stderr,
+        )
+        return 2
     if args.invoker in ("sdk", "sdk-tools"):
         env_problem = _pin_worker_env() or _tier_map_problem()
         if env_problem is not None:

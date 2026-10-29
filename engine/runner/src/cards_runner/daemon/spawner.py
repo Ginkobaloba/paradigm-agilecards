@@ -17,14 +17,32 @@ import sys
 from pathlib import Path
 
 import cards_runner
-from ..common.canonical_config import ENV_TIER_MAP_PATH
+from ..common.canonical_config import ENV_TIER_MAP_PATH, CanonicalConfigMissing, load_tier_map
 from ..common.env_scrub import scrub_environment
 from ..common.process_group import ManagedProcess, spawn_in_job
 from ..common.types import ClaimedCard, DaemonConfig
-from ..providers.registry import LOCAL_BASE_URL_ENV, base_url_problem
+from ..providers.registry import LOCAL_BASE_URL_ENV, base_url_problem, tiers_needing_a_key
 
 
 log = logging.getLogger(__name__)
+
+
+def _worker_needs_the_key() -> bool:
+    """Whether the worker could call Anthropic at all.
+
+    The key is only handed to a worker that might use it: tool mode (the
+    tool loop is Anthropic-only), or a tier map with a tier that is not a
+    keyless local provider. An all-local map gets no key, so nothing the
+    worker runs can read it. A pinned map that cannot load also gets none:
+    that card will fail, and it fails without a credential.
+    """
+    if os.environ.get("CARDS_RUNNER_USE_TOOLS", "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    try:
+        tier_map = load_tier_map()
+    except CanonicalConfigMissing:
+        return False
+    return bool(tiers_needing_a_key(tier_map.points_to_model_map()))
 
 
 def _package_src_dir() -> Path:
@@ -91,8 +109,13 @@ def spawn_worker(
         # the daemon injects exactly one key (not the whole prefix)
         # through `scrub_environment(add=...)`.
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if api_key:
+        if api_key and _worker_needs_the_key():
             injected["ANTHROPIC_API_KEY"] = api_key
+        elif api_key:
+            log.info(
+                "not injecting ANTHROPIC_API_KEY: every tier is a keyless "
+                "local provider, so the worker has no use for it"
+            )
         else:
             # The CLI already refused unless every tier is non-Anthropic
             # (cli._anthropic_key_problem), so this is an all-local run.

@@ -40,6 +40,7 @@ from pathlib import Path
 from types import FrameType
 from typing import Any, Optional
 
+from ..common.git_safety import git_exec_surface
 from ..common.locks import FileLock, LockHeldError, pid_alive
 from ..common.logging_setup import setup_daemon_logging
 from ..common.process_group import ManagedProcess
@@ -128,6 +129,9 @@ class _WorkerHandle:
     claim: ClaimedCard
     process: ManagedProcess
     spawned_at: float
+    # Fingerprint of the repo's git config + hooks at claim (git_safety).
+    # None when the worktree is not a git checkout (skip_worktree).
+    git_surface: str | None = None
 
 
 class Daemon:
@@ -728,6 +732,13 @@ class Daemon:
             self._rollback_to_backlog(claim)
             return False
 
+        # Before the executor can touch anything: what git could be made
+        # to run in this repo. Compared at worker exit (_git_surface_changed).
+        git_surface = (
+            None if self.cfg.skip_worktree
+            else git_exec_surface(claim.worktree_path, git_path=self.cfg.git_path)
+        )
+
         try:
             process = spawn_worker(
                 cfg=self.cfg,
@@ -743,6 +754,7 @@ class Daemon:
             claim=claim,
             process=process,
             spawned_at=time.monotonic(),
+            git_surface=git_surface,
         )
         return True
 
@@ -913,7 +925,11 @@ class Daemon:
         self._emit_escalated_events(claim, fields.get("cascade_history"))
         self._record_executor_metrics(claim, fields, sidecar)
 
-        if rc in (EXIT_COST_CAP_HALT, EXIT_HALT_SIGNAL):
+        if self._git_surface_changed(handle):
+            # Before ANY routing: the verifier, the merge gate and the
+            # shadow ledger would all run git in this repo next.
+            self._route_tamper_to_blocked(claim)
+        elif rc in (EXIT_COST_CAP_HALT, EXIT_HALT_SIGNAL):
             self._route_halt_to_blocked(claim, rc, sidecar)
         elif rc != 0:
             log.warning(
@@ -1388,6 +1404,37 @@ class Daemon:
         # Contract drift: the executor needed an AC amendment, so the
         # up-front contract did not survive unchanged.
         self._record_contract_outcome(claim.card_id, survived=False)
+
+    def _git_surface_changed(self, handle: _WorkerHandle) -> bool:
+        if handle.git_surface is None:
+            return False
+        now = git_exec_surface(handle.claim.worktree_path, git_path=self.cfg.git_path)
+        return now != handle.git_surface
+
+    def _route_tamper_to_blocked(self, claim: ClaimedCard) -> None:
+        """Block a card whose run changed the repo's git config or hooks.
+
+        Git runs programs named there, so the daemon does not run git in
+        this repo again for the card, and a human has to look: the change
+        may also be waiting for the owner's next manual git command.
+        """
+        reason = (
+            "executor run changed the repository's git config or hooks; "
+            "not verifying or merging. Inspect .git/config and .git/hooks"
+        )
+        log.error("routing card_id=%s to blocked: %s", claim.card_id, reason)
+        try:
+            self.repo.transition(
+                claim.card_id,
+                to_status=CardStatus.BLOCKED.value,
+                tenant_id=self.tenant_id,
+                actor_id=claim.attempt_trace_id,
+                actor_type=ActorType.EXECUTOR.value,
+                event_type=EventType.BLOCKED.value,
+                payload={"reason": reason, "error": "git_surface_changed"},
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("failed to block tampered card %s: %s", claim.card_id, exc)
 
     def _route_halt_to_blocked(
         self, claim: ClaimedCard, rc: int, sidecar: dict[str, Any]

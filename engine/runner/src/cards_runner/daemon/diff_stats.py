@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from ..common.git_safety import hardened_git_env
+
 
 def _glob_to_regex(pattern: str) -> re.Pattern[str]:
     """Translate a path glob to a compiled regex.
@@ -122,9 +124,14 @@ class DiffStats:
                 # --no-renames so a rename can't dodge a sensitive-path
                 # escalator (a renamed file shows as add+delete of real
                 # paths rather than an `old => new` entry).
+                # --no-ext-diff / --no-textconv + the hardened env: the
+                # worktree is executor-written, so its config must not get
+                # to run a diff driver or helper here (git_safety).
                 [git_path, "-C", str(worktree), "diff", "--numstat",
-                 "--no-renames", f"{base_branch}...{branch}"],
+                 "--no-renames", "--no-ext-diff", "--no-textconv",
+                 f"{base_branch}...{branch}"],
                 capture_output=True, text=True, timeout=30, check=False,
+                env=hardened_git_env(keep_gh_credentials=False),
             )
         except (OSError, subprocess.SubprocessError):
             return cls()
