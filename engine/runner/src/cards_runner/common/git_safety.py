@@ -17,7 +17,7 @@ without first proving it unchanged:
    (the executor's shell has a HOME) is never read by the daemon. gh's
    credential helper, which normally lives there, is pinned explicitly.
 3. **Overrides for repo config.** `GIT_CONFIG_COUNT` entries outrank every
-   config file: an empty `core.hooksPath`, `core.fsmonitor=false`, the
+   config file: `core.hooksPath` at the null device, `core.fsmonitor=false`, the
    credential helper reset, and a few more.
 4. **A persisted baseline.** The repo's own config and hooks are
    fingerprinted the first time the daemon sees the repo (or when an
@@ -28,10 +28,10 @@ without first proving it unchanged:
    which could disagree with git), minus the `branch.<name>.remote/merge`
    keys the daemon's own `push -u` writes.
 
-The empty hooks dir and the trust store live in a daemon state dir. Same-
-user files are never truly private, so the hooks dir is re-emptied before
-every use, and the trust store on disk is only a fallback: this process's
-in-memory records are authoritative (see `_MEMORY`).
+Hooks are pointed at the null device. The trust store lives in a daemon
+state dir; same-user files are never truly private, so the store on disk
+is only a fallback: this process's in-memory records are authoritative
+(see `_MEMORY`).
 
 What this does NOT close: same-user processes on Windows are not isolated,
 so a determined payload could read another process's memory or write
@@ -156,19 +156,16 @@ def _state_dir() -> Path:
     return _STATE_DIR
 
 
-def empty_hooks_dir() -> Path:
-    """A hooks dir with nothing in it, verified (and emptied) before each use."""
-    path = _state_dir() / "nohooks"
-    if path.exists() and (not path.is_dir() or any(path.iterdir())):
-        shutil.rmtree(path, ignore_errors=True) if path.is_dir() else path.unlink()
-    path.mkdir(exist_ok=True)
-    return path
-
-
 def git_config_overrides(*, gh_path: str | None = None) -> list[tuple[str, str]]:
     """Command-line-precedence config for every daemon git call."""
     overrides = [
-        ("core.hooksPath", str(empty_hooks_dir())),
+        # The null device, not an emptied directory: a directory emptied at
+        # env-build time was writable until git read it, and a hook planted
+        # in that window ran in the daemon's push with GH_TOKEN (#87 L4-4).
+        ("core.hooksPath", os.devnull),
+        # refs/replace planted by a sibling made the committed-tree check
+        # see a benign tree while another was pushed (#87 L4-3).
+        ("core.useReplaceRefs", "false"),
         ("core.fsmonitor", "false"),
         ("core.askPass", ""),
         ("diff.external", ""),
@@ -206,6 +203,7 @@ def hardened_git_env(
     env["GIT_CONFIG_SYSTEM"] = os.devnull
     env["GIT_CONFIG_NOSYSTEM"] = "1"
     env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
     if keep_gh_credentials and gh_path is None:
         gh_path = _PINNED_BINARIES.get("gh") or shutil.which("gh")
     overrides = [*git_config_overrides(gh_path=gh_path if keep_gh_credentials else None),
@@ -336,6 +334,36 @@ def _config_files(common_dir: Path) -> list[Path]:
     return files
 
 
+_INCLUDE_DEPTH = 10  # git's own limit is 10 nested includes
+
+
+def _hash_conditional_includes(digest: "hashlib._Hash", config: Path,
+                               entries: list[ConfigEntry], *, depth: int) -> None:
+    """Hash every `includeIf.<cond>.path` target `config` names, whether or
+    not its condition holds now (conditions can be made to hold later).
+    `--includes` expands only unconditional includes, so before this an
+    edit to a conditional target (a new remote.origin.url) changed what git
+    did without changing the hash (#87 deep verify gitexec-F2)."""
+    for key, value in entries:
+        if not (key.startswith("includeif.") and key.endswith(".path")) or not value:
+            continue
+        target = Path(os.path.expanduser(value))
+        if not target.is_absolute():
+            target = config.parent / target
+        digest.update(b"<includeIf>" + key.encode("utf-8", "surrogateescape") + b"\0")
+        if depth >= _INCLUDE_DEPTH:
+            digest.update(b"<too deep>\0")
+            continue
+        try:
+            digest.update(target.read_bytes() + b"\0")
+        except OSError:
+            digest.update(b"<absent>\0")
+            continue
+        nested = config_entries(target)
+        if nested is not None:
+            _hash_conditional_includes(digest, target, nested, depth=depth + 1)
+
+
 def fingerprint(common_dir: Path) -> str:
     """Hash of what can make git run a program: config (as git parses it) + hooks.
 
@@ -365,6 +393,7 @@ def fingerprint(common_dir: Path) -> str:
             else:
                 digest.update(b"\n" + value.encode("utf-8", "surrogateescape"))
             digest.update(b"\0")
+        _hash_conditional_includes(digest, path, entries, depth=0)
     hooks = common_dir / "hooks"
     if hooks.is_dir():
         for path in sorted(p for p in hooks.rglob("*") if p.is_file() and p.suffix != ".sample"):

@@ -92,7 +92,12 @@ def _clone(source: Path, dest: Path, *, pins: git_safety._Pins, branch: str,
             "--branch", branch]
     if not checkout:
         args.append("--no-checkout")
-    _git(source, *args, "--", str(source), str(dest), first_sight_ok=first_sight_ok)
+    # A file:// URL, not a path: a local-path clone copies objects/ wholesale,
+    # so --single-branch kept other branches' REFS out but not their objects,
+    # which a worker could read by sha (#87 deep verify, tests lens note).
+    # The pack transport sends only what the cloned branch reaches.
+    _git(source, *args, "--", Path(os.path.abspath(source)).as_uri(), str(dest),
+         first_sight_ok=first_sight_ok)
     # Pinned before it is trusted: from here to release, `dest` and its
     # `.git` cannot be renamed or replaced by any process (L4-1).
     pins.pin(dest)

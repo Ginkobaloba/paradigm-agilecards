@@ -260,16 +260,10 @@ def test_hardened_git_env_drops_keys_and_pins_the_exec_config() -> None:
     pinned = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
               for i in range(int(env["GIT_CONFIG_COUNT"]))}
     assert pinned["core.fsmonitor"] == "false"
-    assert Path(pinned["core.hooksPath"]).is_dir()
-    assert not any(Path(pinned["core.hooksPath"]).iterdir())
+    assert pinned["core.hooksPath"] == os.devnull  # nothing can be planted in it
+    assert pinned["core.useReplaceRefs"] == "false" and env["GIT_NO_REPLACE_OBJECTS"] == "1"
     no_gh = git_safety.hardened_git_env(base, keep_gh_credentials=False)
     assert "GH_TOKEN" not in no_gh
-
-
-def test_a_planted_file_in_the_empty_hooks_dir_is_removed_before_use() -> None:
-    first = git_safety.empty_hooks_dir()
-    (first / "pre-push").write_text("#!/bin/sh\nexit 0\n")
-    assert not any(git_safety.empty_hooks_dir().iterdir())
 
 
 def test_user_and_system_config_are_the_null_device() -> None:

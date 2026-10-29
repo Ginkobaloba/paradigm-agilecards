@@ -286,6 +286,81 @@ def test_a_shell_ac_git_cannot_see_a_system_credential_helper(tmp_path: Path) ->
     assert hardened.stdout.strip() == "", hardened.stdout
 
 
+# ---- git hardening (L4-3, L4-4, gitexec-F2, other-branch objects) ---------
+
+
+def test_a_planted_replace_ref_is_not_honored(tmp_path: Path) -> None:
+    """L4-3: refs/replace swapped what the committed-tree check saw."""
+    project, base = _trusted_project(tmp_path)
+    (project / "other.txt").write_text("decoy\n")
+    _g(project, "add", "other.txt")
+    _g(project, "-c", "user.email=t@example.test", "-c", "user.name=t", "commit", "-q", "-m", "d")
+    decoy = _g(project, "rev-parse", "HEAD").strip()
+    _g(project, "reset", "-q", "--hard", base)
+    git_safety.trust_repo(git_safety.common_dir_of(project))  # the plant is not config: still trusted
+    _g(project, "replace", base, decoy)
+    plain = _g(project, "ls-tree", "--name-only", base).split()
+    assert "other.txt" in plain  # control: plain git shows the decoy's tree for `base`
+    hardened = git_safety.run_git(["git", "ls-tree", "--name-only", base],
+                                  cwd=project).stdout.split()
+    assert "other.txt" not in hardened
+
+
+def test_hooks_run_from_nowhere_the_daemon_can_be_raced_on(tmp_path: Path) -> None:
+    """L4-4: the emptied hooks dir was writable between emptying and use."""
+    env = git_safety.hardened_git_env({})
+    pinned = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+              for i in range(int(env["GIT_CONFIG_COUNT"]))}
+    assert pinned["core.hooksPath"] == os.devnull
+    project, _ = _trusted_project(tmp_path)
+    marker = tmp_path / "hook-ran"
+    hooks = project / ".git" / "hooks"
+    (hooks / "post-commit").write_text(f"#!/bin/sh\necho ran > '{marker.as_posix()}'\n",
+                                       newline="\n")
+    git_safety.trust_repo(git_safety.common_dir_of(project))
+    (project / "f.txt").write_text("x\n")
+    git_safety.run_git(["git", "add", "f.txt"], cwd=project)
+    git_safety.run_git(["git", "commit", "-q", "-m", "x"], cwd=project,
+                       extra_config=tuple(git_safety.commit_identity()))
+    assert not marker.exists()
+    _g(project, "-c", "user.email=t@example.test", "-c", "user.name=t", "commit", "-q",
+       "--allow-empty", "-m", "control")
+    assert marker.exists()  # control: plain git runs the hook
+
+
+def test_an_edit_to_a_conditional_include_target_changes_the_fingerprint(tmp_path: Path) -> None:
+    """gitexec-F2: includeIf targets were not hashed, so redirecting
+    remote.origin.url there went unseen."""
+    project, _ = _trusted_project(tmp_path)
+    target = tmp_path / "included.cfg"
+    target.write_text("[remote \"origin\"]\n\turl = https://example.invalid/o/r.git\n")
+    _g(project, "config", f"includeIf.gitdir:{project.as_posix()}/.path", target.as_posix())
+    common = git_safety.common_dir_of(project)
+    before = git_safety.fingerprint(common)
+    target.write_text("[remote \"origin\"]\n\turl = C:/decoy/bare.git\n")
+    assert git_safety.fingerprint(common) != before
+    nested = tmp_path / "nested.cfg"
+    target.write_text(f"[includeIf \"gitdir:{project.as_posix()}/\"]\n\tpath = {nested.as_posix()}\n")
+    mid = git_safety.fingerprint(common)
+    nested.write_text("[core]\n\tsshCommand = evil\n")
+    assert git_safety.fingerprint(common) != mid  # nested conditional targets too
+
+
+def test_a_worker_clone_holds_no_other_branch_objects(tmp_path: Path) -> None:
+    project, _ = _trusted_project(tmp_path)
+    _g(project, "checkout", "-q", "-b", "other")
+    (project / "secret-branch.txt").write_text("not for the worker\n")
+    _g(project, "add", "-A")
+    _g(project, "-c", "user.email=t@example.test", "-c", "user.name=t", "commit", "-q", "-m", "o")
+    other = _g(project, "rev-parse", "other").strip()
+    _g(project, "checkout", "-q", "main")
+    git_safety.trust_repo(git_safety.common_dir_of(project))
+    wt = tmp_path / "wt"
+    clones.prepare_worker_clone(project_dir=project, base_branch="main", branch="card/x/1", dest=wt)
+    assert subprocess.run(["git", "cat-file", "-e", other], cwd=wt).returncode != 0
+    assert subprocess.run(["git", "cat-file", "-e", other], cwd=project).returncode == 0  # control
+
+
 # ---- L4-2: the tick never wedges ------------------------------------------
 
 
