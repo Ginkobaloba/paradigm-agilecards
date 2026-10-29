@@ -67,6 +67,9 @@ def split_model(model_id: str) -> tuple[str, str]:
 KEYLESS_LOCAL_PROVIDERS: frozenset[str] = frozenset({"ollama", "vllm", "local"})
 
 # Their endpoints, the only provider env the spawner forwards to a worker.
+# ENDPOINTS ONLY (see base_url_problem): a path is allowed by design, so a
+# secret placed in the path is not caught here. Keyless local servers need
+# none; never put one there (documented in engine/runner/.env.example).
 LOCAL_BASE_URL_ENV: tuple[str, ...] = tuple(
     f"CARDS_RUNNER_{p.upper()}_BASE_URL" for p in sorted(KEYLESS_LOCAL_PROVIDERS)
 )

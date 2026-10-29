@@ -278,6 +278,7 @@ def test_a_plain_local_endpoint_is_allowed(url: str) -> None:
         "http://:pw@127.0.0.1/v1",
         "http://127.0.0.1:notaport/v1",
         "http://127.0.0.1/v1?",
+        "http://127.0.0.1:11434/v1#",  # bare fragment marker (r3: caught only by accident)
     ],
 )
 def test_anything_beyond_host_port_path_is_refused(url: str) -> None:
@@ -286,12 +287,17 @@ def test_anything_beyond_host_port_path_is_refused(url: str) -> None:
 
 def test_the_spawner_drops_a_credentialed_url_even_if_the_cli_was_bypassed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_key: None,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level("DEBUG")
     monkeypatch.setenv(ENV_TIER_MAP_PATH, str(_tier_map(tmp_path, ALL_LOCAL)))
     monkeypatch.setenv("CARDS_RUNNER_OLLAMA_BASE_URL", "http://u:secretpw@ollama.invalid/v1")
     env = _spawn_env(tmp_path, monkeypatch)
     assert "CARDS_RUNNER_OLLAMA_BASE_URL" not in env
     assert all("secretpw" not in v for v in env.values())
+    # r3: the refusal is logged by name, never echoing the URL
+    assert "CARDS_RUNNER_OLLAMA_BASE_URL" in caplog.text
+    assert "secretpw" not in caplog.text and "ollama.invalid" not in caplog.text
 
 
 def test_every_offending_tier_is_named_not_just_the_first(
@@ -405,9 +411,12 @@ def test_the_worker_passthrough_set_is_exactly_this(
         monkeypatch.setenv(name, "http://127.0.0.1:11434/v1")
     # decoys that must never pass
     for name in ("GH_TOKEN", "GITHUB_TOKEN", "OPENAI_API_KEY", "GEMINI_API_KEY",
-                 "CARDS_RUNNER_OLLAMA_API_KEY", "CARDS_RUNNER_OPENAI_BASE_URL",
+                 "CARDS_RUNNER_OLLAMA_API_KEY", "CARDS_RUNNER_OPENAI_API_KEY",
                  "CARDS_RUNNER_SOMETHING_NEW", "AWS_SECRET_ACCESS_KEY"):
         monkeypatch.setenv(name, "decoy-not-a-real-secret")
+    # a VALID url, so forwarding openai endpoints would pass the URL check
+    # and only the set comparison below can catch it (r3)
+    monkeypatch.setenv("CARDS_RUNNER_OPENAI_BASE_URL", "http://127.0.0.9:1234/v1")
     env = _spawn_env(tmp_path, monkeypatch)
     assert {k for k in env if k.startswith("CARDS_RUNNER_") or k.startswith("ANTHROPIC_")} == {
         "CARDS_RUNNER_CARD_PATH", "CARDS_RUNNER_WORKTREE", "CARDS_RUNNER_ATTEMPT_TRACE_ID",
@@ -421,3 +430,18 @@ def test_the_worker_passthrough_set_is_exactly_this(
         "CARDS_RUNNER_OLLAMA_BASE_URL", "CARDS_RUNNER_VLLM_BASE_URL", "CARDS_RUNNER_LOCAL_BASE_URL",
     }
     assert "decoy-not-a-real-secret" not in env.values()
+
+def test_a_tier_without_a_model_is_a_clean_refusal_naming_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_key: None,
+    patched_daemon: list[DaemonConfig], capsys: pytest.CaptureFixture[str],
+) -> None:
+    # r3 (a): this was a raw KeyError traceback at start.
+    path = tmp_path / "tier_map.yaml"
+    path.write_text(
+        "version: 1\ntiers:\n  1:\n    model: ollama/a\n  2:\n    label: no model here\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(ENV_TIER_MAP_PATH, str(path))
+    assert _cmd_start(_args()) == 2
+    assert patched_daemon == []
+    assert "tier 2" in capsys.readouterr().err

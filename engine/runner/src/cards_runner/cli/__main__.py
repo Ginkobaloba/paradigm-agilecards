@@ -376,6 +376,25 @@ def _anthropic_key_problem(args: argparse.Namespace) -> str | None:
     return None
 
 
+def _tier_map_problem() -> str | None:
+    """Why the tier map the worker will load is unusable, or None.
+
+    Checked once at start so a bad map is a clean refusal naming the
+    problem, not a traceback here or a failure on the first card. A SET
+    env var is a pin (canonical_config.load_tier_map), so broken YAML
+    raises rather than falling back to another map.
+    """
+    try:
+        tier_map = load_tier_map()
+    except CanonicalConfigMissing as exc:
+        return f"{ENV_TIER_MAP_PATH}: {exc}"
+    for points, entry in sorted(tier_map.tiers.items()):
+        model = entry.get("model")
+        if not isinstance(model, str) or not model.strip():
+            return f"tier {points} in {tier_map.source} has no `model`"
+    return None
+
+
 def _pin_worker_env() -> str | None:
     """Make the env the worker inherits mean what the CLI checked, or say why not.
 
@@ -396,10 +415,6 @@ def _pin_worker_env() -> str | None:
         if not path.is_file():
             return f"{ENV_TIER_MAP_PATH} points at {path}, which is not a file"
         os.environ[ENV_TIER_MAP_PATH] = str(path)
-        try:
-            load_tier_map()  # a set var is a pin: broken YAML raises, never falls back
-        except CanonicalConfigMissing as exc:
-            return f"{ENV_TIER_MAP_PATH}: {exc}"
     for name in LOCAL_BASE_URL_ENV:
         url = os.environ.get(name)
         if url:
@@ -450,7 +465,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
             cfg_kwargs[cfg_name] = value
     cfg = DaemonConfig(**cfg_kwargs)
     if args.invoker in ("sdk", "sdk-tools"):
-        env_problem = _pin_worker_env()
+        env_problem = _pin_worker_env() or _tier_map_problem()
         if env_problem is not None:
             print(f"error: {env_problem}", file=sys.stderr)
             return 2

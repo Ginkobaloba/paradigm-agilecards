@@ -15,4 +15,11 @@
   - X4: a test pins the exact `CARDS_RUNNER_*`/`ANTHROPIC_*` set a worker receives, with decoys (GH_TOKEN, *_API_KEY, an unknown CARDS_RUNNER_ var) that must not pass.
   - X5: `spawn_worker` absolutizes the map path itself, covering direct callers.
   - Suite 775/0, ruff clean; eight more mutants each turn a test red.
+- **Deep verify r3 at 27a5c69: PASS WITH WARNINGS (18/22 mutants red), fixed in the next commit.**
+  - The four surviving mutants now have tests: a bare `#`, the spawner's refusal log never echoing the URL (caplog), `CARDS_RUNNER_OPENAI_API_KEY` as a decoy, and the openai base-URL decoy now a VALID URL so forwarding openai endpoints goes red.
+  - (a) a tier with no `model` is a clean rc 2 naming the tier (`_tier_map_problem`), not a KeyError traceback.
+  - (b) a pinned map that vanishes mid-run: `MergeGate.apply` catches `CanonicalConfigMissing` and lands the card `blocked` (merge_status `blocked`, reason "tier map unavailable"), with no gh call. A daemon-level test shows the card ends blocked, not stuck in active.
+  - (c) `.env.example` and the registry document "endpoints only; a path is allowed, so never put a secret there".
+  - Known and accepted: a map swapped to a Claude map AFTER start does not re-run the key check. It fails closed only because no key was injected (the worker cannot call Anthropic without one).
+  - Suite 780/0, ruff clean; five more mutants each turn a test red.
 - **Refs:** cli/__main__.py `_anthropic_key_problem`; providers/registry.py `anthropic_tiers`; daemon/spawner.py passthrough; tests/test_local_map_no_key.py; C:\dev\_status\LOCAL_MODEL_AND_RAM_PLAN_2026-10-28.md
