@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from ..common.git_safety import run_git
+
 
 def _glob_to_regex(pattern: str) -> re.Pattern[str]:
     """Translate a path glob to a compiled regex.
@@ -114,18 +116,25 @@ class DiffStats:
     ) -> "DiffStats":
         """Run `git diff base...branch --numstat` in the worktree.
 
-        Returns an empty DiffStats on any git failure -- the gate treats
+        Raises RepoQuarantined / UntrustedRepo (git_safety) rather than
+        guess. Returns an empty DiffStats on any git failure -- the gate treats
         an unreadable diff as "no diff signal" and leans on the other
         inputs (the caller logs the failure)."""
         try:
-            result = subprocess.run(
+            result = run_git(
                 # --no-renames so a rename can't dodge a sensitive-path
                 # escalator (a renamed file shows as add+delete of real
                 # paths rather than an `old => new` entry).
-                [git_path, "-C", str(worktree), "diff", "--numstat",
-                 "--no-renames", f"{base_branch}...{branch}"],
-                capture_output=True, text=True, timeout=30, check=False,
+                # --no-ext-diff / --no-textconv + the hardened env: the
+                # worktree is executor-written, so its config must not get
+                # to run a diff driver or helper here (git_safety).
+                [git_path, "diff", "--numstat",
+                 "--no-renames", "--no-ext-diff", "--no-textconv",
+                 f"{base_branch}...{branch}"],
+                cwd=worktree, timeout=30,
             )
+        # RepoQuarantined / UntrustedRepo propagate: an empty diff would
+        # read as "nothing sensitive changed" to the confidence gate.
         except (OSError, subprocess.SubprocessError):
             return cls()
         if result.returncode != 0:

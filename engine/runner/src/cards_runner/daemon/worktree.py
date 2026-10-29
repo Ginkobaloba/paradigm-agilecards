@@ -28,6 +28,7 @@ import sys
 from pathlib import Path
 from typing import Final
 
+from ..common.git_safety import RepoQuarantined, UntrustedRepo, resolved, run_git
 from ..common.locks import held_worktree_mutex
 from ..common.types import RuntimePaths
 
@@ -115,6 +116,7 @@ def prepare_worktree(
             _run_powershell_git(
                 project_dir,
                 ["worktree", "add", str(worktree_path), branch_name],
+                first_sight_ok=True,
             )
         except subprocess.CalledProcessError as exc:
             raise WorktreeCreateError(
@@ -187,7 +189,7 @@ def prune_git_worktrees(
     if expire_after:
         args.extend(["--expire", expire_after])
     try:
-        return _run_powershell_git(project_dir, args)
+        return _run_powershell_git(project_dir, args, first_sight_ok=True)
     except subprocess.CalledProcessError as exc:
         log.warning(
             "git worktree prune failed in %s: rc=%s stderr=%r",
@@ -196,6 +198,9 @@ def prune_git_worktrees(
         return None
     except subprocess.TimeoutExpired as exc:
         log.warning("git worktree prune timed out in %s: %s", project_dir, exc)
+        return None
+    except (RepoQuarantined, UntrustedRepo) as exc:
+        log.warning("git worktree prune skipped for %s: %s", project_dir, exc)
         return None
 
 
@@ -221,8 +226,9 @@ def teardown_worktree(
             _run_powershell_git(
                 project_dir,
                 ["worktree", "remove", "--force", str(worktree_path)],
+                first_sight_ok=True,
             )
-        except subprocess.CalledProcessError as exc:
+        except (subprocess.CalledProcessError, RepoQuarantined, UntrustedRepo) as exc:
             log.warning("git worktree remove failed: %s", exc)
             shutil.rmtree(worktree_path, ignore_errors=True)
 
@@ -235,7 +241,7 @@ def _ensure_branch(project_dir: Path, branch_name: str, base_branch: str) -> Non
     """
     try:
         _run_powershell_git(
-            project_dir, ["rev-parse", "--verify", branch_name]
+            project_dir, ["rev-parse", "--verify", branch_name], first_sight_ok=True,
         )
         log.debug("branch %s already exists", branch_name)
         return
@@ -244,6 +250,7 @@ def _ensure_branch(project_dir: Path, branch_name: str, base_branch: str) -> Non
     _run_powershell_git(
         project_dir,
         ["branch", branch_name, base_branch],
+        first_sight_ok=True,
     )
 
 
@@ -258,7 +265,9 @@ def _registered_worktrees(project_dir: Path) -> list[Path]:
     Paths are resolved so callers can compare them to a `Path` without
     caring about separators, case, or relative segments.
     """
-    listing = _run_powershell_git(project_dir, ["worktree", "list", "--porcelain"])
+    listing = _run_powershell_git(
+        project_dir, ["worktree", "list", "--porcelain"], first_sight_ok=True,
+    )
     found: list[Path] = []
     for line in listing.stdout.splitlines():
         if not line.startswith("worktree "):
@@ -316,19 +325,27 @@ def _verify_worktree(project_dir: Path, worktree_path: Path) -> None:
 def _run_powershell_git(
     cwd: Path,
     args: list[str],
+    *,
+    first_sight_ok: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    """Run `git <args>` in `cwd`.
+    """Run `git <args>` in `cwd`, through the hardened runner.
 
     Per SESSION_PROTOCOL.md section 7, git ops on Windows go through
     PowerShell. On non-Windows hosts we fall back to direct invocation
     so the suite runs on Linux CI. The chunk 1 tests use skip-git
     mode, so this path is exercised mainly on Windows during real
     operation.
+
+    `git_safety.run_git` gives PowerShell (and so git) the hardened env
+    and refuses to run in a repo whose config or hooks changed since it
+    was trusted: the next card's prep runs in the same shared `.git` a
+    previous executor could write to. Raises CalledProcessError on a
+    non-zero exit, as callers expect.
     """
     if sys.platform == "win32":
         # Invoke PowerShell with the git command. Use `& git ...` so
         # PowerShell does not parse positional arguments oddly.
-        ps_args = ["git", *args]
+        ps_args = [resolved("git"), *args]
         cmd = [
             "powershell.exe",
             "-NoProfile",
@@ -337,15 +354,14 @@ def _run_powershell_git(
             "& " + " ".join(_quote_for_powershell(a) for a in ps_args),
         ]
     else:
-        cmd = ["git", *args]
-    proc = subprocess.run(
-        cmd,
-        cwd=str(cwd),
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=GIT_WORKTREE_TIMEOUT_SEC,
+        cmd = [resolved("git"), *args]
+    proc = run_git(
+        cmd, cwd=cwd, timeout=GIT_WORKTREE_TIMEOUT_SEC, first_sight_ok=first_sight_ok,
     )
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            proc.returncode, cmd, output=proc.stdout, stderr=proc.stderr,
+        )
     return proc
 
 

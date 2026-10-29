@@ -27,6 +27,7 @@ from typing import Any
 from ..common.canonical_config import ENV_TIER_MAP_PATH, CanonicalConfigMissing, load_tier_map
 from ..common.envfile import ENV_FILE_VAR, load_dotenv
 from ..common.locks import FileLock, pid_alive
+from ..common import git_safety
 from ..common.types import DaemonConfig, RuntimePaths
 from ..daemon import llm_capability
 from ..daemon.daemon import Daemon, DaemonAlreadyRunning
@@ -187,6 +188,14 @@ def main(argv: list[str] | None = None) -> int:
         help="skip the interactive confirmation",
     )
 
+    p_trust = sub.add_parser(
+        "trust-repo",
+        help="record a repository's current git config and hooks as trusted "
+        "(also lifts a quarantine); inspect .git/config and .git/hooks first",
+    )
+    _add_common(p_trust)
+    p_trust.add_argument("project_dir", type=Path)
+
     p_doctor = sub.add_parser(
         "doctor",
         help="diagnostic dump: resolved binaries, project config, "
@@ -302,6 +311,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_status(args)
     if args.cmd == "reclaim":
         return _cmd_reclaim(args)
+    if args.cmd == "trust-repo":
+        return _cmd_trust_repo(args)
     if args.cmd == "doctor":
         return _cmd_doctor(args)
     if args.cmd == "stats":
@@ -464,6 +475,28 @@ def _cmd_start(args: argparse.Namespace) -> int:
         if value is not None:
             cfg_kwargs[cfg_name] = value
     cfg = DaemonConfig(**cfg_kwargs)
+    # The CLI is the ONLY tools switch, set before anything reads it: an
+    # ambient CARDS_RUNNER_USE_TOOLS=1 would otherwise put a `--invoker sdk`
+    # worker in tools mode and slip past the refusal below.
+    if args.invoker == "sdk-tools":
+        os.environ["CARDS_RUNNER_USE_TOOLS"] = "1"
+    else:
+        os.environ.pop("CARDS_RUNNER_USE_TOOLS", None)
+    tools_mode = os.environ.get("CARDS_RUNNER_USE_TOOLS") == "1"
+    if tools_mode and getattr(args, "pr_gate", False):
+        # Tool mode lets the executor write anything in its worktree,
+        # including git config and hooks; the PR gate then runs `git push`
+        # and `gh` there with real credentials. common/git_safety.py
+        # hardens that path, but same-user processes are not isolated on
+        # Windows, so the pair stays refused until a deliberate later
+        # change lifts it (Drew's call, with tool-shell network policy).
+        print(
+            "error: --invoker sdk-tools with --pr-gate is refused: the "
+            "merge gate would run git and gh with credentials in a "
+            "worktree the executor could have rigged",
+            file=sys.stderr,
+        )
+        return 2
     if args.invoker in ("sdk", "sdk-tools"):
         env_problem = _pin_worker_env() or _tier_map_problem()
         if env_problem is not None:
@@ -483,7 +516,6 @@ def _cmd_start(args: argparse.Namespace) -> int:
     # the worker is flipped into tools mode by the CARDS_RUNNER_USE_TOOLS
     # env var the spawner now passes through.
     if args.invoker == "sdk-tools":
-        os.environ["CARDS_RUNNER_USE_TOOLS"] = "1"
         # The DaemonConfig's invoker keeps the canonical "sdk" name so
         # spawner.py's existing "if cfg.invoker == 'sdk'" branch keeps
         # working; the env var flips the executor into tool-using mode.
@@ -601,6 +633,25 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
     finally:
         repo.close()
     print(f"reclaimed: {record.card_id} (status={record.status})")
+    return 0
+
+
+def _cmd_trust_repo(args: argparse.Namespace) -> int:
+    """`cards-runner trust-repo <project>`: (re)record the git baseline.
+
+    The baseline is only as good as the repo is right now, which is why
+    this is a human step: look at .git/config and .git/hooks first.
+    """
+    git_safety.configure(git_safety.state_dir_for(args.todo_root))
+    common = git_safety.common_dir_of(args.project_dir.resolve())
+    if common is None:
+        print(f"error: {args.project_dir} is not a git checkout", file=sys.stderr)
+        return 3
+    previous = git_safety.trust_record(common)
+    value = git_safety.trust_repo(common)
+    if previous is not None and previous.quarantined:
+        print(f"quarantine lifted: {common} (was: {previous.reason})")
+    print(f"trusted: {common} baseline={value[:12]}")
     return 0
 
 

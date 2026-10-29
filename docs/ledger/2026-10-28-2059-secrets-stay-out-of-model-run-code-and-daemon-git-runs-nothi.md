@@ -1,0 +1,43 @@
+# 2026-10-28 20:59 CDT - secrets stay out of model-run code, and daemon git runs nothing planted
+- **Who:** PromptBuilder seat (Claude Opus 5.5), answering Drew's question "if a key was set at startup then a worker could pass critical info?" (relayed by Daedalus). Threat model: prompt injection through card text or repo files steering a tool-mode executor.
+- **Why:** a tool-mode executor runs model-chosen commands; if anything it can make run sees the Anthropic key or GitHub credentials, one injected card exfiltrates them, and if the daemon's own git runs what it planted, the daemon executes attacker code with those credentials (and so may Drew's next manual git command).
+- **Found (read at the source, 2026-10-28):** (1) the tool shell inherited the worker's full env, including the ANTHROPIC_API_KEY the spawner injects (`sdk_invoker._build_tool_belt` used `dict(os.environ)`; `tool_env` was never set), so a model-issued `echo %ANTHROPIC_API_KEY%` printed it; (2) the daemon's `git push` / `gh` ran with `os.environ.copy()` (Anthropic key plus GH_TOKEN) in the executor-written worktree, so a planted pre-push hook or `core.hooksPath` would have run with them; the git tool's "read-only `--get` form" for `git config` was a comment with no enforcement; (3) `diff_stats` ran `git diff` there with the daemon env. The verifier was already clean (`verify_card(env={})`). Exposure was latent: (1) needs `--invoker sdk-tools`, (2) also `--pr-gate`, and nothing scheduled runs the daemon.
+- **Change:**
+  - (a) the worker pops the key from its env once `SdkInvoker` holds it, and the tool belt gets a fresh allowlist scrub;
+  - (b) the spawner injects the key only into a worker that can use it (tool mode, or a tier that is not keyless-local); an all-local map, or a pinned map that cannot load, gets none;
+  - (c) new `common/git_safety.py`: every daemon git/gh call in a card worktree uses `hardened_git_env` (allowlist scrub keeping only gh's own credentials, plus `GIT_CONFIG_COUNT` overrides that outrank every config file: an empty `core.hooksPath`, `core.fsmonitor=false`, empty `core.askPass` and `diff.external`, `protocol.ext.allow=never`);
+  - and `git_exec_surface` fingerprints the repo's config files and hooks at claim and at worker exit; ANY change blocks the card before the verifier, merge gate or ledger run git there (this also protects the owner, whose next manual push would otherwise run a planted hook);
+  - (d) the git tool's `config` is read-only (`--get`/`--list`/`config get`/`config list`);
+  - (e) `--invoker sdk-tools` with `--pr-gate` is refused at start;
+  - (g) `diff_stats` adds `--no-ext-diff --no-textconv` and the hardened env.
+- **State after:** runner suite 817/0 (780 before plus 37), ruff clean, git 2.55.0.windows.5. The hook and textconv tests each run a positive control first (the plant fires under a plain git call on this host), then show the hardened call does not fire it. Eleven mutants, one per piece, each turn a test red. (g) measured: with the flags removed, a planted textconv still did not fire under `--numstat` on this git, so the flags are belt and braces, pinned by a test against future git behaviour.
+- **Not closed (residual, said plainly):** same-user processes on Windows are not isolated, so a model-run payload could still read another process's memory (the worker or daemon holding the key); and tool shells have network access. Those need OS-level isolation and a network policy, a separate design call (Drew).
+- **r2 (after Deep Verify r1 FAIL, 2026-10-28 evening):** the claim-to-exit fingerprint was replaced by a structural fix.
+  - F1: worktree prep ran git with the daemon's full env. Now ONE runner, `git_safety.run_git`, handles every daemon git/gh call. A source scan pins that no other daemon module launches a process.
+  - F2: the tool shell could write the owner's ~/.gitconfig.
+    - Daemon git now reads the null device as its global and system config, so nothing can be written into it between a check and git's read. The credential.helper list is reset and gh's helper is pinned back. Measured against a private repo: rc=0 with gh, rc=128 without.
+    - The tool shell gets a throwaway profile: HOME, USERPROFILE, APPDATA, LOCALAPPDATA and XDG_CONFIG_HOME. Only the commit identity is carried over.
+  - F3, F4, F7: the config+hooks baseline is recorded at the daemon's first touch of a project. It is persisted daemon-side and never re-taken at claim, and it is checked before EVERY git call.
+    - A mismatch quarantines the repo until `cards-runner trust-repo`.
+    - `[branch]` sections are not hashed, so the daemon's own `push -u` does not trip it.
+    - The common dir is read from disk, and a repointed worktree `.git` is refused. GIT_CEILING_DIRECTORIES stops git walking up.
+  - The in-memory trust records are authoritative for a running daemon: deleting or rewriting the on-disk store (a fixed relative path from every worktree) can neither re-arm first sight nor lift a quarantine. A `trust-repo` run from another process therefore takes effect at the daemon's next start. `git`, `gh` and `powershell.exe` are resolved to absolute paths once at daemon boot, so a later PATH plant does not change what the daemon runs. `diff_stats` raises on a quarantined repo instead of reporting an empty diff. F5: the CLI is the only tools-mode switch.
+  - F6: `_prepare_and_spawn` is driven on a real repo.
+  - F10: the git tool refuses `config` reads of other files or scopes.
+  - Results: suite 842/0 and ruff clean. Each F-item has a positive control, and 18 mutants over the r2 changes all turn red.
+- **r3 (after Deep Verify r2 PASS WITH WARNINGS, 2026-10-28 night):**
+  - N1: r2's own config reader split on a lone CR and git doesn't, which hid exec keys from the hash (the verifier demonstrated it). Config is now hashed as GIT parses it (`git config --file --no-includes --null --list`), minus only `branch.<name>.remote/merge/gh-merge-base`. A differential test checks the result against `git config --list`, and the N1 test fails under a faithful copy of the r2 reader.
+  - R18: per-worktree `config.worktree` files are hashed.
+  - The tool shell sets `GIT_CONFIG_NOSYSTEM`, `GCM_INTERACTIVE=never` and `GIT_TERMINAL_PROMPT=0`, so git's system-configured helper (GCM, which reads Windows Credential Manager) is not reachable through git. Commit-relevant settings are carried over.
+  - R30: the push's GitHub credentials are pinned by a test.
+  - The process-launch scan is AST-based (aliases, from-imports, getattr, os.spawn/exec, importlib).
+  - Suite 871/0, and 23 r2+r3 mutants all red.
+- **r2 residuals (said plainly):**
+  - N2: any same-user process can read Windows Credential Manager (Drew's github, gh, ghcr and huggingface entries). `GIT_CONFIG_NOSYSTEM` closes only git's own route to it. Only OS isolation closes it.
+  - Everything is still same-user. A payload can write absolute paths. A `git.exe` planted into a user-writable PATH dir such as `C:\Users\Drama\bin` reaches the daemon only if it lands before the daemon boots (the executor's own tool git is always PATH-resolved). The on-disk trust store is re-read by a restarted daemon. It can also read process memory.
+  - Tool shells have network access.
+  - A repo's legitimate `include.path` target is not hashed.
+  - The first baseline is only as clean as the repo was at first sight.
+  - The verifier's shell ACs still run in the daemon process. They use env={} but no job object (LegionBuild's "second seam").
+  - The structural fix is R1/R2 in C:\dev\_status\WORKER_ISOLATION_OPTIONS_2026-10-28.md: a throwaway clone, plus the patch returned as data. It is queued next.
+- **Refs:** common/git_safety.py; worker_stub/sdk_invoker.py `from_env`, `_build_tool_belt`; daemon/spawner.py `_worker_needs_the_key`; daemon/pr_lifecycle.py `_run`; daemon/diff_stats.py; daemon/daemon.py `_repo_untrusted_after_run`, `_route_untrusted_repo_to_blocked`; daemon/worktree.py `_run_powershell_git`; cli `trust-repo`; worker_stub/tools.py `_git_config_is_read_only`; tests/test_secret_isolation.py, tests/test_merge_gate.py, tests/test_git_runner_seam.py

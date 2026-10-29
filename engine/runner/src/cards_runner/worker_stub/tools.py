@@ -34,10 +34,15 @@ Sandboxing posture:
   Object wrapping the worker is the hard isolation backstop; this
   layer's job is to make accidental escapes loud, not to be a
   security boundary against a hostile executor.
-- The env block handed to `shell` is the worker's already-scrubbed
-  block (no `ANTHROPIC_*` except the one explicit key the daemon
-  injected; no `GH_TOKEN`; no cloud creds). The tool belt does not
-  re-scrub; it inherits.
+- The env block handed to `shell` and `git` is a fresh allowlist scrub
+  built by `SdkInvoker._build_tool_belt` (no `ANTHROPIC_*`, no tokens, no
+  cloud creds). It used to be the worker's own env, which carried the one
+  key the daemon injects, so a model-issued `echo %ANTHROPIC_API_KEY%`
+  printed it. The worker now also pops that key from its env at start.
+- `git config` through the `git` tool is read-only (`--get`, `--list`,
+  ...). That is defence in depth, not a boundary: `shell` can run git
+  directly, which is why the daemon fingerprints the repo's config and
+  hooks across the run (common/git_safety.py).
 - `git push` and `git remote ...` are not in the verb allowlist.
   Merge orchestration is chunk 4.
 """
@@ -86,8 +91,41 @@ _GIT_ALLOWED_VERBS: frozenset[str] = frozenset({
     "switch",
     "rev-parse",
     "ls-files",
-    "config",         # safety: read-only `--get` form is fine.
+    "config",         # READ forms only; enforced by _git_config_is_read_only.
 })
+
+# `git config` forms that only read. Writing config is how a model would
+# plant core.hooksPath / core.fsmonitor / a credential helper. (This
+# comment used to say "read-only `--get` form is fine" with nothing
+# enforcing it.)
+_GIT_CONFIG_READ_ACTIONS: frozenset[str] = frozenset({
+    "--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l",
+})
+_GIT_CONFIG_READ_MODIFIERS: frozenset[str] = frozenset({
+    "--show-origin", "--show-scope", "--null", "-z", "--name-only",
+    "--local", "--worktree", "--includes", "--no-includes",
+    "--bool", "--int", "--path", "--bool-or-int",
+})
+_GIT_CONFIG_READ_SUBCOMMANDS: frozenset[str] = frozenset({"get", "list"})
+
+
+def _git_config_is_read_only(args: list[str]) -> bool:
+    """True only for a `git config` invocation that cannot write."""
+    if args and args[0] in _GIT_CONFIG_READ_SUBCOMMANDS:  # git >= 2.46 form
+        rest = args[1:]
+        return all(
+            not a.startswith("-") or a in _GIT_CONFIG_READ_MODIFIERS
+            or a.startswith("--type=") or a in _GIT_CONFIG_READ_ACTIONS
+            for a in rest
+        )
+    flags = [a for a in args if a.startswith("-")]
+    if not any(a in _GIT_CONFIG_READ_ACTIONS for a in flags):
+        return False  # `git config key value` (a write) has no read action
+    return all(
+        a in _GIT_CONFIG_READ_ACTIONS or a in _GIT_CONFIG_READ_MODIFIERS
+        or a.startswith("--type=")
+        for a in flags
+    )
 
 # Verbs we MUST refuse outright. They either talk to a remote or are
 # destructive in ways that defeat the worktree-isolation model.
@@ -465,6 +503,11 @@ class ToolBelt:
             raise ToolError(
                 f"git verb {verb!r} is not on the allowlist "
                 f"({sorted(_GIT_ALLOWED_VERBS)})"
+            )
+        if verb == "config" and not _git_config_is_read_only(argv[1:]):
+            raise ToolError(
+                "git config is read-only through the tool belt "
+                "(--get, --get-all, --get-regexp, --list, `config get`, `config list`)"
             )
         if verb == "reset" and any(a == "--hard" for a in argv[1:]):
             raise ToolError(

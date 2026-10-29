@@ -40,6 +40,8 @@ from pathlib import Path
 from types import FrameType
 from typing import Any, Optional
 
+from ..common import git_safety
+from ..common.git_safety import RepoQuarantined, UntrustedRepo
 from ..common.locks import FileLock, LockHeldError, pid_alive
 from ..common.logging_setup import setup_daemon_logging
 from ..common.process_group import ManagedProcess
@@ -155,6 +157,9 @@ class Daemon:
         self.cfg = cfg
         self.paths = RuntimePaths.from_root(cfg.todo_root)
         self.paths.ensure()
+        # The trusted git baselines and the empty config files every daemon
+        # git call points at (git_safety). Daemon-side, outside any worktree.
+        git_safety.configure(git_safety.state_dir_for(self.paths.todo_root))
         self.tenant_id = DEFAULT_TENANT
         self._workers: dict[str, _WorkerHandle] = {}
         self._stop_event = threading.Event()
@@ -710,6 +715,11 @@ class Daemon:
                 worktree_path=claim.worktree_path,
                 skip_git=self.cfg.skip_worktree,
             )
+        except (RepoQuarantined, UntrustedRepo) as exc:
+            # Not a rollback: re-claiming would hit the same refusal every
+            # poll. A human re-trusts the repo (`cards-runner trust-repo`).
+            self._route_untrusted_repo_to_blocked(claim, str(exc))
+            return False
         except WorktreeCreateError as exc:
             log.error(
                 "worktree prep failed for %s: %s; rolling back",
@@ -913,7 +923,12 @@ class Daemon:
         self._emit_escalated_events(claim, fields.get("cascade_history"))
         self._record_executor_metrics(claim, fields, sidecar)
 
-        if rc in (EXIT_COST_CAP_HALT, EXIT_HALT_SIGNAL):
+        untrusted = self._repo_untrusted_after_run(claim)
+        if untrusted is not None:
+            # Before ANY routing: the verifier, the merge gate and the
+            # shadow ledger would all run git in this repo next.
+            self._route_untrusted_repo_to_blocked(claim, untrusted)
+        elif rc in (EXIT_COST_CAP_HALT, EXIT_HALT_SIGNAL):
             self._route_halt_to_blocked(claim, rc, sidecar)
         elif rc != 0:
             log.warning(
@@ -1388,6 +1403,48 @@ class Daemon:
         # Contract drift: the executor needed an AC amendment, so the
         # up-front contract did not survive unchanged.
         self._record_contract_outcome(claim.card_id, survived=False)
+
+    def _repo_untrusted_after_run(self, claim: ClaimedCard) -> str | None:
+        """Why the card's repo can no longer be trusted, or None.
+
+        Checks the worktree's repo against the baseline the daemon recorded
+        when it first saw the project (never re-taken at claim, so a
+        change left by an earlier card is not absorbed). A mismatch also
+        quarantines the repo for every later card (git_safety).
+        """
+        if self.cfg.skip_worktree:
+            return None
+        try:
+            git_safety.assert_trusted(claim.worktree_path)
+        except (RepoQuarantined, UntrustedRepo) as exc:
+            return str(exc)
+        return None
+
+    def _route_untrusted_repo_to_blocked(self, claim: ClaimedCard, detail: str) -> None:
+        """Block a card whose repo's git config or hooks are not trusted.
+
+        Git runs programs named there, so the daemon does not run git in
+        this repo again for the card, and a human has to look: the change
+        may also be waiting for the owner's next manual git command.
+        """
+        reason = (
+            "repository git config or hooks changed since it was trusted; "
+            "not running git there. Inspect .git/config and .git/hooks, then "
+            f"`cards-runner trust-repo`. ({detail})"
+        )
+        log.error("routing card_id=%s to blocked: %s", claim.card_id, reason)
+        try:
+            self.repo.transition(
+                claim.card_id,
+                to_status=CardStatus.BLOCKED.value,
+                tenant_id=self.tenant_id,
+                actor_id=claim.attempt_trace_id,
+                actor_type=ActorType.EXECUTOR.value,
+                event_type=EventType.BLOCKED.value,
+                payload={"reason": reason, "error": "repo_untrusted"},
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("failed to block card %s on an untrusted repo: %s", claim.card_id, exc)
 
     def _route_halt_to_blocked(
         self, claim: ClaimedCard, rc: int, sidecar: dict[str, Any]

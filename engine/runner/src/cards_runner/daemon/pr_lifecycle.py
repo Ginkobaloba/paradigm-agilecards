@@ -27,12 +27,13 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+
+from ..common.git_safety import RepoQuarantined, UntrustedRepo, resolved, run_git
 
 
 log = logging.getLogger(__name__)
@@ -196,7 +197,6 @@ class SubprocessGhRunner:
     gh_path: str = "gh"
     git_path: str = "git"
     timeout_sec: float = _DEFAULT_GH_TIMEOUT_SEC
-    env: dict[str, str] | None = None
 
     def is_available(self) -> bool:
         return shutil.which(self.gh_path) is not None and shutil.which(self.git_path) is not None
@@ -340,19 +340,21 @@ class SubprocessGhRunner:
         return self._run(args, cwd=worktree)
 
     def _run(self, args: list[str], *, cwd: Path | None) -> GhCallResult:
-        env = os.environ.copy()
-        if self.env is not None:
-            env.update(self.env)
+        # Through git_safety.run_git, never a bare subprocess: these run in
+        # a worktree the executor wrote to, so git (and the git gh spawns)
+        # must not inherit the daemon's keys, read config the executor
+        # could write, or run anything it planted.
         try:
-            cp = subprocess.run(
+            cp = run_git(
                 args,
-                cwd=str(cwd) if cwd is not None else None,
-                env=env,
-                capture_output=True,
-                text=True,
+                cwd=cwd,
+                keep_gh_credentials=True,
+                gh_path=shutil.which(resolved(self.gh_path)),
                 timeout=self.timeout_sec,
-                check=False,
             )
+        except (RepoQuarantined, UntrustedRepo) as exc:
+            log.error("refusing git/gh call: %s", exc)
+            return GhCallResult(ok=False, reason=f"refused: {exc}")
         except FileNotFoundError as exc:
             log.error("binary not found: %s", exc)
             return GhCallResult(
