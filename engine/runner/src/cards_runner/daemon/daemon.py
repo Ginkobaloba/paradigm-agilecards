@@ -1643,9 +1643,11 @@ class Daemon:
                     card_id=claim.card_id,
                     card_body=card_body,
                     worktree=verify_tree,
-                    env={},  # the daemon owns scrubbing; the verifier
-                             # inherits an empty block, the contract's
-                             # most defensive default.
+                    # The daemon owns scrubbing: no secrets, no PATH, only
+                    # the switches that stop a shell AC's git from reading
+                    # system or global config (credential.helper=manager
+                    # was reachable with env={}: #87 deep verify L5-F1).
+                    env=git_safety.verifier_env(),
                     subjective_client=self._build_subjective_client(),
                     subjective_starting_tier=self.cfg.subjective_starting_tier,
                     subjective_max_tier=self.cfg.subjective_max_tier,

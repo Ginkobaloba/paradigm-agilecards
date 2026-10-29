@@ -395,6 +395,9 @@ def _spawn_win32(
         startupinfo.hStdInput = stdin_h
         startupinfo.hStdOutput = stdout_h
         startupinfo.hStdError = stderr_h
+        # Inherit exactly these three, not every inheritable handle the
+        # daemon happens to hold (#87 deep verify L3-03).
+        startupinfo.lpAttributeList = {"handle_list": sorted({stdin_h, stdout_h, stderr_h})}
 
         flags = (
             _CREATE_SUSPENDED

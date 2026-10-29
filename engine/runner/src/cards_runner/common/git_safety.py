@@ -217,6 +217,22 @@ def hardened_git_env(
     return env
 
 
+def verifier_env() -> dict[str, str]:
+    """The env for the verifier's model-written shell ACs: an empty block
+    (no secrets, no PATH) plus what keeps a `git` run there off the user's
+    and the system's config, credential helpers included."""
+    return {
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GCM_INTERACTIVE": "never",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_VALUE_0": "",
+    }
+
+
 # ---- the baseline ---------------------------------------------------------
 
 

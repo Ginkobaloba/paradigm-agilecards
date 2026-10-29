@@ -211,6 +211,81 @@ def test_forget_uses_the_recorded_pairing_not_a_rewritten_dot_git(tmp_path: Path
         assert str(clone_common) not in git_safety._MEMORY
 
 
+# ---- process and env (L3-02, L3-03, L5-F1, L5-F2) -------------------------
+
+
+def test_shell_output_is_text_mode_again(tmp_path: Path) -> None:
+    """L3-02: an AC expecting 'line1\\nline2' passed on main and failed on
+    cmd.exe's CRLF after the launcher seam."""
+    from cards_runner.verifier.handlers.deterministic import HandlerContext, handle_shell
+    from cards_runner.common.sandbox import LocalProcessLauncher
+    out = handle_shell({"command": "echo line1& echo line2", "expect_contains": "line1\nline2"},
+                       HandlerContext(worktree=tmp_path, env={}, launcher=LocalProcessLauncher()))
+    assert out.passed, out.evidence
+
+
+@windows_only
+def test_a_command_inherits_only_its_std_handles(tmp_path: Path) -> None:
+    """L3-03: with no handle list, a child wrote through an inheritable
+    daemon handle it was never given."""
+    import msvcrt
+    from cards_runner.common.sandbox import LocalProcessLauncher
+    target = tmp_path / "daemon-owned.log"
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT)
+    os.set_inheritable(fd, True)
+    try:
+        handle = msvcrt.get_osfhandle(fd)
+        code = ("import msvcrt, os\n"
+                f"fd = msvcrt.open_osfhandle({handle}, 0)\n"
+                "os.write(fd, b'forged')\n")
+        res = LocalProcessLauncher().run_command([sys.executable, "-c", code], cwd=tmp_path,
+                                                 env=dict(os.environ), timeout=30)
+    finally:
+        os.close(fd)
+    assert target.read_bytes() == b"", "the child wrote through a handle it was not given"
+    assert res.returncode != 0  # control: the attempt itself ran
+
+
+def test_a_command_sees_only_the_env_it_was_given(tmp_path: Path,
+                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    """L5-F2: nothing pinned that the launcher honors `env`."""
+    from cards_runner.common.sandbox import LocalProcessLauncher
+    monkeypatch.setenv("CARDS_TEST_DAEMON_ONLY", "leak")
+    res = LocalProcessLauncher().run_command(["cmd", "/c", "set"], cwd=tmp_path,
+                                             env={"CARDS_TEST_GIVEN": "1"}, timeout=30)
+    assert "CARDS_TEST_GIVEN=1" in res.stdout and "CARDS_TEST_DAEMON_ONLY" not in res.stdout
+
+
+def test_the_verifier_gets_the_hardened_empty_env(setup, repo, paths,
+                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    """L5-F1/L5-F2: no secrets, and git off system and global config."""
+    project, gh, daemon = setup
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-0042")
+    monkeypatch.setenv("GH_TOKEN", "gho_test0042")
+    _insert(repo, "bTST-DV-env", project)
+    claim = _spawned(daemon, repo, paths, "bTST-DV-env", monkeypatch)
+    (claim.worktree_path / "anything").write_text("x\n", encoding="utf-8")
+    assert emit_patch(worktree=claim.worktree_path, base_sha=claim.base_sha, run_dir=claim.run_dir)
+    import cards_runner.daemon.daemon as dm
+    seen: list[dict[str, str]] = []
+    real = dm.verify_card
+    monkeypatch.setattr(dm, "verify_card", lambda **kw: (seen.append(kw["env"]), real(**kw))[1])
+    _exit(daemon, claim)
+    assert seen and seen[0] == git_safety.verifier_env()
+    assert not any("sk-ant" in v or "gho_" in v for v in seen[0].values())
+
+
+def test_a_shell_ac_git_cannot_see_a_system_credential_helper(tmp_path: Path) -> None:
+    git = git_safety.resolved("git")
+    cmd = [git, "config", "--get-all", "credential.helper"]
+    control = subprocess.run(cmd, cwd=tmp_path, env={}, capture_output=True, text=True)
+    if not control.stdout.strip():
+        pytest.skip("no system or global credential.helper on this machine: no control")
+    hardened = subprocess.run(cmd, cwd=tmp_path, env=git_safety.verifier_env(),
+                              capture_output=True, text=True)
+    assert hardened.stdout.strip() == "", hardened.stdout
+
+
 # ---- L4-2: the tick never wedges ------------------------------------------
 
 

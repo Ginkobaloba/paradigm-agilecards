@@ -58,6 +58,10 @@ def _read_capped(handle: BinaryIO) -> str:
     handle.seek(0)
     data = handle.read(OUTPUT_CAP_BYTES + 1)
     text = data[:OUTPUT_CAP_BYTES].decode("utf-8", errors="replace")
+    # Text mode, as `subprocess.run(text=True)` gave the shell handler
+    # before the launcher seam: an AC expecting "a\nb" passed on main and
+    # failed on cmd.exe's "a\r\nb" (#87 deep verify L3-02).
+    text = text.replace("\r\n", "\n")
     return text + ("\n[output truncated]" if len(data) > OUTPUT_CAP_BYTES else "")
 
 
