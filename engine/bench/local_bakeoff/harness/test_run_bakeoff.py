@@ -256,6 +256,7 @@ def test_main_reaches_the_arm_on_the_unedited_copy(exam_copy: Path,
                                                     monkeypatch: pytest.MonkeyPatch) -> None:
     """The positive control for the refusals above."""
     reached = []
+    monkeypatch.setattr(rb, "positive_control", lambda: [])  # tested on its own below
     monkeypatch.setattr(rb, "run_arm", lambda **kw: reached.append(kw) or {"arm_valid": True})
     monkeypatch.setattr(rb, "render_md", lambda s: "")
     assert rb.main(["--arm", "A", "--no-lease"]) == 0
@@ -302,7 +303,7 @@ def test_ollama_client_sends_the_native_payload_and_reads_timings() -> None:
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             seen.append((self.path, body))
             reply = ({"message": {"content": "<<<FILE a.py>>>\nx\n<<<END FILE>>>",
-                                  "thinking": "hmm"},
+                                  "thinking": "hmm"}, "done": True, "done_reason": "stop",
                       "prompt_eval_count": 900, "eval_count": 40, "eval_duration": 2e9}
                      if self.path == "/api/chat" else {"load_duration": 3e9})
             data = json.dumps(reply).encode()
@@ -383,7 +384,217 @@ def test_a_decoy_in_think_does_not_count_against_the_real_answer(tmp_path: Path)
     record = json.loads((tmp_path / "out" / "runs.jsonl").read_text().splitlines()[0])
     assert record["passed"] is True  # primary: the decoy is gone
     assert record["raw_passed"] is False  # raw: a duplicate path is a parse failure
-    assert summary["inline_think_runs"] == 1
+    assert summary["think_flags"]["inline_think"] == 1
+
+
+# ---- PROTOCOL.md v2: A2, outcomes, the infra rule, validity ---------------
+
+
+@pytest.mark.parametrize("content,expected,flags", [
+    ("draft</think>answer", "answer", {"orphan_think_close"}),
+    ("x<think>a</think>y", "xy", {"inline_think"}),
+    ("pre</think>a<think>b</think>c", "ac", {"orphan_think_close", "inline_think"}),
+    ("<think>never closed", "<think>never closed", {"unclosed_think"}),
+    ("<think>a<think>b</think>c</think>d", "c</think>d", {"inline_think", "nested_think",
+                                                          "unclosed_think"}),
+    ("plain", "plain", set()),
+])
+def test_strip_think_a2_then_a1(content: str, expected: str, flags: set[str]) -> None:
+    stripped, got = rb.strip_think(content)
+    assert stripped == expected
+    assert {k for k, v in got.items() if v} == flags
+
+
+def test_an_orphan_closer_drops_the_draft_before_it(tmp_path: Path) -> None:
+    cards = [c for c in rb.load_cards() if c.card_id == "bk-01"]
+    reply = (_blocks({"tally/money.py": "broken = True"}) + "</think>\n"
+             + _blocks(_solution("bk-01")))
+    summary = _run(tmp_path, lambda user: reply, cards=cards)
+    record = json.loads((tmp_path / "out" / "runs.jsonl").read_text().splitlines()[0])
+    assert record["orphan_think_close"] is True and record["passed"] is True
+    assert record["raw_passed"] is False  # the sensitivity line sees A2 too
+    assert summary["think_flags"]["orphan_think_close"] == 1
+
+
+def _row(cid: str, out: str, run: int = 1, **kw: Any) -> dict[str, Any]:
+    return {"card_id": cid, "run": run, "outcome": out, "passed": out == "pass",
+            "forged": out == "forged", "touched_tests": [], "suspect": [],
+            "started_at": 0.0, "ended_at": 1.0, **kw}
+
+
+EXAM_IDS = sorted({f"bk-{i:02d}" for i in range(1, 13)} - rb.NEGATIVE_CONTROLS)
+
+
+def _arm(outcomes_by_run: list[dict[str, str]], runs: int) -> list[dict[str, Any]]:
+    rows = []
+    for run in range(1, runs + 1):
+        for cid in EXAM_IDS:
+            rows.append(_row(cid, outcomes_by_run[run - 1].get(cid, "pass"), run))
+        rows += [_row(cid, "ac_failure", run, verdict="fail") for cid in sorted(rb.NEGATIVE_CONTROLS)]
+    return rows
+
+
+def test_infra_errors_leave_the_denominator_and_are_reported() -> None:
+    rows = _arm([{"bk-01": "infra_error"}, {}, {}], runs=3)
+    s = rb.summarize("T", "m", rows, runs=3)
+    assert s["card_runs"] == 30 and s["answered_card_runs"] == 29 and s["infra_errors"] == 1
+    assert s["pass_at_1"] == 1.0 and s["pass_at_1_errors_as_fails"] == pytest.approx(29 / 30)
+    assert s["pass_pow_3"] == 1.0 and s["pass_pow_3_cards_left_out"] == 1
+    assert s["arm_valid"], s["invalid_reasons"]
+
+
+def test_the_infra_cap_is_ten_percent_of_exam_card_runs() -> None:
+    three = _arm([{"bk-01": "infra_error"}, {"bk-02": "infra_error"}, {"bk-03": "infra_error"}], 3)
+    assert rb.summarize("T", "m", three, runs=3)["arm_valid"]  # 3/30 is not more than 10%
+    four = _arm([{"bk-01": "infra_error", "bk-05": "infra_error"}, {"bk-02": "infra_error"},
+                 {"bk-03": "infra_error"}], 3)
+    s = rb.summarize("T", "m", four, runs=3)
+    assert not s["arm_valid"] and "exceed 10%" in s["invalid_reasons"][0]
+
+
+def test_a_card_with_no_answered_run_invalidates_the_arm() -> None:
+    rows = _arm([{"bk-07": "infra_error"}] * 3, runs=3)  # 3/30: under the cap
+    s = rb.summarize("T", "m", rows, runs=3)
+    assert not s["arm_valid"] and s["invalid_reasons"] == ["bk-07 has no non-error run"]
+
+
+def test_a_control_counts_as_passed_by_its_verdict_even_when_flagged() -> None:
+    """S-F3: v1 counted control passes from `passed`, which a flag could mask."""
+    rows = _arm([{}], runs=1)
+    control = next(r for r in rows if r["card_id"] == "bk-04")
+    control.update(verdict=rb.VERDICT_PASS, suspect=["tally/legacy.py: sys.modules"])
+    s = rb.summarize("T", "m", rows, runs=1)
+    assert not s["arm_valid"] and s["controls"]["passes"] == 1
+
+
+@pytest.mark.parametrize("drop", ["bk-04", "bk-09"])
+def test_controls_that_did_not_run_invalidate_the_arm(drop: str) -> None:
+    rows = [r for r in _arm([{}], runs=1) if r["card_id"] != drop]
+    s = rb.summarize("T", "m", rows, runs=1)
+    assert not s["arm_valid"] and "controls ran 1 times, not 2" in s["invalid_reasons"]
+
+
+def test_time_statistics_cover_answered_exam_runs_only() -> None:
+    rows = _arm([{"bk-01": "infra_error"}], runs=1)
+    answered = [r for r in rows if r["outcome"] != "infra_error" and r["card_id"] in EXAM_IDS]
+    for seconds, r in enumerate(answered, start=1):  # 1..9: the median is 5
+        r["ended_at"] = float(seconds)
+    for r in rows:
+        if r not in answered:  # the infra row and both controls
+            r["ended_at"] = 0.001 if r["outcome"] == "infra_error" else 100.0
+    assert rb.summarize("T", "m", rows, runs=1)["median_card_seconds"] == 5.0
+
+
+@pytest.mark.parametrize("reply_kw,record_kw,expected", [
+    ({"error_kind": "infra"}, {}, "infra_error"),
+    ({"error_kind": "timeout"}, {}, "model_timeout"),
+    ({"done_reason": "length"}, {"parsed": False}, "truncated"),
+    ({"prompt_tokens": 5600, "output_tokens": 26600}, {"parsed": False}, "truncated"),
+    ({"prompt_tokens": 5600, "output_tokens": 900}, {"parsed": False}, "parse_failure"),
+    ({}, {"parsed": True}, "ac_failure"),
+    ({}, {"parsed": True, "verifier_timeout": True}, "verifier_timeout"),
+    ({}, {"parsed": True, "forged": True}, "forged"),
+    ({"done_reason": "length"}, {"parsed": True, "passed": True}, "pass"),
+])
+def test_outcomes(reply_kw: dict[str, Any], record_kw: dict[str, Any], expected: str) -> None:
+    record = {"passed": False, "forged": False, "verifier_timeout": False, "parsed": False,
+              **record_kw}
+    assert rb.outcome(record, rb.Reply("", 0.0, 1.0, **reply_kw), 32768) == expected
+
+
+def _server(handler_fn):  # noqa: ANN001, ANN202
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            self.rfile.read(int(self.headers["Content-Length"]))
+            status, body = handler_fn(self.path)
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a: Any) -> None:
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+@pytest.mark.parametrize("status,body,kind", [
+    (500, {"error": "boom"}, "infra"),
+    (200, {"error": "model failed to load"}, "infra"),
+    (200, {"message": {"content": "x"}, "done": False}, "infra"),
+    (200, {"message": {"content": "x"}}, "infra"),
+    (200, {"message": {"content": "x"}, "done": True, "done_reason": "stop"}, None),
+])
+def test_the_client_tells_an_infra_error_from_an_answer(status: int, body: dict[str, Any],
+                                                         kind: str | None) -> None:
+    server = _server(lambda path: (status, body))
+    try:
+        reply = rb.OllamaClient("m:1", host=f"http://127.0.0.1:{server.server_port}").chat("s", "u")
+    finally:
+        server.shutdown()
+    assert reply.error_kind == kind
+    assert (reply.content == "") == (kind is not None)
+
+
+def test_a_slow_model_is_a_model_timeout_not_infra() -> None:
+    def slow(path: str) -> tuple[int, dict[str, Any]]:
+        time.sleep(3)
+        return 200, {"message": {"content": "late"}, "done": True}
+
+    server = _server(slow)
+    try:
+        reply = rb.OllamaClient("m:1", host=f"http://127.0.0.1:{server.server_port}",
+                                timeout_sec=0.5).chat("s", "u")
+    finally:
+        server.shutdown()
+    assert reply.error_kind == "timeout"
+
+
+def test_an_infra_error_is_recorded_unscored_through_run_arm(tmp_path: Path) -> None:
+    cards = [c for c in rb.load_cards() if c.card_id == "bk-01"]
+
+    class Down(FakeClient):
+        def chat(self, system: str, user: str) -> rb.Reply:
+            return rb.Reply("", 0.0, 0.0, error="URLError: refused", error_kind="infra")
+
+    summary = rb.run_arm(arm="T", client=Down(lambda u: ""), runs=1, out_dir=tmp_path / "out",
+                         vram=NoVram(), probe=False, cards=cards)
+    record = json.loads((tmp_path / "out" / "runs.jsonl").read_text().splitlines()[0])
+    assert record["outcome"] == "infra_error" and record["parsed"] is False
+    assert record["parse_failure"] is None and "verdict" not in record  # never scored
+    assert summary["outcomes"]["parse_failure"] == 0 and summary["infra_errors"] == 1
+    assert summary["pass_at_1"] is None and not summary["arm_valid"]
+
+
+def test_the_positive_control_passes_on_the_real_toolchain() -> None:
+    assert rb.positive_control() == []
+
+
+def test_the_positive_control_catches_a_venv_without_python(monkeypatch: pytest.MonkeyPatch,
+                                                            capsys: pytest.CaptureFixture[str]
+                                                            ) -> None:
+    """S-F5/I-F4: a dead toolchain scored as a weak model in v1."""
+    real = rb.verify_env
+
+    def broken() -> dict[str, str]:
+        env = real()
+        env["PATH"] = env["PATH"].split(";")[-1]  # System32 only: no python
+        return env
+
+    monkeypatch.setattr(rb, "verify_env", broken)
+    problems = rb.positive_control()
+    # All ten: the eight pytest cards fail their AC, and the two file-only
+    # cards (bk-05, bk-08) pass their ACs but the canary cannot run.
+    assert len(problems) == 10 and all("reference failed" in p for p in problems)
+    assert sum("canary" in p for p in problems) == 2
+    for name in ("scorer_problems", "frozen_tree_problems", "results_problems"):
+        monkeypatch.setattr(rb, name, lambda: [])
+    monkeypatch.setattr(rb, "run_arm", lambda **kw: pytest.fail("reached run_arm"))
+    assert rb.main(["--arm", "A", "--no-lease"]) == 2
+    assert "toolchain is broken" in capsys.readouterr().out
 
 
 def test_every_row_and_the_summary_carry_the_exam_and_the_scorer(tmp_path: Path) -> None:

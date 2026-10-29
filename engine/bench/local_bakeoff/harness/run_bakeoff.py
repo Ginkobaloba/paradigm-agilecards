@@ -210,6 +210,10 @@ class Reply:
     output_tokens: int | None = None
     eval_seconds: float | None = None
     error: str | None = None
+    # PROTOCOL.md v2: "infra" (the call failed: no answer to score) or
+    # "timeout" (the model was too slow: a model failure). None: an answer.
+    error_kind: str | None = None
+    done_reason: str | None = None
 
 
 class ModelClient(Protocol):
@@ -263,9 +267,18 @@ class OllamaClient:
                              {"role": "user", "content": user}],
             })
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-            return Reply("", started, time.time(), error=f"{type(exc).__name__}: {exc}")
+            slow = isinstance(exc, TimeoutError) or isinstance(
+                getattr(exc, "reason", None), TimeoutError)
+            return Reply("", started, time.time(), error=f"{type(exc).__name__}: {exc}",
+                         error_kind="timeout" if slow else "infra")
+        if data.get("error") or data.get("done") is not True:
+            # An HTTP 200 can still carry a failure; v1 scored it an empty reply.
+            return Reply("", started, time.time(), error_kind="infra",
+                         error=f"bad response: error={data.get('error')!r} "
+                               f"done={data.get('done')!r}")
         message = data.get("message") or {}
         return Reply(
+            done_reason=data.get("done_reason"),
             content=message.get("content") or "",
             started_at=started, ended_at=time.time(),
             thinking_chars=len(message.get("thinking") or ""),
@@ -334,12 +347,28 @@ class VramSampler:
 # ---- PROTOCOL.md amendment A1: inline reasoning --------------------------
 
 _THINK = re.compile(r"<think>.*?</think>", re.S)
+_OPEN, _CLOSE = "<think>", "</think>"
 
 
 def strip_inline_think(content: str) -> tuple[str, bool]:
-    """Remove every complete `<think>...</think>` block. An unclosed tag stays."""
+    """A1: remove every complete `<think>...</think>` block. An unclosed tag stays."""
     stripped, count = _THINK.subn("", content)
     return stripped, count > 0
+
+
+def strip_think(content: str) -> tuple[str, dict[str, bool]]:
+    """A2 then A1 (PROTOCOL.md v2). An orphan `</think>` (no `<think>` before
+    it, as a template that pre-fills the opener produces) removes everything
+    up to and including it; then every complete pair goes. Flags say which
+    forms were present, so a reader can see what the stripping did."""
+    close, opener = content.find(_CLOSE), content.find(_OPEN)
+    orphan = close != -1 and (opener == -1 or opener > close)
+    rest = content[close + len(_CLOSE):] if orphan else content
+    nested = any(_OPEN in m.group(0)[len(_OPEN):] for m in _THINK.finditer(rest))
+    stripped, inline = strip_inline_think(rest)
+    return stripped, {"inline_think": inline, "orphan_think_close": orphan,
+                      "nested_think": nested,
+                      "unclosed_think": _OPEN in stripped or _CLOSE in stripped}
 
 
 # ---- verifying one reply ------------------------------------------------
@@ -492,7 +521,9 @@ def score_reply(card: Card, reply_text: str, *, verify=None,  # noqa: ANN001
     record: dict[str, Any] = {"parsed": parsed.ok, "parse_failure": parsed.failure,
                               "blocks": len(parsed.blocks), "touched_tests": [],
                               "suspect": [], "passed": False, "ac": [],
-                              "verifier_timeout": False, "forged": False}
+                              "verifier_timeout": False, "forged": False,
+                              "think_in_block": any(_OPEN in b.content or _CLOSE in b.content
+                                                    for b in parsed.blocks)}
     if not parsed.ok:
         return record
     with tempfile.TemporaryDirectory(prefix="bakeoff-") as tmp:
@@ -553,36 +584,113 @@ def refusal_probe(client: ModelClient) -> list[dict[str, Any]]:
 # ---- an arm -------------------------------------------------------------
 
 
+OUTCOMES = ("pass", "parse_failure", "truncated", "ac_failure", "verifier_timeout", "forged",
+            "model_timeout", "infra_error")
+INFRA_CAP = 0.10  # PROTOCOL.md v2: more than this share of exam card-runs invalidates
+TRUNCATION_SHARE = 0.98
+THINK_FLAGS = ("inline_think", "orphan_think_close", "nested_think", "unclosed_think",
+               "think_in_block")
+
+
+def outcome(record: dict[str, Any], reply: Reply, num_ctx: int | None) -> str:
+    """Exactly one outcome per card-run (PROTOCOL.md v2 "Outcomes")."""
+    if reply.error_kind == "infra":
+        return "infra_error"
+    if reply.error_kind == "timeout":
+        return "model_timeout"
+    if record["passed"]:
+        return "pass"
+    if record["forged"]:
+        return "forged"
+    if record["verifier_timeout"]:
+        return "verifier_timeout"
+    used = (reply.prompt_tokens or 0) + (reply.output_tokens or 0)
+    if reply.done_reason == "length" or (num_ctx and used >= TRUNCATION_SHARE * num_ctx):
+        return "truncated"
+    return "ac_failure" if record["parsed"] else "parse_failure"
+
+
+def _median(values: list[float]) -> float | None:
+    return sorted(values)[len(values) // 2] if values else None
+
+
 def summarize(arm: str, model: str, records: list[dict[str, Any]], runs: int) -> dict[str, Any]:
     exam = [r for r in records if r["card_id"] not in NEGATIVE_CONTROLS]
     controls = [r for r in records if r["card_id"] in NEGATIVE_CONTROLS]
-    by_card: dict[str, list[bool]] = {}
+    answered = [r for r in exam if r["outcome"] != "infra_error"]
+    infra = len(exam) - len(answered)
+    passes = sum(r["outcome"] == "pass" for r in exam)
+    by_card: dict[str, list[dict[str, Any]]] = {}
     for r in exam:
-        by_card.setdefault(r["card_id"], []).append(r["passed"])
-    seconds = [r["ended_at"] - r["started_at"] for r in records]
-    control_passes = [r for r in controls if r["passed"]]
+        by_card.setdefault(r["card_id"], []).append(r)
+    clean_cards = {cid: rs for cid, rs in by_card.items()
+                   if len(rs) == runs and all(r["outcome"] != "infra_error" for r in rs)}
+    # A control counts as passed by the verifier's verdict, whatever else was
+    # flagged, and it must actually have run (PROTOCOL.md v2).
+    control_passes = [r for r in controls if r.get("verdict") == VERDICT_PASS]
+    controls_ran = [r for r in controls if r["outcome"] != "infra_error"]
+    invalid = []
+    if exam and infra > INFRA_CAP * len(exam):
+        invalid.append(f"infra errors {infra}/{len(exam)} exceed {INFRA_CAP:.0%}")
+    invalid += [f"{cid} has no non-error run" for cid, rs in sorted(by_card.items())
+                if all(r["outcome"] == "infra_error" for r in rs)]
+    if control_passes:
+        invalid.append(f"a negative control passed ({len(control_passes)} run(s))")
+    if len(controls_ran) != len(NEGATIVE_CONTROLS) * runs:
+        invalid.append(f"controls ran {len(controls_ran)} times, "
+                       f"not {len(NEGATIVE_CONTROLS) * runs}")
+    forged = [{"card_id": r["card_id"], "run": r["run"]} for r in records if r["forged"]]
+    if forged:
+        invalid.append(f"forged card-runs: {len(forged)}")
     return {
         "label": LABEL, "arm": arm, "model": model, "runs_per_card": runs,
-        "card_runs": len(exam),
-        "pass_at_1": sum(r["passed"] for r in exam) / len(exam) if exam else None,
-        # PROTOCOL.md A1 sensitivity: the same runs scored on the raw reply.
-        "pass_at_1_raw": sum(r.get("raw_passed", r["passed"]) for r in exam) / len(exam)
-        if exam else None,
-        "inline_think_runs": sum(bool(r.get("inline_think")) for r in records),
-        "pass_pow_3": (sum(all(v) and len(v) == runs for v in by_card.values()) / len(by_card)
-                       if by_card else None),
-        "parse_failures": sum(not r["parsed"] for r in exam),
-        "ac_failures": sum(r["parsed"] and not r["passed"] and not r["suspect"] for r in exam),
-        "model_errors": sum(bool(r.get("model_error")) for r in records),
+        "card_runs": len(exam), "answered_card_runs": len(answered),
+        # pass@1 is over card-runs the model answered; infra errors are not answers.
+        "pass_at_1": passes / len(answered) if answered else None,
+        "pass_at_1_errors_as_fails": passes / len(exam) if exam else None,
+        "infra_errors": infra,
+        # PROTOCOL.md A1/A2 sensitivity: the same runs scored on the raw reply.
+        "pass_at_1_raw": (sum(r.get("raw_passed", r["passed"]) for r in answered) / len(answered)
+                          if answered else None),
+        "think_flags": {f: sum(bool(r.get(f)) for r in records) for f in THINK_FLAGS},
+        "pass_pow_3": (sum(all(r["outcome"] == "pass" for r in rs) for rs in clean_cards.values())
+                       / len(clean_cards) if clean_cards else None),
+        "pass_pow_3_cards_left_out": len(by_card) - len(clean_cards),
+        "outcomes": {o: sum(r["outcome"] == o for r in exam) for o in OUTCOMES},
+        "parse_failures": sum(r["outcome"] == "parse_failure" for r in exam),
+        "ac_failures": sum(r["outcome"] == "ac_failure" for r in exam),
         "touched_tests_runs": sum(bool(r["touched_tests"]) for r in records),
         "suspect": [{"card_id": r["card_id"], "run": r["run"], "hits": r["suspect"]}
                     for r in records if r["suspect"]],
-        "controls": {"runs": len(controls), "passes": len(control_passes)},
-        "forged": [{"card_id": r["card_id"], "run": r["run"]} for r in records if r.get("forged")],
-        "verifier_timeouts": sum(bool(r.get("verifier_timeout")) for r in records),
-        "arm_valid": not control_passes and not any(r.get("forged") for r in records),
-        "median_card_seconds": sorted(seconds)[len(seconds) // 2] if seconds else None,
+        "controls": {"runs": len(controls_ran), "passes": len(control_passes)},
+        "forged": forged,
+        "invalid_reasons": invalid,
+        "arm_valid": not invalid,
+        # Time over answered exam card-runs only: fast errors would drag it down.
+        "median_card_seconds": _median([r["ended_at"] - r["started_at"] for r in answered]),
     }
+
+
+def positive_control() -> list[str]:
+    """PROTOCOL.md v2: before any model loads, the twelve reference solutions
+    go through the same verifier environment. Empty list: the toolchain works."""
+    problems = []
+    for card in load_cards():
+        root = SOLUTIONS / card.card_id
+        files = {p.relative_to(root).as_posix(): p.read_text(encoding="utf-8")
+                 for p in sorted(root.rglob("*")) if p.is_file()}
+        reply = "\n".join(f"<<<FILE {k}>>>\n{v.rstrip(chr(10))}\n<<<END FILE>>>"
+                          for k, v in files.items())
+        record = score_reply(card, reply)
+        expected = card.card_id not in NEGATIVE_CONTROLS
+        if record["passed"] != expected:
+            why = (record["parse_failure"]
+                   or ("the canary did not report one failure" if record["forged"] else None)
+                   or ("verifier timeout" if record["verifier_timeout"] else None)
+                   or [a for a in record["ac"] if not a["passed"]][:1])
+            problems.append(f"{card.card_id}: reference "
+                            f"{'failed' if expected else 'PASSED'}: {why}")
+    return problems
 
 
 def run_arm(*, arm: str, client: ModelClient, runs: int, out_dir: Path,
@@ -609,18 +717,28 @@ def run_arm(*, arm: str, client: ModelClient, runs: int, out_dir: Path,
                               "output_tokens": reply.output_tokens,
                               "eval_seconds": reply.eval_seconds,
                               "thinking_chars": reply.thinking_chars,
-                              "model_error": reply.error,
+                              "model_error": reply.error, "error_kind": reply.error_kind,
+                              "done_reason": reply.done_reason,
                               "reply_sha256": hashlib.sha256(reply.content.encode()).hexdigest()}
-                    stripped, inline_think = strip_inline_think(reply.content)
-                    record.update(label_set, inline_think=inline_think)
-                    record.update(score_reply(card, stripped, verify=verify))  # A1: primary
-                    # A1 sensitivity: the raw reply, scored only when it differs.
-                    record["raw_passed"] = (score_reply(card, reply.content, verify=verify)["passed"]
-                                            if inline_think else record["passed"])
+                    stripped, flags = strip_think(reply.content)
+                    changed = stripped != reply.content
+                    record.update(label_set, **flags)
+                    if reply.error_kind == "infra":  # no answer: nothing to score
+                        record.update(parsed=False, parse_failure=None, blocks=0,
+                                      touched_tests=[], suspect=[], passed=False, ac=[],
+                                      verifier_timeout=False, forged=False,
+                                      think_in_block=False, raw_passed=False)
+                    else:
+                        record.update(score_reply(card, stripped, verify=verify))  # A2+A1: primary
+                        # Sensitivity: the raw reply, scored only when stripping changed it.
+                        record["raw_passed"] = (
+                            score_reply(card, reply.content, verify=verify)["passed"]
+                            if changed else record["passed"])
+                    record["outcome"] = outcome(record, reply, getattr(client, "num_ctx", None))
                     (out_dir / "replies").mkdir(exist_ok=True)
                     (out_dir / "replies" / f"{card.card_id}-r{run}.txt").write_text(
                         reply.content, encoding="utf-8")
-                    if inline_think:
+                    if changed:
                         (out_dir / "replies" / f"{card.card_id}-r{run}.stripped.txt").write_text(
                             stripped, encoding="utf-8")
                     sink.write(json.dumps(record) + "\n")
@@ -645,18 +763,22 @@ def render_md(s: dict[str, Any]) -> str:
              f"- Exam {s.get('exam_version')}: digest {s.get('exam_digest')}",
              f"- Scored at {s.get('repo_head')}; scorer {s.get('scorer')}; "
              f"python {s.get('python')}, pytest {s.get('pytest')}",
-             f"- **Valid:** {'yes' if s['arm_valid'] else 'NO, a negative control passed'}",
-             f"- pass@1: {pct(s['pass_at_1'])} over {s['card_runs']} card-runs; "
-             f"pass^3: {pct(s['pass_pow_3'])}",
-             f"- Sensitivity (A1, raw reply incl. inline <think>): pass@1 "
-             f"{pct(s['pass_at_1_raw'])}; runs with inline think: {s['inline_think_runs']}",
-             f"- Parse failures: {s['parse_failures']}; AC failures: {s['ac_failures']}; "
-             f"model errors: {s['model_errors']}; touched tests: {s['touched_tests_runs']}",
+             f"- **Valid:** {'yes' if s['arm_valid'] else 'NO: ' + '; '.join(s['invalid_reasons'])}",
+             f"- pass@1: {pct(s['pass_at_1'])} over {s['answered_card_runs']} answered "
+             f"card-runs; pass^3: {pct(s['pass_pow_3'])} "
+             f"({s['pass_pow_3_cards_left_out']} card(s) left out for an infra error)",
+             f"- Errors as fails: pass@1 {pct(s['pass_at_1_errors_as_fails'])} over "
+             f"{s['card_runs']} card-runs; infra errors: {s['infra_errors']}",
+             f"- Sensitivity (A1/A2, raw reply): pass@1 {pct(s['pass_at_1_raw'])}; "
+             f"think flags: {s['think_flags']}",
+             f"- Outcomes (exam): {s['outcomes']}; touched tests: {s['touched_tests_runs']}",
              f"- Controls: {s['controls']['passes']}/{s['controls']['runs']} passed (must be 0)",
              f"- Load: {s['load']}; median card-run: {s['median_card_seconds']}",
              f"- VRAM (device, MiB): {s['vram']}"]
     for item in s["suspect"]:
-        lines.append(f"- SUSPECT (scored fail, read by hand): {item}")
+        lines.append(f"- SUSPECT (score unchanged, read by hand): {item}")
+    for item in s["forged"]:
+        lines.append(f"- FORGED (the canary passed; scored a fail): {item}")
     for p in s["refusal_probes"]:
         lines.append(f"- Refusal probe {p['probe']}: refused_heuristic={p['refused_heuristic']}")
     return "\n".join(lines) + "\n"
@@ -676,6 +798,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--host", default="http://127.0.0.1:11434")
     ap.add_argument("--num-ctx", type=int, default=32768)
     ap.add_argument("--temperature", type=float, default=None)
+    ap.add_argument("--timeout", type=float, default=1800.0,
+                    help="seconds per model request; exceeding it is a model failure")
     lease = ap.add_mutually_exclusive_group(required=True)
     lease.add_argument("--lease-gb", type=float, help="re-run under with_lease.py")
     lease.add_argument("--no-lease", action="store_true", help="only for a remote model")
@@ -704,10 +828,15 @@ def main(argv: list[str] | None = None) -> int:
                "--gb", str(args.lease_gb), "--", sys.executable, str(Path(__file__).resolve()),
                *(argv if argv is not None else sys.argv[1:])]
         return subprocess.run(cmd, env={**os.environ, "BAKEOFF_LEASED": "1"}).returncode
+    problems = positive_control()  # before the model loads: seconds, no GPU
+    if problems:
+        print("refusing: the reference solutions do not score as they must, so the "
+              "toolchain is broken:\n  " + "\n  ".join(problems))
+        return 2
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out = args.out or HERE / "results" / f"{args.arm}-{stamp}"
     client = OllamaClient(args.model, host=args.host, num_ctx=args.num_ctx,
-                          temperature=args.temperature)
+                          temperature=args.temperature, timeout_sec=args.timeout)
     summary = run_arm(arm=args.arm, client=client, runs=args.runs, out_dir=out)
     print(render_md(summary))
     return 0 if summary["arm_valid"] else 3
