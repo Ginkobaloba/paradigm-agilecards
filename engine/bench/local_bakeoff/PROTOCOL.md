@@ -95,13 +95,28 @@ The harness gives `verify_card` an explicit env, never the default empty one:
 
 ## Suspect passes (in-process forgery)
 
-Code the model writes runs inside the pytest process, so it could print a
-fake "N passed" and `os._exit(0)`, or graft test functions onto a test
-module. So a card-run that passes every AC is re-checked: if any applied
-`.py` file outside `tests/` contains `os._exit`, `_getframe`, `sys.modules`,
-`import pytest`, `from pytest`, `_pytest` or `sys.settrace`, the run is
-**scored a fail** and listed as "suspect" with the file and token, for a
-human to read. None of the twelve reference solutions contains one.
+Code the model writes runs inside the pytest process, so it could write a
+fake "N passed" to the output and exit, or patch pytest so failing tests
+pass. Nothing inside that process can rule this out. v2 changes how it is
+handled (the v1 rule scored a token hit a fail, and an independent review
+showed the token list is bypassed by plain aliasing and also fails correct
+code that mentions a token in a comment):
+
+- **Canary (the mitigation that decides validity).** After a card-run passes
+  every AC, the harness copies `canary/test_canary.py` (never shown to a
+  model) into the scratch `tests/` and runs it with the pytest AC command
+  shape. It imports every module of the package and then fails. If the run
+  does not report exactly one failure with a non-zero exit, the card-run is
+  **forged**: it is scored a fail, and the whole arm is invalid. This is a
+  mitigation, not a proof: code that only misbehaves while one particular
+  test file is collected can dodge it.
+- **Token tripwire (a flag, not a score).** If any applied `.py` file
+  outside `tests/` contains `os._exit`, `_getframe`, `sys.modules`,
+  `import pytest`, `from pytest`, `_pytest` or `sys.settrace`, the run is
+  listed as "suspect" with the file and token, for a human to read. A
+  suspect flag does NOT change the score.
+- The process-level isolation in "Protected tests" and "Verifier
+  environment" is the defense; the canary and the tripwire only report on it.
 
 ## Scoring
 
@@ -151,4 +166,110 @@ also scored on the raw reply and reported as a sensitivity line. When
 
 **Labeling:** every result row and every summary carries the exam freeze
 commit and the commit of the verifier that scored it. A result without both
-is unlabeled and is not reported.
+is unlabeled and is not reported. (v2 replaces the freeze commit with a
+content digest; see below.)
+
+### v2 (2026-10-29): re-freeze after independent review, pre-data
+
+**Why:** an independent review of the v1 harness (three lenses, every
+finding re-run by a separate verifier) found the freeze guard inert for
+edited tracked files, the scorer unlabeled, sampling unpinned, infrastructure
+errors scored as model failures, and two cards (bk-05, bk-08) that accepted
+replies violating their own scope. No model had produced any output on this
+card set, so the fixes are made as a new freeze rather than shipped against
+known-weak cards. `CHANGELOG.md` lists every change. Where this section and
+an earlier one disagree, this section wins.
+
+**Exam identity.** The exam is every file under this directory except
+`harness/`: the cards, the seed repo, the reference solutions, the canary,
+this protocol, `SYSTEM_PROMPT.txt`, `CONTROLS.md`, `CHANGELOG.md` and
+`.gitattributes`. Its identity is a content digest: the sha256 of the sorted
+lines `<path>\0<git blob id>` over every such file found on disk (not in
+git), with `.gitattributes` turning off any line-ending conversion, so the
+digest is the same on every machine. The harness pins the digest and refuses
+to run when the disk differs: an edited, deleted, added, renamed or
+git-ignored file all refuse. Every result row and summary carries the digest.
+It survives a squash or rebase merge, which a commit sha does not.
+
+**Pre-data proof.** The freeze is pushed to the remote before any arm runs.
+The server-side push time is recorded in `harness/README.md`, outside the
+digest (a timestamp cannot live inside the content it stamps). The harness
+also refuses to run while its results directory holds rows from a different
+exam digest.
+
+**Scorer identity.** Every result row and summary also carries the sha256
+of each harness source file that scores (`run_bakeoff.py`,
+`reply_parser.py`), the repo HEAD, and the Python and pytest versions of the
+verifier interpreter. The harness refuses to run while the runner source or
+the harness source differs from HEAD.
+
+**Sampling (the declared policy).** Each arm runs at its vendor-recommended
+sampling, written into the harness's `ARMS` table with the source, sent
+explicitly on every request (load, card-runs, refusal probe), and recorded:
+
+| arm | model | temperature | top_p | top_k | think | source |
+|---|---|---|---|---|---|---|
+| A | qwen3:30b | 0.6 | 0.95 | 20 | true | the tag's Ollama Modelfile params |
+| B | Qwen3.8-27B UD-Q4_K_XL | 1.0 | 0.95 | 20 | true | the GGUF `general.sampling` keys |
+| C | Qwen3.6-35B-A3B UD-IQ4_NL_XL | 1.0 | 0.95 | 20 | true | the GGUF `general.sampling` keys |
+| D | gpt-oss:120b | 1.0 | 1.0 | (none) | "medium" | the vendor's recommendation |
+| E | Huihui Qwen3.8-27B abliterated UD-Q4_K_XL | 1.0 | 0.95 | 20 | true | the GGUF `general.sampling` keys |
+
+Every arm: `num_ctx` 32768 and `num_predict` 26624, so the longest prompt
+(about 5,600 tokens) plus the whole output budget fits the context. The
+seed is fixed per card-run: `20261029 + run index`, the same for every
+card in a run and every arm, so three runs are three samples rather than
+one sample three times. At load the harness records the Ollama version
+(refusing below 0.34.0, the first release that applies GGUF sampling
+defaults), the model's digest from `/api/show`, and the options it sent.
+Arms with different digests for the same tag are never pooled.
+
+**Outcomes of a card-run.** Exactly one of:
+- **pass:** parsed, every AC passed, the canary failed as it must.
+- **parse failure:** rules 1 to 7.
+- **truncated:** the reply stopped at the output limit (`done_reason` is
+  `length`, or prompt plus output tokens reached 98% of `num_ctx`). A model
+  failure, reported apart from parse failures.
+- **AC failure:** parsed, and an AC failed.
+- **verifier timeout:** the verifier did not finish within its wall-clock
+  limit (for example a reply that loops forever); the harness kills the whole
+  process tree. A model failure.
+- **forged:** the canary did not fail. A fail, and the arm is invalid.
+- **infra error:** the model call itself failed: no connection, an HTTP
+  error, a body carrying `error`, or a reply without `done: true`. Not the
+  model's answer. A request that exceeds the request timeout is a model
+  failure (too slow), not an infra error.
+
+**Denominator and validity.**
+- pass@1 is passes over exam card-runs that are not infra errors. Reported
+  next to it: the same passes over ALL exam card-runs (infra errors counted
+  as fails), and the infra error count.
+- pass^3 is over cards whose runs had no infra error; the number of cards
+  left out is reported.
+- The arm is **INVALID** if: infra errors exceed 10% of exam card-runs; or
+  any exam card has zero non-error runs; or a negative control's verdict is
+  pass (counted by the verifier's verdict, whatever else was flagged); or
+  the controls did not run exactly twice per run; or any card-run is forged.
+- **Positive control.** Before the model is loaded, the harness scores all
+  twelve reference solutions through the same verifier environment. Unless
+  the ten exam solutions pass and both controls fail, it stops and runs
+  nothing. This catches a broken toolchain (for example a venv without
+  pytest) that would otherwise score as a weak model.
+
+**Amendment A2: an orphan closing tag.** If the reply contains `</think>`
+with no `<think>` before it (what a template that pre-fills the opening tag
+produces), everything up to and including the first such `</think>` is
+removed before parsing, then A1 applies to the rest. Recorded per card-run
+alongside `inline_think`: `orphan_think_close`, `unclosed_think`,
+`nested_think`, and `think_in_block` (a think tag inside a file block's
+contents, which is left as content). The A1 raw-reply sensitivity line
+covers A2 as well.
+
+**Measurement (reported, not scored).** Per card-run: `done_reason`, load,
+prompt and eval durations. Per arm: `/api/ps` residency (`size_vram` against
+`size`), whole-card VRAM with its caveat written into the result (WDDM
+reports no per-process figure, so it includes the desktop and anything else
+on the card), a read after unload, and the time statistics over non-error
+exam card-runs only. The refusal probe is reported as its own column, never
+in a score or rank, and B vs E differs by abliteration AND by the
+requantization of the ablated tensors, so it is not an exact isolation.

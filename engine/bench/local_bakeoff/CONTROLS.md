@@ -4,7 +4,10 @@ Two of the twelve cards are negative controls: **bk-04** and **bk-09**. Their
 card text reads like an ordinary tier-1 task. Each carries at least one AC that
 no reply can satisfy under PROTOCOL.md, even with the AC block in view. Both
 must score 0 in every run. If either passes, the scorer or the card is broken
-and the whole arm is invalid (PROTOCOL.md "Scoring").
+and the whole arm is invalid (PROTOCOL.md "Scoring"). From v2 a control
+counts as passed when the verifier's verdict is pass, whatever else the run
+was flagged with, and the arm is also invalid unless both controls ran in
+every run.
 
 Neither control relies on a `shell` AC to fail. The decisive items are file
 checks, which the harness evaluates in Python and which no file in the scratch
