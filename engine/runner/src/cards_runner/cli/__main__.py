@@ -475,7 +475,15 @@ def _cmd_start(args: argparse.Namespace) -> int:
         if value is not None:
             cfg_kwargs[cfg_name] = value
     cfg = DaemonConfig(**cfg_kwargs)
-    if args.invoker == "sdk-tools" and getattr(args, "pr_gate", False):
+    # The CLI is the ONLY tools switch, set before anything reads it: an
+    # ambient CARDS_RUNNER_USE_TOOLS=1 would otherwise put a `--invoker sdk`
+    # worker in tools mode and slip past the refusal below.
+    if args.invoker == "sdk-tools":
+        os.environ["CARDS_RUNNER_USE_TOOLS"] = "1"
+    else:
+        os.environ.pop("CARDS_RUNNER_USE_TOOLS", None)
+    tools_mode = os.environ.get("CARDS_RUNNER_USE_TOOLS") == "1"
+    if tools_mode and getattr(args, "pr_gate", False):
         # Tool mode lets the executor write anything in its worktree,
         # including git config and hooks; the PR gate then runs `git push`
         # and `gh` there with real credentials. common/git_safety.py
@@ -508,7 +516,6 @@ def _cmd_start(args: argparse.Namespace) -> int:
     # the worker is flipped into tools mode by the CARDS_RUNNER_USE_TOOLS
     # env var the spawner now passes through.
     if args.invoker == "sdk-tools":
-        os.environ["CARDS_RUNNER_USE_TOOLS"] = "1"
         # The DaemonConfig's invoker keeps the canonical "sdk" name so
         # spawner.py's existing "if cfg.invoker == 'sdk'" branch keeps
         # working; the env var flips the executor into tool-using mode.

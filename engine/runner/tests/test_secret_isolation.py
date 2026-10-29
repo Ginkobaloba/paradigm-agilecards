@@ -205,6 +205,47 @@ def test_sdk_tools_with_the_pr_gate_is_refused(monkeypatch: pytest.MonkeyPatch, 
     assert "sdk-tools with --pr-gate is refused" in capsys.readouterr().err
 
 
+class _Booted(Exception):
+    pass
+
+
+def test_an_ambient_use_tools_cannot_put_an_sdk_worker_in_tools_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # F5: `--invoker sdk --pr-gate` with CARDS_RUNNER_USE_TOOLS=1 in the
+    # environment used to boot a tools-mode worker past the refusal.
+    from cards_runner.cli.__main__ import _cmd_start
+
+    monkeypatch.setenv("CARDS_RUNNER_USE_TOOLS", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", FAKE_KEY)
+    # Positive control: the worker reads the ambient variable as tools mode.
+    assert SdkInvoker.from_env().use_tools is True
+    monkeypatch.setenv("ANTHROPIC_API_KEY", FAKE_KEY)  # from_env popped it
+
+    seen: dict[str, object] = {}
+
+    def boot(cfg: object) -> None:
+        seen["use_tools"] = os.environ.get("CARDS_RUNNER_USE_TOOLS")
+        raise _Booted
+
+    monkeypatch.setattr("cards_runner.cli.__main__.Daemon", boot)
+    monkeypatch.setattr("cards_runner.cli.__main__._pin_worker_env", lambda: None)
+    monkeypatch.setattr("cards_runner.cli.__main__._tier_map_problem", lambda: None)
+    args = argparse.Namespace(
+        todo_root=tmp_path / "td", store="", poll_interval_sec=5.0, max_parallel=1,
+        orphan_timeout_minutes=120, heartbeat_interval_sec=30.0, stub_sleep_sec=3.0,
+        invoker="sdk", skip_worktree=True, no_verifier=False, pr_gate=True,
+        gh_path=None, git_path=None, auto_merge_strategy=None, pr_base_branch_default=None,
+        no_boot_alive_check=False, forensic_ttl_hours=None, pr_unblock=False,
+        sibling_reviewer=False, amendment_reviewer=False, worktree_prune=False,
+        worktree_prune_interval_sec=None, project_config_path=None,
+    )
+    with pytest.raises(_Booted):
+        _cmd_start(args)
+    assert seen["use_tools"] is None  # cleared before the daemon (and its spawner) existed
+    assert SdkInvoker.from_env().use_tools is False
+
+
 # ---- hardened git env ------------------------------------------------------
 
 def test_hardened_git_env_drops_keys_and_pins_the_exec_config() -> None:
