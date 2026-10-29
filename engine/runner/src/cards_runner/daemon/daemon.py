@@ -807,33 +807,45 @@ class Daemon:
 
     def _reap_workers(self, summary: dict[str, int]) -> None:
         done: list[str] = []
-        for attempt_id, handle in self._workers.items():
-            rc = handle.process.poll()
-            if rc is None:
-                # Wall-clock safety net. The real cost-cap path lands
-                # in chunk 2b-ii; this generous default is the
-                # last-resort backstop.
-                age = time.monotonic() - handle.spawned_at
-                if age > self.cfg.force_kill_after_seconds:
-                    log.warning(
-                        "force-killing worker attempt=%s after %.1fs",
-                        attempt_id, age,
-                    )
-                    handle.process.kill_tree(grace_sec=2.0)
-                    done.append(attempt_id)
-                continue
-            log.info(
-                "worker exited attempt=%s card_id=%s rc=%d",
-                attempt_id, handle.claim.card_id, rc,
-            )
-            done.append(attempt_id)
-            summary["worker_exits"] += 1
-            # The worker exited; anything it left running did not. End the
-            # whole job before reading, applying or pushing its output.
-            handle.process.end_job()
+        try:
+            for attempt_id, handle in list(self._workers.items()):
+                self._reap_one(attempt_id, handle, summary, done)
+        finally:
+            # Always: a handle left tracked is re-processed every tick (#87 patch-F2).
+            for attempt_id in done:
+                self._workers.pop(attempt_id, None)
+
+    def _reap_one(self, attempt_id: str, handle: _WorkerHandle, summary: dict[str, int],
+                  done: list[str]) -> None:
+        rc = handle.process.poll()
+        if rc is None:
+            # Wall-clock safety net. The real cost-cap path lands
+            # in chunk 2b-ii; this generous default is the
+            # last-resort backstop.
+            age = time.monotonic() - handle.spawned_at
+            if age > self.cfg.force_kill_after_seconds:
+                log.warning(
+                    "force-killing worker attempt=%s after %.1fs",
+                    attempt_id, age,
+                )
+                handle.process.kill_tree(grace_sec=2.0)
+                done.append(attempt_id)
+            return
+        log.info(
+            "worker exited attempt=%s card_id=%s rc=%d",
+            attempt_id, handle.claim.card_id, rc,
+        )
+        done.append(attempt_id)
+        summary["worker_exits"] += 1
+        # The worker exited; anything it left running did not. End the
+        # whole job before reading, applying or pushing its output.
+        handle.process.end_job()
+        try:
             self._post_worker_exit(handle, rc)
-        for attempt_id in done:
-            self._workers.pop(attempt_id, None)
+        except Exception:  # noqa: BLE001 - one card must not wedge every later one (L4-2)
+            log.exception("post-exit handling failed for card_id=%s attempt=%s; "
+                          "blocking it", handle.claim.card_id, attempt_id)
+            self._block_after_internal_error(handle.claim)
 
     def _post_worker_exit(self, handle: _WorkerHandle, rc: int) -> None:
         """Land a finished worker's results back into the store.
@@ -960,14 +972,18 @@ class Daemon:
         else:
             # Clean executor exit: integrate the patch, then verify.
             try:
-                integrated = self._integrate_worker_patch(claim)
-                if integrated is not None:
-                    self._dispatch_verifier(
-                        integrated, body_md=body_md, fields=fields, sidecar=sidecar,
-                    )
+                # One pin set from integration through verify and push: no
+                # sibling can swap a daemon clone dir in between (L4-1).
+                with git_safety.pinned_clones():
+                    integrated = self._integrate_worker_patch(claim)
+                    if integrated is not None:
+                        self._dispatch_verifier(
+                            integrated, body_md=body_md, fields=fields, sidecar=sidecar,
+                        )
             finally:
-                # The push (if any) is done; the daemon clones are not
-                # forensic state. The worker clone stays with the run dir.
+                # The push (if any) is done and the pins are released; the
+                # daemon clones are not forensic state. The worker clone
+                # stays with the run dir.
                 remove_attempt_clones(self.paths, claim.attempt_trace_id)
 
     def _integrate_worker_patch(self, claim: ClaimedCard) -> ClaimedCard | None:
@@ -1009,6 +1025,10 @@ class Daemon:
         except (PatchRejected, CloneError, OSError) as exc:
             self._route_patch_refused_to_blocked(claim, str(exc))
             return None
+        except Exception as exc:  # noqa: BLE001 - e.g. TimeoutExpired: never wedge the tick
+            log.exception("integration failed for card_id=%s", claim.card_id)
+            self._route_patch_refused_to_blocked(claim, f"{type(exc).__name__}: {exc}")
+            return None
         log.info("integrated card_id=%s at %s", claim.card_id, sha[:12])
         return replace(claim, integration_path=root / "integration", integrated_sha=sha)
 
@@ -1030,6 +1050,23 @@ class Daemon:
             )
         except Exception as exc:  # noqa: BLE001
             log.error("failed to block card %s on a refused patch: %s", claim.card_id, exc)
+
+    def _block_after_internal_error(self, claim: ClaimedCard) -> None:
+        """Block a card whose post-exit handling raised. Best effort: the
+        tick goes on either way, so later cards are still reaped and claimed."""
+        try:
+            self.repo.transition(
+                claim.card_id,
+                to_status=CardStatus.BLOCKED.value,
+                tenant_id=self.tenant_id,
+                actor_id=claim.attempt_trace_id,
+                actor_type=ActorType.EXECUTOR.value,
+                event_type=EventType.BLOCKED.value,
+                payload={"reason": "internal error after the worker exited; see the daemon log",
+                         "error": "post_exit_internal_error"},
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("failed to block card %s after an internal error: %s", claim.card_id, exc)
 
     @staticmethod
     def _read_result_sidecar(run_dir: Path) -> dict[str, Any]:
@@ -1678,6 +1715,11 @@ class Daemon:
             return None
         except (CloneError, OSError) as exc:
             self._verifier_route_error(claim, VerifierError(f"verify clone failed: {exc}"))
+            return None
+        except Exception as exc:  # noqa: BLE001 - e.g. TimeoutExpired: never wedge the tick
+            log.exception("verify clone failed for card_id=%s", claim.card_id)
+            self._verifier_route_error(
+                claim, VerifierError(f"verify clone failed: {type(exc).__name__}: {exc}"))
             return None
         return dest
 

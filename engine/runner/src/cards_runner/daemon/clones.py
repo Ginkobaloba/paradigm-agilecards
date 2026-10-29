@@ -76,13 +76,15 @@ def _git(cwd: Path, *args: str, extra_config: tuple[tuple[str, str], ...] = (),
                    first_sight_ok=first_sight_ok, extra_config=extra_config)
     if proc.returncode != 0:
         raise CloneError(f"git {args[0]} failed in {cwd}: rc={proc.returncode} "
-                         f"stderr={proc.stderr.strip()[:400]!r}")
+                         f"stderr={(proc.stderr or '').strip()[:400]!r}")
+    if proc.stdout is None:  # a reader thread died: never parse a guess
+        raise CloneError(f"git {args[0]} in {cwd} returned no output")
     return proc.stdout
 
 
-def _clone(source: Path, dest: Path, *, branch: str, checkout: bool = True,
-           first_sight_ok: bool = False) -> None:
-    """`git clone` run FROM the (trusted) source, then trust the result."""
+def _clone(source: Path, dest: Path, *, pins: git_safety._Pins, branch: str,
+           checkout: bool = True, first_sight_ok: bool = False) -> None:
+    """`git clone` run FROM the (trusted) source; pin the result, then trust it."""
     if dest.exists():
         raise CloneError(f"clone destination {dest} already exists")
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -91,7 +93,19 @@ def _clone(source: Path, dest: Path, *, branch: str, checkout: bool = True,
     if not checkout:
         args.append("--no-checkout")
     _git(source, *args, "--", str(source), str(dest), first_sight_ok=first_sight_ok)
+    # Pinned before it is trusted: from here to release, `dest` and its
+    # `.git` cannot be renamed or replaced by any process (L4-1).
+    pins.pin(dest)
+    pins.pin(dest / ".git")
     git_safety.trust_daemon_clone(dest)
+
+
+def _pin_ancestors(pins: git_safety._Pins, path: Path, levels: int) -> None:
+    """Pin `path` and its parents, top-down, so nothing above a clone can be
+    swapped either (attempt dir, clones root, state dir for a daemon clone)."""
+    chain = [path, *list(path.parents)[:levels - 1]]
+    for directory in reversed(chain):
+        pins.pin(directory)
 
 
 def resolve_base_sha(project_dir: Path, base_branch: str) -> str:
@@ -113,13 +127,16 @@ def prepare_worker_clone(*, project_dir: Path, base_branch: str, branch: str,
     if not (project_dir / ".git").exists():
         raise CloneError(f"project_dir {project_dir} is not a git repo")
     base_sha = resolve_base_sha(project_dir, base_branch)
-    _clone(project_dir, dest, branch=base_branch, first_sight_ok=True)
-    try:
-        _git(dest, "checkout", "--quiet", "-b", branch, base_sha)
-        _git(dest, "remote", "remove", "origin")
-    finally:
-        # From here on the clone belongs to the worker.
-        git_safety.forget(dest)
+    with git_safety.pinned_clones() as pins:
+        try:
+            _clone(project_dir, dest, pins=pins, branch=base_branch, first_sight_ok=True)
+            _git(dest, "checkout", "--quiet", "-b", branch, base_sha)
+            _git(dest, "remote", "remove", "origin")
+        finally:
+            # From here on the clone belongs to the worker.
+            git_safety.forget(dest)
+            pins.release(dest / ".git")
+            pins.release(dest)
     return base_sha
 
 
@@ -207,7 +224,17 @@ def integrate_patch(*, project_dir: Path, base_branch: str, base_sha: str,
     the base sha (and the merge gate's PR then has nothing in it, exactly
     as an executor that committed nothing did before).
     """
-    _clone(project_dir, dest, branch=base_branch, first_sight_ok=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with git_safety.pinned_clones() as pins:
+        # Held until the caller's pin set ends (the daemon: after the push).
+        _pin_ancestors(pins, dest.parent, 3)
+        _clone(project_dir, dest, pins=pins, branch=base_branch, first_sight_ok=True)
+        return _integrate(project_dir=project_dir, base_sha=base_sha, branch=branch,
+                          patch_file=patch_file, dest=dest, message=message)
+
+
+def _integrate(*, project_dir: Path, base_sha: str, branch: str, patch_file: Path,
+               dest: Path, message: str) -> str:
     _git(dest, "checkout", "--quiet", "-b", branch, base_sha)
     origin = _project_origin_url(project_dir)
     if origin is not None:
@@ -217,8 +244,10 @@ def integrate_patch(*, project_dir: Path, base_branch: str, base_sha: str,
     # The baseline was taken before these, the daemon's own config writes;
     # take it again now. Nothing from THIS attempt is alive (its worker's
     # job has ended; its verifier has not started). A sibling attempt's
-    # worker could write here by absolute path; that is the same-user
-    # residual, bounded by the fingerprint and the committed-tree check.
+    # worker could write files here by absolute path (the same-user
+    # residual, bounded by the fingerprint and the committed-tree check),
+    # but cannot swap this dir or its .git for a link: they are pinned
+    # (git_safety "daemon clones"), and every call re-checks the pairing.
     git_safety.trust_daemon_clone(dest)
     if patch_file.stat().st_size == 0:
         return base_sha
@@ -252,16 +281,20 @@ def prepare_verify_clone(*, integration: Path, branch: str, sha: str, dest: Path
     daemon forgets this clone once HEAD is confirmed and never runs git in
     it again.
     """
-    _clone(integration, dest, branch=branch, checkout=False)
-    try:
-        _git(dest, "checkout", "--quiet", "--detach", sha)
-        head = _git(dest, "rev-parse", "--verify", "HEAD^{commit}").strip()
-        if head != sha:
-            raise CloneError(f"verify clone HEAD {head} is not {sha}")
-        # No path back to the integration clone for an AC to push into.
-        _git(dest, "remote", "remove", "origin")
-    finally:
-        git_safety.forget(dest)
+    with git_safety.pinned_clones() as pins:
+        try:
+            _clone(integration, dest, pins=pins, branch=branch, checkout=False)
+            _git(dest, "checkout", "--quiet", "--detach", sha)
+            head = _git(dest, "rev-parse", "--verify", "HEAD^{commit}").strip()
+            if head != sha:
+                raise CloneError(f"verify clone HEAD {head} is not {sha}")
+            # No path back to the integration clone for an AC to push into.
+            _git(dest, "remote", "remove", "origin")
+        finally:
+            git_safety.forget(dest)
+            # The ACs own this clone now; only the daemon's use was pinned.
+            pins.release(dest / ".git")
+            pins.release(dest)
 
 
 def _make_writable(func, path, _exc) -> None:  # noqa: ANN001 - shutil callback

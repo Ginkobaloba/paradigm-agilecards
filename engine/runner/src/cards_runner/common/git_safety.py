@@ -91,6 +91,10 @@ class RepoQuarantined(RuntimeError):
         self.reason = reason
 
 
+class UntrustedRepo(RuntimeError):
+    """A path resolves to a repo the daemon was never told to trust."""
+
+
 def state_dir_for(todo_root: Path) -> Path:
     """Where a daemon rooted at `todo_root` keeps this module's state."""
     return Path(todo_root) / ".cards-runner-state" / "git"
@@ -415,22 +419,175 @@ def trust_daemon_clone(path: Path) -> None:
 
     Called right after `git clone` returns, before any other process is
     given the path. Never persisted: a restarted daemon has no use for an
-    old attempt's clone, and the reaper removes it.
+    old attempt's clone, and the reaper removes it. The clone's own `.git`
+    must be its common dir, and that pairing is recorded: every later call
+    and `forget` use the record, never a fresh read of a `.git` a sibling
+    worker could have repointed (#87 deep verify L4-1, gitexec-F1).
     """
     common = common_dir_of(path)
+    expected = Path(os.path.abspath(path)) / ".git"
     if common is None:
         raise UntrustedRepo(f"{path} is not a repository after clone")
+    if _key(common) != _key(expected.resolve()) or _is_reparse_point(expected):
+        raise UntrustedRepo(f"daemon clone {path} resolves to {common}, not its own .git")
     value = fingerprint(common)
     with _LOCK:
         _MEMORY[str(common)] = TrustRecord(value)
+        _DAEMON_CLONES[_key(path)] = str(common)
 
 
 def forget(path: Path) -> None:
-    """Drop this process's record for a daemon clone about to be removed."""
-    common = common_dir_of(path)
-    if common is not None:
-        with _LOCK:
-            _MEMORY.pop(str(common), None)
+    """Drop this process's record for a daemon clone about to be removed.
+
+    Uses the pairing recorded at trust time: re-reading `path/.git` here let
+    a verifier AC point it at the project and drop the PROJECT's record."""
+    with _LOCK:
+        common = _DAEMON_CLONES.pop(_key(path), None)
+        if common is not None:
+            _MEMORY.pop(common, None)
+
+
+# ---- daemon clones: pinned while the daemon uses them (#87 L4-1) ----------
+#
+# A sibling worker (same user, max_parallel > 1) could rename a daemon
+# clone dir aside and put a junction to the project in its place between
+# the daemon's git calls, so the daemon committed into the operator's
+# checkout. Checking the path at creation is not enough: it has to hold at
+# the moment of use. On Windows the daemon therefore holds an open handle on
+# every directory from the clones root down to each clone's `.git` while it
+# works there, opened WITHOUT FILE_SHARE_DELETE: while that handle is open,
+# no process can rename or delete the directory, so the swap cannot happen.
+# Each pin also refuses a reparse point and a final path other than the one
+# asked for. Elsewhere (POSIX, unverified) each pin and each call re-checks
+# that the path is not a symlink; that narrows the window but does not
+# close it.
+
+_DAEMON_CLONES: dict[str, str] = {}
+_TLS = threading.local()
+
+
+def _key(path: Path | str) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    attrs = getattr(st, "st_file_attributes", 0)
+    return bool(attrs & 0x400) or os.path.islink(path)  # FILE_ATTRIBUTE_REPARSE_POINT
+
+
+class ClonePinned(UntrustedRepo):
+    """A daemon clone directory could not be pinned as itself."""
+
+
+class _Pins:
+    def __init__(self) -> None:
+        self._held: dict[str, object] = {}
+
+    def pin(self, path: Path) -> None:
+        key = _key(path)
+        if key in self._held:
+            return
+        self._held[key] = _open_pin(Path(path)) if os.name == "nt" else _posix_pin(Path(path))
+
+    def release(self, path: Path) -> None:
+        handle = self._held.pop(_key(path), None)
+        if handle is not None and os.name == "nt":
+            _close_pin(handle)
+
+    def close(self) -> None:
+        for key in list(self._held):
+            self.release(Path(key))
+
+
+def _posix_pin(path: Path) -> None:
+    if _is_reparse_point(path) or not path.is_dir():
+        raise ClonePinned(f"{path} is a link or not a directory")
+    return None
+
+
+def _kernel32():  # noqa: ANN202
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    k32.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD,
+                                              wintypes.DWORD]
+    k32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    return k32
+
+
+def _open_pin(path: Path) -> object:
+    import ctypes
+
+    k32 = _kernel32()
+    handle = k32.CreateFileW(
+        # FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES. A data access right is
+        # what makes the share mode bind: a handle with attribute access only
+        # takes no part in sharing checks, and a rename went through.
+        str(path), 0x1 | 0x80,
+        0x1 | 0x2,  # FILE_SHARE_READ | FILE_SHARE_WRITE, deliberately NOT FILE_SHARE_DELETE
+        None, 3,  # OPEN_EXISTING
+        0x02000000 | 0x00200000,  # FILE_FLAG_BACKUP_SEMANTICS (a dir) | OPEN_REPARSE_POINT
+        None)
+    if handle in (None, ctypes.c_void_p(-1).value):
+        raise ClonePinned(f"cannot pin {path}: {ctypes.WinError(ctypes.get_last_error())}")
+    try:
+        # The name is held now; what it names cannot be swapped. Check it.
+        attrs = k32.GetFileAttributesW(str(path))
+        if attrs == 0xFFFFFFFF or not attrs & 0x10 or attrs & 0x400:
+            raise ClonePinned(f"{path} is a reparse point or not a directory")
+        buf = ctypes.create_unicode_buffer(32768)
+        if not k32.GetFinalPathNameByHandleW(handle, buf, len(buf), 0):
+            raise ClonePinned(f"cannot read the final path of {path}")
+        final = buf.value[4:] if buf.value.startswith("\\\\?\\") else buf.value
+        if _key(final) != _key(Path(path).resolve()):
+            raise ClonePinned(f"{path} is {final}")
+    except BaseException:
+        k32.CloseHandle(handle)
+        raise
+    return handle
+
+
+def _close_pin(handle: object) -> None:
+    _kernel32().CloseHandle(handle)
+
+
+class pinned_clones:  # noqa: N801 - used as a context manager, like open()
+    """The pin set for daemon clones: the current one if a caller already
+    holds one (the daemon, across integrate, verify and push), else a new
+    one released on exit."""
+
+    def __enter__(self) -> _Pins:
+        self._own = getattr(_TLS, "pins", None) is None
+        if self._own:
+            _TLS.pins = _Pins()
+        return _TLS.pins
+
+    def __exit__(self, *exc: object) -> None:
+        if self._own:
+            pins, _TLS.pins = _TLS.pins, None
+            pins.close()
+
+
+def _check_daemon_clone(path: Path) -> None:
+    """At the moment of use: a daemon clone must still be itself."""
+    with _LOCK:
+        common = _DAEMON_CLONES.get(_key(path))
+    if common is None:
+        return
+    if _is_reparse_point(Path(path)) or _is_reparse_point(Path(path) / ".git"):
+        raise UntrustedRepo(f"daemon clone {path} was replaced by a link")
+    now = common_dir_of(Path(path))
+    if now is None or str(now) != common:
+        raise UntrustedRepo(f"daemon clone {path} now resolves to {now}, not {common}")
 
 
 def _quarantine(common_dir: Path, reason: str) -> None:
@@ -445,10 +602,6 @@ def _quarantine(common_dir: Path, reason: str) -> None:
     log.error("QUARANTINED repository %s: %s", common_dir, reason)
 
 
-class UntrustedRepo(RuntimeError):
-    """A path resolves to a repo the daemon was never told to trust."""
-
-
 def assert_trusted(path: Path, *, first_sight_ok: bool = False) -> Path | None:
     """Raise unless `path`'s repo still matches its trusted baseline.
 
@@ -459,6 +612,7 @@ def assert_trusted(path: Path, *, first_sight_ok: bool = False) -> Path | None:
     Returns the common dir, or None when `path` has no `.git` at all (the
     caller's git then cannot walk up, see GIT_CEILING_DIRECTORIES).
     """
+    _check_daemon_clone(path)
     common = common_dir_of(path)
     if common is None:
         return None
@@ -502,7 +656,11 @@ def run_git(
         assert_trusted(cwd, first_sight_ok=first_sight_ok)
         env["GIT_CEILING_DIRECTORIES"] = str(Path(cwd).resolve().parent)
     argv = [resolved(argv[0]), *argv[1:]] if argv else []
+    # UTF-8 with surrogateescape, not the locale codec: under cp1252 one
+    # filename git prints that the codec cannot decode killed subprocess's
+    # reader thread, left stdout None and wedged the daemon tick (#87 L4-2).
     return subprocess.run(
         argv, cwd=str(cwd) if cwd is not None else None,
-        capture_output=True, text=True, timeout=timeout, check=False, env=env,
+        capture_output=True, text=True, encoding="utf-8", errors="surrogateescape",
+        timeout=timeout, check=False, env=env,
     )
