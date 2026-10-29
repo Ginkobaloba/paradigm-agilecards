@@ -238,6 +238,13 @@ class DaemonConfig:
     sibling_reviewer_enabled: bool = False
     amendment_reviewer_enabled: bool = False
     worktree_prune_enabled: bool = False
+    # What a card does when the PINNED local tier map
+    # (CARDS_RUNNER_TIER_MAP_YAML) is missing or broken. `stop` (default,
+    # fail closed): the worker gets no key and the card fails. `warn`: if
+    # ANTHROPIC_API_KEY was set at start, the card runs on the hosted map,
+    # with a warning naming the paid model, the model stamped on the card,
+    # and a `map_fallback` event. Without a key, `warn` behaves as `stop`.
+    on_local_map_unavailable: str = "stop"
     # How often to run `git worktree prune`, in seconds. Default hourly
     # because the cost (a couple of subprocess calls) is small but the
     # benefit (cleaning up dead refs accumulated by chunk-3-era git work)

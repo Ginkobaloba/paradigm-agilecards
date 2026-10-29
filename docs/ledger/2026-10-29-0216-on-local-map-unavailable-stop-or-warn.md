@@ -1,0 +1,19 @@
+# 2026-10-29 02:16 CDT - on-local-map-unavailable: stop or warn
+- **Who:** PromptBuilder seat (Claude Opus 5.5). This is the follow-up to #84 that Daedalus asked for, after Drew's design note: "Idk if I want it to stop. But a warning that it will be switching to a paid model would be appropriate."
+- **Change:**
+  - A new setting, `--on-local-map-unavailable stop|warn` (`DaemonConfig.on_local_map_unavailable`), governs one condition: the pinned local tier map (`CARDS_RUNNER_TIER_MAP_YAML`) is missing or broken.
+  - `stop` is the default and is #84's fail-closed behaviour, unchanged.
+  - Under `warn`, a card runs on the hosted map only if ANTHROPIC_API_KEY was set at start. When it does, three things happen:
+    - start prints a banner naming the paid models;
+    - the daemon logs a per-card PAID MODEL warning naming the model;
+    - the model is written onto the card (`billed_fallback_model`, `tier_map_fallback_reason`) and a `map_fallback` event is appended.
+  - The decision is made per card at spawn, because a pinned map can vanish mid-run. A fallback worker is spawned without the pin, so it loads exactly the hosted map that was named, and with the key.
+  - Without a key, `warn` refuses like `stop`, and says why.
+  - A credentialed base URL and a map tier with no model stay hard refusals in both modes.
+- **Why:** Drew wants the option to keep working on the paid map when the local map is gone, but never silently. The default stays `stop`: Daedalus will recommend a default to Drew, and a default chosen in code would make that decision for him.
+- **State after:**
+  - Runner suite 894/0, ruff clean.
+  - 17 new tests; each mode is pinned against its opposite.
+  - Five mutants all turn red: a fallback still forwarding the pin, warn without a key, stop falling back, no per-card record, start allowing warn without a key.
+  - With the PR gate on, the merge gate still blocks a card when the pinned map is unavailable at gate time (#84), so a card that ran on the paid fallback ends `blocked` for a human. With the PR gate off, it lands `done` as any verified card does.
+- **Refs:** engine/runner/src/cards_runner/daemon/spawner.py `plan_worker_map`, `MapPlan`; engine/runner/src/cards_runner/daemon/daemon.py `_record_map_fallback`; engine/runner/src/cards_runner/cli/__main__.py `_local_map_unavailable`, `_paid_fallback_banner`; engine/runner/src/cards_runner/common/canonical_config.py `load_tier_map(honor_pin=False)`; engine/runner/tests/test_local_map_fallback.py
