@@ -46,6 +46,8 @@ if sys.platform == "win32":  # pragma: no cover - exercised only on Windows.
 
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
+# What every job gets. Breakaway is deliberately NOT allowed (see spawn_in_job).
+JOB_LIMIT_FLAGS = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 JobObjectExtendedLimitInformation = 9
 
 # Win32 process-creation flags (literals: not all are exposed by
@@ -98,6 +100,27 @@ class ManagedProcess:
 
     def wait(self, timeout: float | None = None) -> int:
         return self.popen.wait(timeout=timeout)
+
+    def end_job(self) -> None:
+        """Kill every descendant still alive, EVEN IF the worker itself exited.
+
+        `kill_tree` returns early once the worker has exited, so anything
+        the worker left running (a model-run `start /b ...`, a background
+        `&`) would outlive it. The daemon calls this before it reads or
+        applies anything the worker produced. Idempotent.
+        """
+        if sys.platform == "win32":
+            if self._job_handle is not None:
+                try:
+                    _winapi.CloseHandle(self._job_handle)  # KILL_ON_JOB_CLOSE
+                except OSError:
+                    pass
+                self._job_handle = None
+            return
+        try:
+            os.killpg(self.popen.pid, signal.SIGKILL)  # the group id is the leader's pid
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
 
     def kill_tree(self, grace_sec: float = 5.0) -> None:
         """Kill the worker and any descendants.
@@ -216,10 +239,11 @@ def spawn_in_job(
     and job assignment. On POSIX the child starts in its own process
     group instead.
 
-    The Job Object is configured with
-    `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` plus
-    `JOB_OBJECT_LIMIT_BREAKAWAY_OK` so the daemon can voluntarily
-    detach a process if it ever needs to.
+    The Job Object is configured with `JOB_LIMIT_FLAGS`: kill-on-close,
+    and NO breakaway. `JOB_OBJECT_LIMIT_BREAKAWAY_OK` used to be set
+    "so the daemon can voluntarily detach a process"; nothing ever did,
+    and it let any descendant (model-run code) escape the job with
+    `CREATE_BREAKAWAY_FROM_JOB` and outlive every kill.
     """
     if sys.platform == "win32":
         return _spawn_win32(args, cwd=cwd, env=env, stdout=stdout, stderr=stderr)
@@ -297,9 +321,7 @@ def _build_job() -> Any:
         ]
 
     info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-    info.BasicLimitInformation.LimitFlags = (
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK
-    )
+    info.BasicLimitInformation.LimitFlags = JOB_LIMIT_FLAGS
     if not kernel32.SetInformationJobObject(
         job,
         JobObjectExtendedLimitInformation,

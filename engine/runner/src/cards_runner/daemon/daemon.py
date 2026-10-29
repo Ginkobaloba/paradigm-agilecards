@@ -814,6 +814,9 @@ class Daemon:
             )
             done.append(attempt_id)
             summary["worker_exits"] += 1
+            # The worker exited; anything it left running did not. End the
+            # whole job before reading, applying or pushing its output.
+            handle.process.end_job()
             self._post_worker_exit(handle, rc)
         for attempt_id in done:
             self._workers.pop(attempt_id, None)

@@ -19,7 +19,8 @@ from pathlib import Path
 import cards_runner
 from ..common.canonical_config import ENV_TIER_MAP_PATH, CanonicalConfigMissing, load_tier_map
 from ..common.env_scrub import scrub_environment
-from ..common.process_group import ManagedProcess, spawn_in_job
+from ..common.process_group import ManagedProcess
+from ..common.sandbox import SandboxLauncher, default_launcher
 from ..common.types import ClaimedCard, DaemonConfig
 from ..providers.registry import LOCAL_BASE_URL_ENV, base_url_problem, tiers_needing_a_key
 
@@ -66,6 +67,7 @@ def spawn_worker(
     extra_env: dict[str, str] | None = None,
     extra_keep: tuple[str, ...] = (),
     extra_drop: tuple[str, ...] = (),
+    launcher: SandboxLauncher | None = None,
 ) -> ManagedProcess:
     """Spawn the per-card worker for `claim`.
 
@@ -186,12 +188,10 @@ def spawn_worker(
     stdout = open(log_path, "ab", buffering=0)
     stderr = open(err_path, "ab", buffering=0)
     try:
-        process = spawn_in_job(
-            args,
-            cwd=str(claim.worktree_path),
-            env=env,
-            stdout=stdout.fileno(),
-            stderr=stderr.fileno(),
+        # The worker runs model-chosen code: it starts through the
+        # sandbox seam (common/sandbox.py), never a bare spawn.
+        process = (launcher or default_launcher()).spawn_worker(
+            args, cwd=claim.worktree_path, env=env, stdout=stdout, stderr=stderr,
         )
     finally:
         # The duplicated handles inside the child remain valid even

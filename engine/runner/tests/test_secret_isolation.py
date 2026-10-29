@@ -120,7 +120,7 @@ def _tier_map(tmp: Path, model: str) -> Path:
 
 def _spawn_env(tmp: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     seen: dict[str, str] = {}
-    monkeypatch.setattr(spawner, "spawn_in_job", lambda args, *, env, **_: seen.update(env) or object())
+    monkeypatch.setattr("cards_runner.common.sandbox.spawn_in_job", lambda args, *, env, **_: seen.update(env) or object())
     run_dir = tmp / "run"
     claim = ClaimedCard(card_id="c", attempt_trace_id="a", trace_id="t", run_dir=run_dir,
                         worktree_path=tmp, card_file=run_dir / "card.md")

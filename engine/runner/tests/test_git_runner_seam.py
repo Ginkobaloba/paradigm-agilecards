@@ -27,7 +27,7 @@ ALLOWED = {
     "common/git_safety.py": "the hardened runner itself",
     "common/process_group.py": "launches the worker (spawn_in_job)",
     "store/dolt_store.py": "runs the dolt binary on the card store",
-    "verifier/handlers/deterministic.py": "runs card AC commands with env={}",
+    "common/sandbox.py": "the sandbox seam: worker spawn and verifier shell ACs",
     "cli/doctor.py": "`<binary> --version` only, no repo",
     "common/locks.py": "ctypes OpenProcess/GetExitCodeProcess for PID liveness only",
 }

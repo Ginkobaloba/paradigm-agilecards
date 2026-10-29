@@ -21,11 +21,12 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from ...common.sandbox import SandboxLauncher, default_launcher
 
 
 log = logging.getLogger(__name__)
@@ -57,6 +58,9 @@ class HandlerContext:
     worktree: Path
     env: dict[str, str] = field(default_factory=dict)
     shell_timeout_sec: float = _DEFAULT_SHELL_TIMEOUT_SEC
+    # Where shell AC commands run (common/sandbox.py). Tests and a future
+    # container launcher swap it; the default is a same-user Job Object.
+    launcher: SandboxLauncher = field(default_factory=default_launcher)
 
 
 @dataclass(frozen=True)
@@ -262,16 +266,16 @@ def handle_shell(
     timeout = float(item.get("timeout_sec", ctx.shell_timeout_sec))
 
     try:
-        proc = subprocess.run(
-            args,
-            cwd=str(ctx.worktree),
-            env=ctx.env,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
+        # Through the sandbox seam: the command (often a model-written
+        # test) runs in its own Job Object, and nothing it starts outlives
+        # this call (common/sandbox.py).
+        proc = ctx.launcher.run_command(args, cwd=ctx.worktree, env=ctx.env, timeout=timeout)
+    except OSError as exc:
+        return HandlerResult(
+            False,
+            {"command": cmd, "error": f"could not spawn shell: {exc}"},
         )
-    except subprocess.TimeoutExpired:
+    if proc.timed_out:
         return HandlerResult(
             False,
             {
@@ -279,11 +283,6 @@ def handle_shell(
                 "error": f"command timed out after {timeout:.1f}s",
                 "timeout_sec": timeout,
             },
-        )
-    except OSError as exc:
-        return HandlerResult(
-            False,
-            {"command": cmd, "error": f"could not spawn shell: {exc}"},
         )
 
     stdout = proc.stdout or ""
