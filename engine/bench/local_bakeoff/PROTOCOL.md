@@ -117,3 +117,38 @@ Per card-run, the harness:
   passes, the scorer or the card is broken, and the whole arm is invalid.
 - Model load time is measured once per arm, before the timed runs, and
   reported apart from them. It is never folded into per-card time.
+
+## Amendments (pre-data)
+
+Each amendment is committed before any model has produced output on this
+card set, and says so. An amendment changes the tree hash, so the exam's
+freeze moves to the amendment commit. No results exist from the earlier tree,
+so nothing is split across tree hashes.
+
+### A1 (2026-10-29): inline reasoning is stripped before parsing
+
+**Why:** some models write their reasoning inline in the reply as
+`<think>...</think>`, rather than in Ollama's separate `thinking` field. A
+file block inside that reasoning would otherwise be parsed as an answer. The
+original text did not say what to do. This is decided before any arm has
+run, so the rule cannot be chosen to favour one model.
+
+**Rule:**
+- Before parsing, every complete `<think>...</think>` block is removed from
+  the reply. Matching is case-sensitive and non-greedy, and blocks may span
+  lines.
+- A `<think>` with no closing tag is left in place. Its contents are not
+  treated as reasoning.
+- Only the reply content is ever parsed. Ollama's separate `thinking` field
+  is counted, never parsed.
+
+**Recorded per card-run:** the raw reply, the stripped reply, and
+`inline_think` (true when at least one block was removed).
+
+**Scored:** the primary score uses the stripped reply. The same runs are
+also scored on the raw reply and reported as a sensitivity line. When
+`inline_think` is false the two are identical by construction.
+
+**Labeling:** every result row and every summary carries the exam freeze
+commit and the commit of the verifier that scored it. A result without both
+is unlabeled and is not reported.
