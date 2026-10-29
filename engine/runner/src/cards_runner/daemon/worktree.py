@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 from typing import Final
 
-from ..common.git_safety import run_git
+from ..common.git_safety import RepoQuarantined, UntrustedRepo, resolved, run_git
 from ..common.locks import held_worktree_mutex
 from ..common.types import RuntimePaths
 
@@ -199,6 +199,9 @@ def prune_git_worktrees(
     except subprocess.TimeoutExpired as exc:
         log.warning("git worktree prune timed out in %s: %s", project_dir, exc)
         return None
+    except (RepoQuarantined, UntrustedRepo) as exc:
+        log.warning("git worktree prune skipped for %s: %s", project_dir, exc)
+        return None
 
 
 def teardown_worktree(
@@ -225,7 +228,7 @@ def teardown_worktree(
                 ["worktree", "remove", "--force", str(worktree_path)],
                 first_sight_ok=True,
             )
-        except subprocess.CalledProcessError as exc:
+        except (subprocess.CalledProcessError, RepoQuarantined, UntrustedRepo) as exc:
             log.warning("git worktree remove failed: %s", exc)
             shutil.rmtree(worktree_path, ignore_errors=True)
 
@@ -342,7 +345,7 @@ def _run_powershell_git(
     if sys.platform == "win32":
         # Invoke PowerShell with the git command. Use `& git ...` so
         # PowerShell does not parse positional arguments oddly.
-        ps_args = ["git", *args]
+        ps_args = [resolved("git"), *args]
         cmd = [
             "powershell.exe",
             "-NoProfile",
@@ -351,7 +354,7 @@ def _run_powershell_git(
             "& " + " ".join(_quote_for_powershell(a) for a in ps_args),
         ]
     else:
-        cmd = ["git", *args]
+        cmd = [resolved("git"), *args]
     proc = run_git(
         cmd, cwd=cwd, timeout=GIT_WORKTREE_TIMEOUT_SEC, first_sight_ok=first_sight_ok,
     )

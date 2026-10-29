@@ -13,7 +13,7 @@ without first proving it unchanged:
    (worktree prep and teardown, push, PR calls, the ledger diff). A test
    pins that no call site escapes it.
 2. **No user or system config.** `GIT_CONFIG_GLOBAL` and
-   `GIT_CONFIG_SYSTEM` point at empty files, so a write to `~/.gitconfig`
+   `GIT_CONFIG_SYSTEM` point at the null device, so a write to `~/.gitconfig`
    (the executor's shell has a HOME) is never read by the daemon. gh's
    credential helper, which normally lives there, is pinned explicitly.
 3. **Overrides for repo config.** `GIT_CONFIG_COUNT` entries outrank every
@@ -27,9 +27,10 @@ without first proving it unchanged:
    it. `[branch "..."]` sections are excluded from the hash: the daemon's
    own `push -u` writes them, and they name no program.
 
-The private files (empty configs, empty hooks dir, the trust store) live
-in a daemon state dir, not TEMP, and are re-verified before every use,
-because same-user files are never truly private.
+The empty hooks dir and the trust store live in a daemon state dir. Same-
+user files are never truly private, so the hooks dir is re-emptied before
+every use, and the trust store on disk is only a fallback: this process's
+in-memory records are authoritative (see `_MEMORY`).
 
 What this does NOT close: same-user processes on Windows are not isolated,
 so a determined payload could read another process's memory or write
@@ -62,6 +63,16 @@ GIT_TIMEOUT_SEC = 120.0
 
 _STATE_DIR: Path | None = None
 _LOCK = threading.Lock()
+# The authoritative trust records for this process. The file is only a
+# fallback for repos this process has not seen yet: an executor that
+# deletes or rewrites it (it sits at a fixed path near every worktree)
+# cannot re-arm "first sight" or lift a quarantine for a running daemon.
+_MEMORY: dict[str, "TrustRecord"] = {}
+# Bare binary names resolved ONCE, at configure() (daemon boot, before any
+# executor ran), so a git.exe planted later in a user-writable PATH dir is
+# not what the daemon's own calls run. The executor's tools still use PATH.
+_PINNED_BINARIES: dict[str, str] = {}
+_PINNABLE: tuple[str, ...] = ("git", "gh", "powershell.exe")
 
 
 class RepoQuarantined(RuntimeError):
@@ -83,6 +94,17 @@ def configure(state_dir: Path) -> None:
     global _STATE_DIR
     _STATE_DIR = Path(state_dir)
     _STATE_DIR.mkdir(parents=True, exist_ok=True)
+    _MEMORY.clear()
+    _PINNED_BINARIES.clear()
+    for name in _PINNABLE:
+        found = shutil.which(name)
+        if found:
+            _PINNED_BINARIES[name] = found
+
+
+def resolved(binary: str) -> str:
+    """The boot-pinned absolute path for a bare `git`/`gh`/`powershell.exe`."""
+    return _PINNED_BINARIES.get(binary, binary)
 
 
 def _state_dir() -> Path:
@@ -93,14 +115,6 @@ def _state_dir() -> Path:
         configure(Path(tempfile.mkdtemp(prefix="cards-runner-git-")))
     assert _STATE_DIR is not None
     return _STATE_DIR
-
-
-def _empty_file(name: str) -> Path:
-    """A zero-byte file, verified (and reset) immediately before each use."""
-    path = _state_dir() / name
-    if not path.is_file() or path.stat().st_size != 0:
-        path.write_bytes(b"")
-    return path
 
 
 def empty_hooks_dir() -> Path:
@@ -142,12 +156,14 @@ def hardened_git_env(
         base=dict(base if base is not None else os.environ),
         extra_keep=GH_ENV_KEEP if keep_gh_credentials else (),
     )
-    env["GIT_CONFIG_GLOBAL"] = str(_empty_file("empty-global.gitconfig"))
-    env["GIT_CONFIG_SYSTEM"] = str(_empty_file("empty-system.gitconfig"))
+    # The null device, not a file: nothing can be written into it between
+    # a check and git's read.
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_SYSTEM"] = os.devnull
     env["GIT_CONFIG_NOSYSTEM"] = "1"
     env["GIT_TERMINAL_PROMPT"] = "0"
     if keep_gh_credentials and gh_path is None:
-        gh_path = shutil.which("gh")
+        gh_path = _PINNED_BINARIES.get("gh") or shutil.which("gh")
     overrides = git_config_overrides(gh_path=gh_path if keep_gh_credentials else None)
     env["GIT_CONFIG_COUNT"] = str(len(overrides))
     for i, (key, value) in enumerate(overrides):
@@ -254,10 +270,22 @@ def _save_store(data: dict[str, dict[str, object]]) -> None:
 
 
 def trust_record(common_dir: Path) -> TrustRecord | None:
-    raw = _load_store().get(str(common_dir))
-    if not isinstance(raw, dict) or not isinstance(raw.get("baseline"), str):
-        return None
-    return TrustRecord(str(raw["baseline"]), bool(raw.get("quarantined")), str(raw.get("reason", "")))
+    """This process's record for `common_dir`; the file only for unseen repos.
+
+    So `cards-runner trust-repo` run from another process takes effect at
+    the daemon's next start.
+    """
+    key = str(common_dir)
+    with _LOCK:
+        if key in _MEMORY:
+            return _MEMORY[key]
+        raw = _load_store().get(key)
+        if not isinstance(raw, dict) or not isinstance(raw.get("baseline"), str):
+            return None
+        record = TrustRecord(str(raw["baseline"]), bool(raw.get("quarantined")),
+                             str(raw.get("reason", "")))
+        _MEMORY[key] = record
+        return record
 
 
 def trust_repo(common_dir: Path) -> str:
@@ -267,6 +295,7 @@ def trust_repo(common_dir: Path) -> str:
     """
     value = fingerprint(common_dir)
     with _LOCK:
+        _MEMORY[str(common_dir)] = TrustRecord(value)
         data = _load_store()
         data[str(common_dir)] = {"baseline": value, "quarantined": False, "reason": ""}
         _save_store(data)
@@ -275,6 +304,8 @@ def trust_repo(common_dir: Path) -> str:
 
 def _quarantine(common_dir: Path, reason: str) -> None:
     with _LOCK:
+        previous = _MEMORY.get(str(common_dir))
+        _MEMORY[str(common_dir)] = TrustRecord(previous.baseline if previous else "", True, reason)
         data = _load_store()
         entry = data.get(str(common_dir)) or {}
         entry.update({"quarantined": True, "reason": reason})
@@ -337,7 +368,8 @@ def run_git(
     if cwd is not None:
         assert_trusted(cwd, first_sight_ok=first_sight_ok)
         env["GIT_CEILING_DIRECTORIES"] = str(Path(cwd).resolve().parent)
+    argv = [resolved(argv[0]), *argv[1:]] if argv else []
     return subprocess.run(
-        list(argv), cwd=str(cwd) if cwd is not None else None,
+        argv, cwd=str(cwd) if cwd is not None else None,
         capture_output=True, text=True, timeout=timeout, check=False, env=env,
     )

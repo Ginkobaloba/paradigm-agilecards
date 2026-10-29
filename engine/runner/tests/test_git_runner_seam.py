@@ -7,6 +7,7 @@ the git/gh calls the daemon does make all carry the hardened env.
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -85,7 +86,31 @@ def test_every_daemon_git_and_gh_call_carries_the_hardened_env(
     for call in calls:
         env = call["env"]
         assert isinstance(env, dict), call["argv"]
-        assert Path(env["GIT_CONFIG_GLOBAL"]).stat().st_size == 0, call["argv"]
-        assert Path(env["GIT_CONFIG_SYSTEM"]).stat().st_size == 0, call["argv"]
+        assert env["GIT_CONFIG_GLOBAL"] == os.devnull, call["argv"]
+        assert env["GIT_CONFIG_SYSTEM"] == os.devnull, call["argv"]
         assert int(env["GIT_CONFIG_COUNT"]) >= 6, call["argv"]
         assert "GIT_CEILING_DIRECTORIES" in env, call["argv"]
+
+
+def test_daemon_git_is_the_binary_pinned_at_boot_not_a_later_path_plant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import shutil
+
+    git_safety.configure(tmp_path / "state")  # daemon boot
+    pinned = git_safety.resolved("git")
+    assert Path(pinned).is_absolute()
+    plant_dir = tmp_path / "bin"
+    plant_dir.mkdir()
+    (plant_dir / "git.bat").write_text("@echo planted\n")
+    (plant_dir / "git").write_text("#!/bin/sh\necho planted\n")
+    (plant_dir / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", str(plant_dir) + os.pathsep + os.environ["PATH"])
+    # Positive control: after the plant, a PATH lookup finds it.
+    assert Path(shutil.which("git") or "").parent == plant_dir
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr("subprocess.run", lambda argv, **kw: (calls.append(argv),
+                        SimpleNamespace(returncode=0, stdout="", stderr=""))[1])
+    git_safety.run_git(["git", "status"], cwd=None)
+    assert calls == [[pinned, "status"]]

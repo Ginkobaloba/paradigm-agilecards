@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from ..common.git_safety import RepoQuarantined, UntrustedRepo, run_git
+from ..common.git_safety import RepoQuarantined, UntrustedRepo, resolved, run_git
 
 
 log = logging.getLogger(__name__)
@@ -197,7 +197,6 @@ class SubprocessGhRunner:
     gh_path: str = "gh"
     git_path: str = "git"
     timeout_sec: float = _DEFAULT_GH_TIMEOUT_SEC
-    env: dict[str, str] | None = None
 
     def is_available(self) -> bool:
         return shutil.which(self.gh_path) is not None and shutil.which(self.git_path) is not None
@@ -350,7 +349,7 @@ class SubprocessGhRunner:
                 args,
                 cwd=cwd,
                 keep_gh_credentials=True,
-                gh_path=shutil.which(self.gh_path),
+                gh_path=shutil.which(resolved(self.gh_path)),
                 timeout=self.timeout_sec,
             )
         except (RepoQuarantined, UntrustedRepo) as exc:

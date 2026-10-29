@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from ..common.git_safety import RepoQuarantined, UntrustedRepo, run_git
+from ..common.git_safety import run_git
 
 
 def _glob_to_regex(pattern: str) -> re.Pattern[str]:
@@ -116,7 +116,8 @@ class DiffStats:
     ) -> "DiffStats":
         """Run `git diff base...branch --numstat` in the worktree.
 
-        Returns an empty DiffStats on any git failure -- the gate treats
+        Raises RepoQuarantined / UntrustedRepo (git_safety) rather than
+        guess. Returns an empty DiffStats on any git failure -- the gate treats
         an unreadable diff as "no diff signal" and leans on the other
         inputs (the caller logs the failure)."""
         try:
@@ -132,7 +133,9 @@ class DiffStats:
                  f"{base_branch}...{branch}"],
                 cwd=worktree, timeout=30,
             )
-        except (OSError, subprocess.SubprocessError, RepoQuarantined, UntrustedRepo):
+        # RepoQuarantined / UntrustedRepo propagate: an empty diff would
+        # read as "nothing sensitive changed" to the confidence gate.
+        except (OSError, subprocess.SubprocessError):
             return cls()
         if result.returncode != 0:
             return cls()

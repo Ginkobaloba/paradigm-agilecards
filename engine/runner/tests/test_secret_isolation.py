@@ -272,13 +272,28 @@ def test_a_planted_file_in_the_empty_hooks_dir_is_removed_before_use() -> None:
     assert not any(git_safety.empty_hooks_dir().iterdir())
 
 
-def test_the_empty_config_files_are_re_emptied_before_every_use() -> None:
-    env = git_safety.hardened_git_env({"PATH": "x"})
-    for key in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
-        Path(env[key]).write_text("[core]\n\tsshCommand = evil\n")
-    env = git_safety.hardened_git_env({"PATH": "x"})
-    for key in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
-        assert Path(env[key]).stat().st_size == 0
+def test_user_and_system_config_are_the_null_device() -> None:
+    env = git_safety.hardened_git_env({"PATH": "x", "GIT_CONFIG_GLOBAL": "C:/evil.cfg"})
+    assert env["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert env["GIT_CONFIG_SYSTEM"] == os.devnull
+
+
+@needs_git
+def test_a_deleted_trust_store_cannot_re_arm_first_sight(tmp_path: Path, _git_state: Path) -> None:
+    # The store sits at a fixed path near every worktree; a running daemon's
+    # in-memory records are what count.
+    work = tmp_path / "w"
+    _git(tmp_path, "init", str(work))
+    git_safety.trust_repo(_common(work))
+    (work / ".git" / "hooks" / "post-checkout").write_text("#!/bin/sh\n")
+    with pytest.raises(git_safety.RepoQuarantined):
+        git_safety.assert_trusted(work)
+    (_git_state / "git_trust.json").unlink()
+    with pytest.raises(git_safety.RepoQuarantined):
+        git_safety.assert_trusted(work, first_sight_ok=True)
+    # Control: a process with no memory of the repo (a restart) re-baselines.
+    git_safety.configure(_git_state)
+    assert git_safety.assert_trusted(work, first_sight_ok=True) == _common(work)
 
 
 # ---- (f) a planted hook does not fire on the daemon's git push --------------
@@ -559,3 +574,15 @@ def test_the_git_tool_reads_only_the_repos_own_config(args: list[str]) -> None:
     # F10: a read of ANOTHER config file is a way to read arbitrary files.
     assert _git_config_is_read_only(args[1:]) is False
     assert _git_config_is_read_only(["--get", "user.email"]) is True  # control
+
+
+@needs_git
+def test_diff_stats_raises_on_a_quarantined_repo_instead_of_reporting_no_diff(tmp_path: Path) -> None:
+    # An empty diff would read as "nothing sensitive changed" to the gate.
+    work = _repo_with_remote(tmp_path)
+    git_safety.trust_repo(_common(work))
+    stats = DiffStats.from_worktree(work, branch="card/x", base_branch="main", git_path=GIT)
+    assert stats.files == ("a.txt",)  # control: a trusted repo diffs normally
+    _git(work, "config", "core.sshCommand", "evil")
+    with pytest.raises(git_safety.RepoQuarantined):
+        DiffStats.from_worktree(work, branch="card/x", base_branch="main", git_path=GIT)

@@ -11,4 +11,24 @@
   - (g) `diff_stats` adds `--no-ext-diff --no-textconv` and the hardened env.
 - **State after:** runner suite 817/0 (780 before plus 37), ruff clean, git 2.55.0.windows.5. The hook and textconv tests each run a positive control first (the plant fires under a plain git call on this host), then show the hardened call does not fire it. Eleven mutants, one per piece, each turn a test red. (g) measured: with the flags removed, a planted textconv still did not fire under `--numstat` on this git, so the flags are belt and braces, pinned by a test against future git behaviour.
 - **Not closed (residual, said plainly):** same-user processes on Windows are not isolated, so a model-run payload could still read another process's memory (the worker or daemon holding the key); and tool shells have network access. Those need OS-level isolation and a network policy, a separate design call (Drew).
-- **Refs:** common/git_safety.py; worker_stub/sdk_invoker.py `from_env`, `_build_tool_belt`; daemon/spawner.py `_worker_needs_the_key`; daemon/pr_lifecycle.py `_run`; daemon/diff_stats.py; daemon/daemon.py `_git_surface_changed`, `_route_tamper_to_blocked`; worker_stub/tools.py `_git_config_is_read_only`; tests/test_secret_isolation.py, tests/test_merge_gate.py
+- **r2 (after Deep Verify r1 FAIL, 2026-10-28 evening):** the claim-to-exit fingerprint was replaced by a structural fix.
+  - F1: worktree prep ran git with the daemon's full env. Now ONE runner, `git_safety.run_git`, handles every daemon git/gh call. A source scan pins that no other daemon module launches a process.
+  - F2: the tool shell could write the owner's ~/.gitconfig.
+    - Daemon git now reads the null device as its global and system config, so nothing can be written into it between a check and git's read. The credential.helper list is reset and gh's helper is pinned back. Measured against a private repo: rc=0 with gh, rc=128 without.
+    - The tool shell gets a throwaway profile: HOME, USERPROFILE, APPDATA, LOCALAPPDATA and XDG_CONFIG_HOME. Only the commit identity is carried over.
+  - F3, F4, F7: the config+hooks baseline is recorded at the daemon's first touch of a project. It is persisted daemon-side and never re-taken at claim, and it is checked before EVERY git call.
+    - A mismatch quarantines the repo until `cards-runner trust-repo`.
+    - `[branch]` sections are not hashed, so the daemon's own `push -u` does not trip it.
+    - The common dir is read from disk, and a repointed worktree `.git` is refused. GIT_CEILING_DIRECTORIES stops git walking up.
+  - The in-memory trust records are authoritative for a running daemon: deleting or rewriting the on-disk store (a fixed relative path from every worktree) can neither re-arm first sight nor lift a quarantine. A `trust-repo` run from another process therefore takes effect at the daemon's next start. `git`, `gh` and `powershell.exe` are resolved to absolute paths once at daemon boot, so a later PATH plant does not change what the daemon runs. `diff_stats` raises on a quarantined repo instead of reporting an empty diff. F5: the CLI is the only tools-mode switch.
+  - F6: `_prepare_and_spawn` is driven on a real repo.
+  - F10: the git tool refuses `config` reads of other files or scopes.
+  - Results: suite 842/0 and ruff clean. Each F-item has a positive control, and 18 mutants over the r2 changes all turn red.
+- **r2 residuals (said plainly):**
+  - Everything is still same-user. A payload can write absolute paths. A `git.exe` planted into a user-writable PATH dir such as `C:\Users\Drama\bin` reaches the daemon only if it lands before the daemon boots (the executor's own tool git is always PATH-resolved). The on-disk trust store is re-read by a restarted daemon. It can also read process memory.
+  - Tool shells have network access.
+  - A repo's legitimate `include.path` target is not hashed.
+  - The first baseline is only as clean as the repo was at first sight.
+  - The verifier's shell ACs still run in the daemon process. They use env={} but no job object (LegionBuild's "second seam").
+  - The structural fix is R1/R2 in C:\dev\_status\WORKER_ISOLATION_OPTIONS_2026-10-28.md: a throwaway clone, plus the patch returned as data. It is queued next.
+- **Refs:** common/git_safety.py; worker_stub/sdk_invoker.py `from_env`, `_build_tool_belt`; daemon/spawner.py `_worker_needs_the_key`; daemon/pr_lifecycle.py `_run`; daemon/diff_stats.py; daemon/daemon.py `_repo_untrusted_after_run`, `_route_untrusted_repo_to_blocked`; daemon/worktree.py `_run_powershell_git`; cli `trust-repo`; worker_stub/tools.py `_git_config_is_read_only`; tests/test_secret_isolation.py, tests/test_merge_gate.py, tests/test_git_runner_seam.py

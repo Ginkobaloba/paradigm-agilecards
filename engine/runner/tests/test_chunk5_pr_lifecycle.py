@@ -10,10 +10,19 @@ from typing import Any
 
 import pytest
 
+from cards_runner.common import git_safety
 from cards_runner.daemon import pr_lifecycle as pr
 from cards_runner.daemon.pr_lifecycle import (
     GhCallResult, NullGhRunner, SubprocessGhRunner,
 )
+
+
+@pytest.fixture(autouse=True)
+def _unpinned_binaries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # These tests pin the argv shape; the boot-time absolute-path pin is
+    # tested in test_git_runner_seam.
+    git_safety.configure(tmp_path / "git-state")
+    monkeypatch.setattr(git_safety, "_PINNED_BINARIES", {})
 
 
 class _FakeCompletedProcess:
