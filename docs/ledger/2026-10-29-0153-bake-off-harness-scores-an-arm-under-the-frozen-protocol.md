@@ -1,0 +1,17 @@
+# 2026-10-29 01:53 CDT - bake-off harness scores an arm under the frozen protocol
+- **Who:** PromptBuilder seat (Claude Opus 5.5), the bake-off scorer Daedalus queued after #85 and #86.
+- **Change:**
+  - `engine/bench/local_bakeoff/harness/` lands on top of the freeze commit 8447e14. It holds `reply_parser.py` (the PROTOCOL.md reply format and parse failures), `run_bakeoff.py` (one arm end to end), tests and a README.
+  - The runner checks the exam on disk against the freeze and refuses to run if it differs.
+  - It loads the model through Ollama's native API, with load time recorded apart from the runs and `num_ctx` set explicitly.
+  - It runs each card 3 times, one turn, no tools. Each reply is applied to a fresh seed copy, verified with the protocol's env and suspect-scanned.
+  - It samples device VRAM through nvidia-smi and re-runs itself under paradigm-ops `with_lease.py` when given `--lease-gb`.
+  - It runs a refusal probe for every arm, so arm E has baselines.
+  - It writes `runs.jsonl`, the raw replies, `summary.json` and `summary.md`.
+- **Why:** the exam was frozen before any model saw it. The scorer had to exist, and be shown correct, before the first arm runs, so that no result can be tuned after the fact.
+- **State after:**
+  - Harness tests: 46 passed, all against fake models, no GPU.
+  - Positive control: answering every card with its reference solution passes all 10 exam cards through the real verifier and real pytest, and fails both negative controls.
+  - Two mutants (a wrong verdict string, a disabled suspect scan) turn the tests red.
+  - No arm has been run yet. That waits on Drew upgrading Ollama and pulling the models, and on Daedalus supplying the C and E tags.
+- **Refs:** engine/bench/local_bakeoff/harness/run_bakeoff.py; engine/bench/local_bakeoff/harness/test_run_bakeoff.py; engine/bench/local_bakeoff/harness/README.md; engine/bench/local_bakeoff/PROTOCOL.md; engine/bench/local_bakeoff/CONTROLS.md
