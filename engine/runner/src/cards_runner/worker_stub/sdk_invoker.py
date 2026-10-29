@@ -33,6 +33,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import subprocess
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -51,6 +52,46 @@ from ..providers import (
 from .cost import CostCapExceeded, CostGovernor, Pricing, model_tier
 from .invoker import InvokeRequest, InvokeResult
 from .tools import TOOL_DESCRIPTORS, ToolBelt, ToolError, ToolResult
+
+# Every variable a Windows or POSIX tool resolves "the user's profile" from.
+_PROFILE_VARS: tuple[str, ...] = (
+    "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME",
+)
+_IDENTITY_KEYS: tuple[str, ...] = ("user.name", "user.email")
+
+
+def _isolate_profile(env: dict[str, str], home: Path) -> None:
+    """Point every profile variable in `env` at a fresh dir under `home`.
+
+    The commit identity from the real global config is carried over, so the
+    executor's commits are attributed as before. Nothing else is: the new
+    global config holds exactly those two keys. Absolute-path writes into
+    the real profile stay possible (same user); see the PR's residuals.
+    """
+
+
+    identity: list[tuple[str, str]] = []
+    for key in _IDENTITY_KEYS:
+        try:
+            proc = subprocess.run(
+                ["git", "config", "--global", "--get", key],
+                capture_output=True, text=True, timeout=10, check=False,
+                env={k: v for k, v in env.items() if not k.startswith("GIT_")},
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            identity.append((key, proc.stdout.strip()))
+    home.mkdir(parents=True, exist_ok=True)
+    for var, sub in zip(_PROFILE_VARS, ("", "", "AppData/Roaming", "AppData/Local", ".config")):
+        path = home / sub if sub else home
+        path.mkdir(parents=True, exist_ok=True)
+        env[var] = str(path)
+    env["HOMEDRIVE"], env["HOMEPATH"] = home.drive, str(home)[len(home.drive):]
+    for key in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"):
+        env.pop(key, None)
+    lines = ["[user]"] + [f"\t{k.split('.', 1)[1]} = {v}" for k, v in identity]
+    (home / ".gitconfig").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 log = logging.getLogger(__name__)
@@ -665,12 +706,16 @@ class SdkInvoker:
         # The tool shell runs MODEL-WRITTEN commands, so it gets a fresh
         # allowlist scrub, never dict(os.environ): no Anthropic or cloud
         # keys, no tokens, nothing the scrub does not explicitly keep.
-        env = (
+        env = dict(
             self.tool_env
             if self.tool_env is not None
             else scrub_environment(base=dict(os.environ))
         )
         worktree = Path(request.worktree)
+        # And a throwaway profile: a model-run `git config --global` (or
+        # anything else writing under ~) lands in the run dir, not in the
+        # owner's real profile, where the owner's own git would run it.
+        _isolate_profile(env, worktree.parent / "tool-home")
         return ToolBelt(worktree=worktree, env=env)
 
     # ---- cascade bookkeeping -----------------------------------------

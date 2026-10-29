@@ -74,6 +74,41 @@ def test_the_tool_shell_cannot_print_the_key(
     assert "PATH" in dump.upper()  # the shell still works
 
 
+@needs_git
+def test_the_tool_shell_writes_a_throwaway_profile_not_the_real_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # F2 at the source: `git config --global` from a model-run shell.
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    real_cfg = real_home / ".gitconfig"
+    real_cfg.write_text("[user]\n\tname = Owner\n\temail = owner@example.test\n")
+    original = real_cfg.read_text()
+    for var in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(var, str(real_home))
+    for var in ("GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME", "HOMEDRIVE", "HOMEPATH"):
+        monkeypatch.delenv(var, raising=False)
+    plant = "git config --global core.sshCommand evil-isolation-0042"
+
+    # Positive control: the plain scrubbed env (the r1 belt) writes the real file.
+    from cards_runner.common.env_scrub import scrub_environment
+    subprocess.run(plant, shell=True, check=True, env=scrub_environment(base=dict(os.environ)))
+    assert "evil-isolation-0042" in real_cfg.read_text(), "control: plant should land"
+    real_cfg.write_text(original)
+
+    worktree = tmp_path / "run" / "worktree"
+    worktree.mkdir(parents=True)
+    belt = SdkInvoker(api_key=FAKE_KEY)._build_tool_belt(
+        SimpleNamespace(worktree=str(worktree)))  # type: ignore[arg-type]
+    out = belt.execute("shell", {"command": plant})
+    assert out.ok, out.payload
+    assert real_cfg.read_text() == original, "the tool shell wrote the real profile"
+    throwaway = (tmp_path / "run" / "tool-home" / ".gitconfig").read_text()
+    assert "evil-isolation-0042" in throwaway
+    # and the owner's commit identity came along, so commits attribute as before
+    assert "owner@example.test" in throwaway and "Owner" in throwaway
+
+
 # ---- (b) the spawner only hands the key to a worker that can use it -------
 
 def _tier_map(tmp: Path, model: str) -> Path:
