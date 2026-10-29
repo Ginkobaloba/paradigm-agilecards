@@ -23,7 +23,7 @@ from cards_runner.common.types import (
     RuntimePaths,
     parse_iso,
 )
-from cards_runner.daemon.worktree import prepare_worktree
+from cards_runner.daemon.worktree import prepare_stub_worktree
 from cards_runner.store.projection import project_card_file
 from cards_runner.store.sqlite_store import SqliteRepository
 from cards_runner.worker_stub.invoker import StubInvoker
@@ -50,13 +50,10 @@ def claimed(
     run_dir = paths.runs / attempt
     run_dir.mkdir(parents=True, exist_ok=True)
     worktree = run_dir / "worktree"
-    prepare_worktree(
-        paths=paths,
-        project_dir=tmp_path,
+    prepare_stub_worktree(
+        worktree_path=worktree,
         branch_name="card/bTST-03-heartbeat",
         base_branch="main",
-        worktree_path=worktree,
-        skip_git=True,
     )
     card_file = run_dir / PROJECTED_CARD_NAME
     project_card_file(record, card_file, verbatim=False)

@@ -218,24 +218,26 @@ Lean mode (project opts in): all cards in a batch share one branch
 `cards/<batch_id>`. Cards merge into that branch sequentially in
 dependency order. One PR per batch instead of per card.
 
-**Worktree creation reliability.** When the runner spawns a per-card
-worktree (the typical pattern for true parallel execution), it MUST:
+**Per-card tree creation.** Each attempt's executor works in a
+throwaway CLONE of the project (`git clone --no-hardlinks
+--single-branch --no-tags`), never a `git worktree`. A worktree shares
+the project's `.git` (config, hooks) with model-run code, and the
+runner's next git call in the project would read whatever it wrote.
+The runner MUST:
 
-1. Serialize worktree creation across parallel runners using a global
-   mutex. A file lock on `C:\dev\todo\.runner.lock` (or equivalent) is
-   sufficient. This avoids the `.git/config.lock` race observed in
-   Claude Code issue #34645 (multiple agents writing config
-   concurrently corrupt git state).
-2. Verify creation succeeded before handing the worktree to an agent.
-   Check (a) the worktree directory exists and is non-empty, (b)
-   `git worktree list` includes the path, (c) `git status` inside the
-   worktree returns cleanly. If any check fails, treat the claim as
-   failed and roll back (move card back to backlog).
-3. Document any partial-creation failure in `_batches/<batch>-runner.log`
-   so subsequent runs can avoid the same path.
+1. Pin the base to a commit sha at claim time and create the clone at
+   that sha, on the per-attempt branch, with no remote.
+2. Never run git in the executor's clone after the executor starts. The
+   executor hands its change back as a patch file; the runner applies it
+   in a clone of its own, checks every resulting path and file mode,
+   commits once with its own identity, and verifies and pushes exactly
+   that commit's sha.
+3. On a failed clone, treat the claim as failed and roll back (move the
+   card back to backlog).
 
-Related Claude Code issues for context: #40164 (parallel agent file
-contention) and #34645 (.git/config.lock race). Same mitigations apply.
+A clone only reads the project's `.git`, so concurrent clones do not
+contend on `.git/config.lock` (Claude Code issue #34645), and no mutex is
+needed. Related: #40164 (parallel agent file contention).
 
 **Atomic move between subfolders.** Card state transitions rely on
 atomic file moves across `backlog/`, `active/`, `amendments/`,
@@ -299,14 +301,11 @@ subtle ways. The runner MUST enforce the following:
    prevents one agent's half-written log being parsed as ground truth
    by another agent's tool call.
 
-6. **Serialized worktree creation via global mutex.** Worktree
-   creation calls (`git worktree add`) must be serialized across
-   parallel runners by a global file lock (`C:\dev\todo\.runner.lock`
-   or equivalent). Git's internal locks (`.git/config.lock`,
-   `.git/worktrees/*/locked`) are not safe under concurrent
-   `git worktree add` invocations; see issue #34645. Hold the mutex
-   for the duration of the `git worktree add` call only, not for
-   the executor's lifetime.
+6. **A clone per attempt, not a shared worktree.** See "Per-card tree
+   creation" above. Clones never write the project's `.git`, which is
+   what made concurrent `git worktree add` calls unsafe (issue #34645)
+   and what let one card's executor change the git config the next
+   card's git read.
 
 These are not optional. Skipping any of them produces failure modes
 that are intermittent, machine-specific, and miserable to debug after

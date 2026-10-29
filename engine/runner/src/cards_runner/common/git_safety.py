@@ -79,7 +79,7 @@ _PINNABLE: tuple[str, ...] = ("git", "gh", "powershell.exe")
 # real config, before any executor ran. Model-chosen identities and
 # commit messages never reach a pushed commit.
 _IDENTITY: dict[str, str] = {}
-_FALLBACK_IDENTITY: dict[str, str] = {"user.name": "cards-runner", "user.email": "cards-runner@localhost"}
+_FALLBACK_IDENTITY: dict[str, str] = {"user.name": "cards-runner", "user.email": "cards-runner@users.noreply.github.com"}
 
 
 class RepoQuarantined(RuntimeError):

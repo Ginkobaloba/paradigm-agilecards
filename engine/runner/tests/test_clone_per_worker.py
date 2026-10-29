@@ -550,3 +550,55 @@ def test_branch_remote_names_match_case_sensitively_like_git(tmp_path: Path) -> 
     assert git_safety.fingerprint(common) == before  # exempt: a real remote
     _g(project, "config", "branch.main.remote", "ORIGIN")
     assert git_safety.fingerprint(common) != before  # hashed: not a remote
+
+
+# ---- residual bounds: a sibling worker, and what model-side git sees ----
+
+
+def test_an_index_rewritten_between_check_and_commit_is_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With max_parallel > 1, another card's worker (same user) is alive
+    # during integration and the index is not fingerprinted. So the check
+    # that counts is on the committed tree, the thing that is pushed.
+    project = _project(tmp_path)
+    git_safety.assert_trusted(project, first_sight_ok=True)
+    patch = _patch_for(tmp_path, lambda r: (r / "src.py").write_text("x = 1\n"))
+    blob = subprocess.run([GIT, "hash-object", "-w", "--stdin"], input=b"../../outside",
+                          cwd=project, capture_output=True, check=True).stdout.decode().strip()
+    real_git = clones._git
+
+    def sibling_writes_index(cwd: Path, *args: str, **kw: Any) -> str:
+        if args and args[0] == "commit":
+            subprocess.run([GIT, "hash-object", "-w", "--stdin"], input=b"../../outside",
+                           cwd=cwd, capture_output=True, check=True)
+            subprocess.run([GIT, "update-index", "--add", "--cacheinfo",
+                            f"120000,{blob},evil-link"], cwd=cwd, check=True,
+                           capture_output=True)
+        return real_git(cwd, *args, **kw)
+
+    monkeypatch.setattr(clones, "_git", sibling_writes_index)
+    with pytest.raises(PatchRejected, match="symlink or submodule"):
+        _integrate(tmp_path, project, patch)
+
+
+def test_model_side_git_runs_a_planted_filter_without_the_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Clean filters still run under `git add -A` (the overrides cannot name
+    # every driver). What patch_emit guarantees is the env they run in.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-0042")
+    monkeypatch.setenv("GH_TOKEN", "gh-test-0042")
+    project = _project(tmp_path)
+    base = _g(project, "rev-parse", "HEAD").strip()
+    marker = tmp_path / "filter-env.txt"
+    _g(project, "config", "filter.leak.clean", f"env > '{marker.as_posix()}'; cat")
+    (project / ".gitattributes").write_text("* filter=leak\n", encoding="utf-8")
+    (project / "new.txt").write_text("data\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    assert emit_patch(worktree=project, base_sha=base, run_dir=run_dir)
+    dumped = marker.read_text(encoding="utf-8", errors="replace")
+    assert "PATH" in dumped.upper(), "control: the planted filter ran and dumped its env"
+    assert "sk-ant-test-0042" not in dumped
+    assert "gh-test-0042" not in dumped

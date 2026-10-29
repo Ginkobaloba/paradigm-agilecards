@@ -168,11 +168,8 @@ def path_allowed(path: str) -> bool:
     return True
 
 
-def _index_changes(clone: Path, base_sha: str) -> list[tuple[str, str]]:
-    """(new_mode, path) for every entry the index changes vs `base_sha`,
-    read from git's own record of the index (`diff-index --raw -z`)."""
-    out = _git(clone, "diff-index", "--cached", "--raw", "-z", "--no-renames",
-               base_sha)
+def _parse_raw(out: str) -> list[tuple[str, str]]:
+    """(new_mode, path) pairs from `--raw -z --no-renames` output."""
     fields = out.split("\x00")
     changes: list[tuple[str, str]] = []
     i = 0
@@ -186,16 +183,29 @@ def _index_changes(clone: Path, base_sha: str) -> list[tuple[str, str]]:
     return changes
 
 
+def _refuse_bad_entries(changes: list[tuple[str, str]]) -> None:
+    for mode, path in changes:
+        if not path_allowed(path):
+            raise PatchRejected(f"patch touches a refused path: {path!r}")
+        if mode in (_SYMLINK_MODE, _GITLINK_MODE):
+            raise PatchRejected(f"patch adds a symlink or submodule: {path!r} ({mode})")
+
+
 def integrate_patch(*, project_dir: Path, base_branch: str, base_sha: str,
                     branch: str, patch_file: Path, dest: Path, message: str) -> str:
     """Apply the worker's patch in a fresh daemon clone; commit; return the sha.
 
     The patch is applied to the INDEX only (`--cached`): no file the patch
-    names is written to disk here. Before committing, every changed path
-    and its new mode is read back from git and refused if it is not a
-    plain relative path or if it is a symlink or submodule. An empty patch
-    leaves the base sha (and the merge gate's PR then has nothing in it,
-    exactly as an executor that committed nothing did before).
+    names is written to disk here. Every changed path and its new mode is
+    read back from git and refused if it is not a plain relative path or if
+    it is a symlink or submodule: once in the index before committing (an
+    early refusal), and once in the COMMITTED TREE, the check that counts.
+    The index is not part of the trust fingerprint, and with
+    `max_parallel > 1` another card's worker (same user) is alive while
+    this runs and could rewrite it between check and commit. The commit's
+    tree cannot change under the sha that is pushed. An empty patch leaves
+    the base sha (and the merge gate's PR then has nothing in it, exactly
+    as an executor that committed nothing did before).
     """
     _clone(project_dir, dest, branch=base_branch, first_sight_ok=True)
     _git(dest, "checkout", "--quiet", "-b", branch, base_sha)
@@ -205,8 +215,10 @@ def integrate_patch(*, project_dir: Path, base_branch: str, base_sha: str,
     else:
         _git(dest, "remote", "remove", "origin")
     # The baseline was taken before these, the daemon's own config writes;
-    # take it again now. Nothing model-run is alive yet (the worker's job
-    # has ended and the verifier has not started), so this absorbs nothing.
+    # take it again now. Nothing from THIS attempt is alive (its worker's
+    # job has ended; its verifier has not started). A sibling attempt's
+    # worker could write here by absolute path; that is the same-user
+    # residual, bounded by the fingerprint and the committed-tree check.
     git_safety.trust_daemon_clone(dest)
     if patch_file.stat().st_size == 0:
         return base_sha
@@ -214,12 +226,9 @@ def integrate_patch(*, project_dir: Path, base_branch: str, base_sha: str,
                     "--", str(patch_file)], cwd=dest, timeout=CLONE_TIMEOUT_SEC)
     if proc.returncode != 0:
         raise PatchRejected(f"git apply refused the patch: {proc.stderr.strip()[:400]}")
-    changes = _index_changes(dest, base_sha)
-    for mode, path in changes:
-        if not path_allowed(path):
-            raise PatchRejected(f"patch touches a refused path: {path!r}")
-        if mode in (_SYMLINK_MODE, _GITLINK_MODE):
-            raise PatchRejected(f"patch adds a symlink or submodule: {path!r} ({mode})")
+    changes = _parse_raw(_git(dest, "diff-index", "--cached", "--raw", "-z",
+                              "--no-renames", base_sha))
+    _refuse_bad_entries(changes)
     if not changes:
         return base_sha
     _git(dest, "commit", "--quiet", "--no-verify", "-m", message,
@@ -227,6 +236,12 @@ def integrate_patch(*, project_dir: Path, base_branch: str, base_sha: str,
     sha = _git(dest, "rev-parse", "--verify", "HEAD^{commit}").strip()
     if not _SHA_RE.match(sha):
         raise CloneError(f"unexpected HEAD after commit: {sha!r}")
+    # What is pushed is `sha`: check its parent and its tree, not the index.
+    parents = _git(dest, "rev-list", "--parents", "-n", "1", sha).split()
+    if parents != [sha, base_sha]:
+        raise PatchRejected(f"integrated commit is not one commit on {base_sha[:12]}")
+    _refuse_bad_entries(_parse_raw(_git(dest, "diff-tree", "-r", "--raw", "-z",
+                                        "--no-renames", base_sha, sha)))
     return sha
 
 
@@ -243,6 +258,8 @@ def prepare_verify_clone(*, integration: Path, branch: str, sha: str, dest: Path
         head = _git(dest, "rev-parse", "--verify", "HEAD^{commit}").strip()
         if head != sha:
             raise CloneError(f"verify clone HEAD {head} is not {sha}")
+        # No path back to the integration clone for an AC to push into.
+        _git(dest, "remote", "remove", "origin")
     finally:
         git_safety.forget(dest)
 

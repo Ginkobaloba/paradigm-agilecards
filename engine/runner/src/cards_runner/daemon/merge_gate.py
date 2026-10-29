@@ -170,7 +170,7 @@ class MergeGate:
             )
 
         # The working branch is per-attempt (see `attempt_branch_name`): it
-        # MUST match the branch `prepare_worktree` created for this claim, or
+        # MUST match the branch clone prep created for this claim, or
         # the push targets a branch that does not exist. Derive it the same
         # way, from the same attempt id, not from the card's fixed `branch:`
         # field alone.

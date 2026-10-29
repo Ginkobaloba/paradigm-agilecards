@@ -463,10 +463,10 @@ def test_a_worktree_repointed_at_another_repo_is_refused(tmp_path: Path) -> None
 
 @needs_git
 @pytest.mark.parametrize("planted_after_trust", [False, True])
-def test_worktree_prep_runs_no_planted_hook(planted_after_trust: bool, tmp_path: Path) -> None:
-    # F1: the next card's `git worktree add` runs in the shared .git.
-    from cards_runner.common.types import RuntimePaths
-    from cards_runner.daemon.worktree import prepare_worktree
+def test_clone_prep_runs_no_planted_hook(planted_after_trust: bool, tmp_path: Path) -> None:
+    # F1: the next card's prep runs git in the project, which earlier
+    # model-run code could write by absolute path.
+    from cards_runner.daemon.clones import prepare_worker_clone
 
     work = _repo_with_remote(tmp_path)
     marker = tmp_path / "post-checkout-fired.txt"
@@ -486,16 +486,14 @@ def test_worktree_prep_runs_no_planted_hook(planted_after_trust: bool, tmp_path:
     else:
         git_safety.trust_repo(_common(work))  # rigged at first sight: overrides alone
 
-    paths = RuntimePaths.from_root(tmp_path / "todo")
-    paths.ensure()
-    kwargs = dict(paths=paths, project_dir=work, branch_name="card/z",
-                  base_branch="main", worktree_path=tmp_path / "card-wt")
+    kwargs = dict(project_dir=work, branch="card/z", base_branch="main",
+                  dest=tmp_path / "card-wt")
     if planted_after_trust:
         with pytest.raises(git_safety.RepoQuarantined):
-            prepare_worktree(**kwargs)
+            prepare_worker_clone(**kwargs)
     else:
-        prepare_worktree(**kwargs)
-    assert not marker.exists(), "worktree prep ran a planted hook"
+        prepare_worker_clone(**kwargs)
+    assert not marker.exists(), "clone prep ran a planted hook"
 
 
 @needs_git

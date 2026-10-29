@@ -113,11 +113,7 @@ from .sibling_reviewer import (
 )
 from .spawner import spawn_worker
 from .unblocker import UnblockDecision, unblock_merged_cards
-from .worktree import (
-    attempt_branch_name,
-    prepare_worktree,
-    prune_git_worktrees,
-)
+from .worktree import attempt_branch_name, prepare_stub_worktree
 
 
 # How many times the daemon re-runs the verifier on a `VerifierError`
@@ -178,7 +174,12 @@ class Daemon:
         self._owns_repo = repo is None
         self._last_tick_at: float = 0.0
         self._last_tick_summary: dict[str, int] = {}
-        self._last_prune_at: float = 0.0
+        if cfg.worktree_prune_enabled:
+            # Obsolete since workers moved to clones (daemon/clones.py): the
+            # runner no longer registers worktrees in a project. Accepted so
+            # an existing launch command still starts.
+            log.warning("--worktree-prune is obsolete and ignored: workers use "
+                        "throwaway clones, not git worktrees")
         # Merge gate. Tests pass a `FakeGhRunner`; production builds use
         # the default subprocess wrapper. When `pr_gate_enabled=False`
         # both the gate and the runner are no-ops by design.
@@ -498,14 +499,6 @@ class Daemon:
         except Exception:  # noqa: BLE001
             log.exception("pr unblocker failed; continuing")
 
-        # 0b. Chunk 5: `git worktree prune` sweep. The chunk-4 reaper
-        #     deletes the `_runs/<attempt>/` tree; this drops the dead
-        #     administrative `.git/worktrees/<id>/` entries that the
-        #     project repo still tracks. Rate-limited by
-        #     `worktree_prune_interval_sec`; off by default.
-        if self.cfg.worktree_prune_enabled:
-            self._maybe_prune_git_worktrees()
-
         # 0c. Chunk 5: sibling-agent reviewer for tier-3/4 PRs.
         #     Walks blocked/requires_review cards and posts a gh review.
         #     No-op when the host knob or the project knob is False.
@@ -717,14 +710,8 @@ class Daemon:
         project_dir, base, branch = self._clone_coordinates(record, claim)
         try:
             if self.cfg.skip_worktree:
-                prepare_worktree(
-                    paths=self.paths,
-                    project_dir=project_dir,
-                    branch_name=branch,
-                    base_branch=base,
-                    worktree_path=claim.worktree_path,
-                    skip_git=True,
-                )
+                prepare_stub_worktree(worktree_path=claim.worktree_path,
+                                      branch_name=branch, base_branch=base)
             else:
                 # A throwaway clone, not a worktree: the worker gets its own
                 # `.git`, and the base is pinned to a sha (daemon/clones.py).
@@ -987,7 +974,10 @@ class Daemon:
         """Apply the worker's patch in a daemon clone and commit it once.
 
         Runs only after the worker's whole job has ended (`_reap_workers`),
-        so nothing model-run is alive to race the read or the apply. Returns
+        so nothing from THIS attempt is alive to race the read or the apply.
+        Another attempt's worker may be (`max_parallel > 1`, same user): the
+        trust fingerprint, the committed-tree check in `integrate_patch` and
+        the sha-pinned push bound what it can do (see the PR residuals). Returns
         the claim with `integration_path` / `integrated_sha` set, the claim
         unchanged in skip-worktree mode, or None after routing the card to
         `blocked` (no patch, a refused patch, or an untrusted project).
@@ -1672,7 +1662,9 @@ class Daemon:
         push. Model-written shell ACs run there, so the daemon runs no git
         in it afterwards. None after routing the card to `blocked`."""
         if claim.integration_path is None or claim.integrated_sha is None:
-            return claim.worktree_path  # skip-worktree mode
+            # Skip-worktree mode only: outside it `_integrate_worker_patch`
+            # either set both or routed the card away before this point.
+            return claim.worktree_path
         record = self.repo.get_card(claim.card_id, tenant_id=self.tenant_id)
         if record is None:  # pragma: no cover - just wrote it.
             return None
@@ -2181,44 +2173,3 @@ class Daemon:
         if client is None:
             return None
         return AnthropicAmendmentEditorClient(client=client)
-
-    # ---- chunk 5: git worktree prune sweep ---------------------------
-
-    def _maybe_prune_git_worktrees(self) -> None:
-        """Run `git worktree prune` per project once the interval elapses.
-
-        The runner does not (today) track the set of project repos
-        explicitly; we derive it from the distinct `project` fields on
-        live cards. A project with zero cards in the store contributes
-        nothing -- which is correct, the runner has nothing to clean up
-        there.
-        """
-        if self.cfg.skip_worktree:
-            return  # tests run against tmp dirs, never against a real git repo.
-        if self.cfg.worktree_prune_interval_sec <= 0:
-            return
-        now = time.monotonic()
-        if self._last_prune_at and now - self._last_prune_at < (
-            self.cfg.worktree_prune_interval_sec
-        ):
-            return
-        seen: set[Path] = set()
-        for record in self.repo.query_cards(tenant_id=self.tenant_id):
-            project = record.project
-            if not project:
-                continue
-            try:
-                project_dir = Path(project).resolve()
-            except OSError:
-                continue
-            if project_dir in seen:
-                continue
-            seen.add(project_dir)
-            try:
-                prune_git_worktrees(project_dir=project_dir)
-            except Exception:  # noqa: BLE001 - defensive sweep.
-                log.exception(
-                    "worktree prune sweep failed for %s; continuing",
-                    project_dir,
-                )
-        self._last_prune_at = now

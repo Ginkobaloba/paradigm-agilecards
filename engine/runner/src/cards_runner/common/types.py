@@ -237,11 +237,10 @@ class DaemonConfig:
     pr_unblock_enabled: bool = False
     sibling_reviewer_enabled: bool = False
     amendment_reviewer_enabled: bool = False
+    # Obsolete: workers use throwaway clones, so the runner registers no
+    # worktrees to prune. Kept so existing launch commands still parse;
+    # the daemon warns and ignores them.
     worktree_prune_enabled: bool = False
-    # How often to run `git worktree prune`, in seconds. Default hourly
-    # because the cost (a couple of subprocess calls) is small but the
-    # benefit (cleaning up dead refs accumulated by chunk-3-era git work)
-    # is rare in steady state.
     worktree_prune_interval_sec: int = 3600
     # Chunk 6d: cleanup TTL for the per-card reviewer markers under
     # signals/sibling_reviews/ and signals/amendment_reviews/. The sweep
