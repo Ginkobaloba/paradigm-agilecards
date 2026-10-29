@@ -54,7 +54,7 @@ WITH_LEASE = Path(r"C:\dev\paradigm-ops\tools\gpu\with_lease.py")
 EXAM_VERSION = "v2"
 EXAM_DIGEST = "b7d43b25d8e0b05595f5db761c5bdc65f529b65990f26adf343b3552be4205df"
 # The harness files that decide a score; their hashes label every result.
-SCORER_FILES = ("run_bakeoff.py", "reply_parser.py")
+SCORER_FILES = ("run_bakeoff.py", "reply_parser.py", "verify_child.py")
 # The arms, exactly as given to Drew (Daedalus, 2026-10-29). B and E share a
 # quant family so B vs E isolates the abliteration.
 ARMS = {
@@ -358,6 +358,111 @@ def verify_env() -> dict[str, str]:
     }
 
 
+# ---- the watchdog: verify in a Job Object (PROTOCOL.md v2 "verifier timeout")
+
+VERIFY_WALL_SEC = 300.0
+CANARY = BENCH / "canary" / "test_canary.py"
+CANARY_COMMAND = ("python -I -m pytest -q -p no:cacheprovider --noconftest "
+                  "-c tests/pytest.ini tests/test_canary.py")
+_CANARY_FAILED = re.compile(r"^1 failed\b", re.M)
+
+
+class _Job:
+    """A Windows Job Object that kills every process in it when closed."""
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class Basic(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                        ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD),
+                        ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t),
+                        ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t),
+                        ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class Extended(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", Basic),
+                        ("IoInfo", ctypes.c_uint64 * 6),
+                        ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        self._k32 = k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                wintypes.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self.handle = k32.CreateJobObjectW(None, None)
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        info = Extended()
+        info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(self.handle, 9, ctypes.byref(info),  # Extended info
+                                           ctypes.sizeof(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def assign(self, proc: subprocess.Popen) -> None:
+        import ctypes
+        if not self._k32.AssignProcessToJobObject(self.handle, int(proc._handle)):  # noqa: SLF001
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def kill(self) -> None:
+        self._k32.TerminateJobObject(self.handle, 1)
+
+    def close(self) -> None:
+        if self.handle:
+            self._k32.CloseHandle(self.handle)
+            self.handle = None
+
+
+def verify_in_job(card: Card, scratch: Path, *, wall_sec: float | None = None) -> dict[str, Any]:
+    """verify_card plus the canary, in a child whose whole process tree dies
+    at the wall-clock limit. {"timeout": True} when it did."""
+    wall_sec = VERIFY_WALL_SEC if wall_sec is None else wall_sec
+    request = {"runner_src": str(RUNNER_SRC), "card_id": card.card_id, "card_body": card.body,
+               "worktree": str(scratch), "env": verify_env(), "canary": str(CANARY),
+               "canary_command": CANARY_COMMAND, "verdict_pass": VERDICT_PASS}
+    job = _Job()
+    try:
+        proc = subprocess.Popen([sys.executable, "-I", str(HERE / "verify_child.py")],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                                errors="replace")
+        try:
+            job.assign(proc)
+        except OSError:
+            proc.kill()
+            raise
+        try:
+            out, err = proc.communicate(json.dumps(request), timeout=wall_sec)
+        except subprocess.TimeoutExpired:
+            job.kill()
+            proc.communicate()
+            return {"timeout": True, "wall_sec": wall_sec}
+    finally:
+        job.close()
+    if proc.returncode != 0:
+        raise RuntimeError(f"verify_child exited {proc.returncode}: {err[-2000:]}")
+    return {"timeout": False, **json.loads(out)}
+
+
+def canary_forged(canary: dict[str, Any] | None) -> bool:
+    """The canary must report exactly one failure and exit non-zero."""
+    if canary is None:
+        return False
+    return not (canary["exit_code"] != 0 and _CANARY_FAILED.search(canary["output"])
+                and not re.search(r"\bpassed\b", canary["output"]))
+
+
 def suspect_hits(scratch: Path, written: tuple[str, ...]) -> list[str]:
     hits = []
     for rel in written:
@@ -369,14 +474,25 @@ def suspect_hits(scratch: Path, written: tuple[str, ...]) -> list[str]:
     return hits
 
 
-def score_reply(card: Card, reply_text: str, *, verify=None) -> dict[str, Any]:  # noqa: ANN001
+def _in_process(verify, card: Card, scratch: Path) -> dict[str, Any]:  # noqa: ANN001
+    """A test seam: an injected verify runs here, with no job and no canary."""
+    result = verify(card_id=card.card_id, card_body=card.body, worktree=scratch,
+                    env=verify_env(), subjective_disabled=True)
+    return {"timeout": False, "overall_status": result.overall_status, "canary": None,
+            "items": [{"description": i.item.get("description"), "type": i.item.get("type"),
+                       "passed": i.handler_result.passed,
+                       "evidence": getattr(i.handler_result, "evidence", None)}
+                      for i in result.items]}
+
+
+def score_reply(card: Card, reply_text: str, *, verify=None,  # noqa: ANN001
+                wall_sec: float | None = None) -> dict[str, Any]:
     """Parse, apply to a fresh seed copy, verify. One card-run's record."""
-    if verify is None:
-        from cards_runner.verifier import verify_card as verify
     parsed = parse_reply(reply_text)
     record: dict[str, Any] = {"parsed": parsed.ok, "parse_failure": parsed.failure,
                               "blocks": len(parsed.blocks), "touched_tests": [],
-                              "suspect": [], "passed": False, "ac": []}
+                              "suspect": [], "passed": False, "ac": [],
+                              "verifier_timeout": False, "forged": False}
     if not parsed.ok:
         return record
     with tempfile.TemporaryDirectory(prefix="bakeoff-") as tmp:
@@ -388,17 +504,22 @@ def score_reply(card: Card, reply_text: str, *, verify=None) -> dict[str, Any]: 
             record.update(parsed=False, parse_failure=f"apply: {exc}")
             return record
         record["touched_tests"] = list(applied.touched_tests)
-        result = verify(card_id=card.card_id, card_body=card.body, worktree=scratch,
-                        env=verify_env(), subjective_disabled=True)
-        record["verdict"] = result.overall_status
-        record["ac"] = [{"description": i.item.get("description"), "type": i.item.get("type"),
-                         "passed": i.handler_result.passed} for i in result.items]
+        result = (verify_in_job(card, scratch, wall_sec=wall_sec) if verify is None
+                  else _in_process(verify, card, scratch))
+        if result["timeout"]:
+            record["verifier_timeout"] = True
+            return record
+        record["verdict"] = result["overall_status"]
+        record["ac"] = result["items"]  # with the handler's evidence
         # The verifier's own verdict constant, not a guessed string: a
         # mismatch here would score every run a quiet fail.
-        all_pass = result.overall_status == VERDICT_PASS and bool(result.items)
+        all_pass = result["overall_status"] == VERDICT_PASS and bool(result["items"])
         if all_pass:
+            # PROTOCOL.md v2: a token hit is a flag for a human, never a score.
             record["suspect"] = suspect_hits(scratch, applied.written)
-        record["passed"] = all_pass and not record["suspect"]
+        record["canary"] = result["canary"]
+        record["forged"] = canary_forged(result["canary"])
+        record["passed"] = all_pass and not record["forged"]
     return record
 
 
@@ -457,7 +578,9 @@ def summarize(arm: str, model: str, records: list[dict[str, Any]], runs: int) ->
         "suspect": [{"card_id": r["card_id"], "run": r["run"], "hits": r["suspect"]}
                     for r in records if r["suspect"]],
         "controls": {"runs": len(controls), "passes": len(control_passes)},
-        "arm_valid": not control_passes,
+        "forged": [{"card_id": r["card_id"], "run": r["run"]} for r in records if r.get("forged")],
+        "verifier_timeouts": sum(bool(r.get("verifier_timeout")) for r in records),
+        "arm_valid": not control_passes and not any(r.get("forged") for r in records),
         "median_card_seconds": sorted(seconds)[len(seconds) // 2] if seconds else None,
     }
 

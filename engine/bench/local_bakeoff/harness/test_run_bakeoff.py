@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -88,15 +89,77 @@ def test_garbage_is_a_parse_failure_and_nothing_passes(tmp_path: Path) -> None:
     assert summary["arm_valid"]
 
 
-def test_a_forged_pass_is_scored_a_fail_and_listed(tmp_path: Path) -> None:
+def test_a_suspect_token_is_flagged_for_a_human_and_does_not_change_the_score(
+        tmp_path: Path) -> None:
     cards = [c for c in rb.load_cards() if c.card_id == "bk-01"]
     files = _solution("bk-01")
     files["tally/money.py"] += "\nimport os\n_EXIT = os._exit\n"
     summary = _run(tmp_path, lambda user: _blocks(files), cards=cards)
     record = json.loads((tmp_path / "out" / "runs.jsonl").read_text().splitlines()[0])
-    assert record["verdict"] == "pass"  # control: the verifier itself passed it
-    assert record["passed"] is False and record["suspect"] == ["tally/money.py: os._exit"]
-    assert summary["suspect"][0]["card_id"] == "bk-01"
+    assert record["verdict"] == "pass" and record["suspect"] == ["tally/money.py: os._exit"]
+    assert record["passed"] is True and record["forged"] is False  # the canary failed as it must
+    assert summary["suspect"][0]["card_id"] == "bk-01" and summary["pass_at_1"] == 1.0
+
+
+_SEED_INIT = (rb.SEED / "tally" / "__init__.py").read_text(encoding="utf-8")
+# The review's two forgery shapes (S-F2, I-F2): neither uses a listed token.
+_FD_FORGE = ("\nfrom os import _exit as _x, write as _w\nfor _fd in range(64):\n"
+             "    try:\n        _w(_fd, b'8 passed in 0.01s\\n')\n    except OSError:\n"
+             "        pass\n_x(0)\n")
+_RUNTEST_PATCH = "\n_m = __import__('py' + 'test')\n_m.Function.runtest = lambda self: None\n"
+
+
+@pytest.mark.parametrize("forge", [_FD_FORGE, _RUNTEST_PATCH], ids=["fd-write", "runtest-patch"])
+def test_a_forgery_the_tokens_miss_is_caught_by_the_canary(tmp_path: Path, forge: str) -> None:
+    cards = [c for c in rb.load_cards() if c.card_id == "bk-01"]
+    # The seed money.py, unfixed: only the forgery can make bk-01 pass.
+    files = {"tally/__init__.py": _SEED_INIT + forge}
+    summary = _run(tmp_path, lambda user: _blocks(files), cards=cards)
+    record = json.loads((tmp_path / "out" / "runs.jsonl").read_text().splitlines()[0])
+    assert record["verdict"] == "pass" and record["suspect"] == []  # the verifier was fooled
+    assert record["forged"] is True and record["passed"] is False
+    assert summary["arm_valid"] is False and summary["forged"] == [{"card_id": "bk-01", "run": 1}]
+
+
+@pytest.mark.parametrize("canary,forged", [
+    ({"exit_code": 1, "output": "F\n1 failed in 0.20s"}, False),
+    ({"exit_code": 0, "output": "1 passed in 0.01s"}, True),
+    ({"exit_code": 1, "output": "1 failed, 1 passed in 0.2s"}, True),
+    ({"exit_code": 1, "output": "2 failed in 0.2s"}, True),
+    ({"exit_code": 1, "output": "ERROR: file not found"}, True),
+    ({"exit_code": 0, "output": "1 failed in 0.20s"}, True),
+    (None, False),
+])
+def test_canary_verdicts(canary: dict[str, Any] | None, forged: bool) -> None:
+    assert rb.canary_forged(canary) is forged
+
+
+def test_a_looping_answer_is_killed_with_its_whole_process_tree(tmp_path: Path) -> None:
+    """S-F1: the shell handler's timeout killed only cmd.exe and then waited
+    forever on pytest. The job kills the tree at the wall-clock limit."""
+    card = next(c for c in rb.load_cards() if c.card_id == "bk-01")
+    pids = tmp_path / "pids.txt"
+    loop = (f"\nimport os\nwith open({str(pids)!r}, 'a') as _f:\n"
+            f"    _f.write(str(os.getpid()) + '\\n')\nwhile True:\n    pass\n")
+    started = time.time()
+    record = rb.score_reply(card, _blocks({"tally/__init__.py": _SEED_INIT + loop}), wall_sec=15)
+    elapsed = time.time() - started
+    assert record["verifier_timeout"] is True and record["passed"] is False
+    assert elapsed < 45, elapsed
+    hung = [int(p) for p in pids.read_text().split()]
+    assert hung, "the looping pytest never started, so this proved nothing"
+    for pid in hung:
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True,
+                             text=True).stdout
+        assert str(pid) not in out, f"pytest {pid} outlived the job"
+
+
+def test_ac_evidence_is_kept(tmp_path: Path) -> None:
+    cards = [c for c in rb.load_cards() if c.card_id == "bk-01"]
+    _run(tmp_path, lambda user: _blocks({"tally/money.py": "x = 1\n"}), cards=cards)
+    record = json.loads((tmp_path / "out" / "runs.jsonl").read_text().splitlines()[0])
+    assert record["ac"] and all("evidence" in item for item in record["ac"])
+    assert any(item["evidence"] for item in record["ac"])
 
 
 def test_a_passing_control_invalidates_the_arm(tmp_path: Path) -> None:
@@ -328,7 +391,7 @@ def test_every_row_and_the_summary_carry_the_exam_and_the_scorer(tmp_path: Path)
     summary = _run(tmp_path, lambda user: "nothing", cards=cards)
     head = rb._git("rev-parse", "HEAD").strip()
     scorer = {name: hashlib.sha256((rb.HERE / name).read_bytes()).hexdigest()
-              for name in ("run_bakeoff.py", "reply_parser.py")}
+              for name in ("run_bakeoff.py", "reply_parser.py", "verify_child.py")}
     for item in [json.loads(line) for line in
                  (tmp_path / "out" / "runs.jsonl").read_text().splitlines()] + [summary]:
         assert item["exam_digest"] == rb.EXAM_DIGEST and item["exam_version"] == "v2"
