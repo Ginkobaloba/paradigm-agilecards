@@ -207,3 +207,58 @@ def test_a_reply_that_parses_but_changes_nothing_is_an_ac_failure(tmp_path: Path
     record = json.loads((tmp_path / "out" / "runs.jsonl").read_text().splitlines()[0])
     assert record["parsed"] and not record["passed"] and record["verdict"] == "fail"
     assert summary["ac_failures"] == 1 and summary["parse_failures"] == 0
+
+
+# ---- PROTOCOL.md amendment A1 and labeling ------------------------------
+
+
+@pytest.mark.parametrize("content,expected,flag", [
+    ("<think>plan</think>answer", "answer", True),
+    ("a<think>x\ny</think>b<think>z</think>c", "abc", True),
+    ("<think>never closed\n<<<FILE a.py>>>", "<think>never closed\n<<<FILE a.py>>>", False),
+    ("<THINK>upper</THINK>kept", "<THINK>upper</THINK>kept", False),
+    ("no reasoning", "no reasoning", False),
+])
+def test_strip_inline_think(content: str, expected: str, flag: bool) -> None:
+    assert rb.strip_inline_think(content) == (expected, flag)
+
+
+def test_a_block_only_inside_think_fails_primary_and_passes_raw(tmp_path: Path) -> None:
+    cards = [c for c in rb.load_cards() if c.card_id == "bk-01"]
+    reply = "<think>\n" + _blocks(_solution("bk-01")) + "</think>\nDone."
+    summary = _run(tmp_path, lambda user: reply, cards=cards)
+    record = json.loads((tmp_path / "out" / "runs.jsonl").read_text().splitlines()[0])
+    assert record["inline_think"] is True
+    assert record["passed"] is False and record["parse_failure"] == "no complete block"
+    assert record["raw_passed"] is True  # the sensitivity line sees the difference
+    assert summary["pass_at_1"] == 0.0 and summary["pass_at_1_raw"] == 1.0
+    assert (tmp_path / "out" / "replies" / "bk-01-r1.stripped.txt").is_file()
+
+
+def test_a_decoy_in_think_does_not_count_against_the_real_answer(tmp_path: Path) -> None:
+    cards = [c for c in rb.load_cards() if c.card_id == "bk-01"]
+    decoy = _blocks({"tally/money.py": "broken = True"})
+    reply = f"<think>\n{decoy}</think>\n" + _blocks(_solution("bk-01"))
+    summary = _run(tmp_path, lambda user: reply, cards=cards)
+    record = json.loads((tmp_path / "out" / "runs.jsonl").read_text().splitlines()[0])
+    assert record["passed"] is True  # primary: the decoy is gone
+    assert record["raw_passed"] is False  # raw: a duplicate path is a parse failure
+    assert summary["inline_think_runs"] == 1
+
+
+def test_every_row_and_the_summary_carry_both_commits(tmp_path: Path) -> None:
+    cards = [c for c in rb.load_cards() if c.card_id == "bk-01"]
+    summary = _run(tmp_path, lambda user: "nothing", cards=cards)
+    head, _ = rb.verifier_commit()
+    for line in (tmp_path / "out" / "runs.jsonl").read_text().splitlines():
+        row = json.loads(line)
+        assert row["exam_freeze"] == rb.FREEZE_COMMIT and row["verifier_commit"] == head
+    assert summary["exam_freeze"] == rb.FREEZE_COMMIT and summary["verifier_commit"] == head
+    md = (tmp_path / "out" / "summary.md").read_text(encoding="utf-8")
+    assert rb.FREEZE_COMMIT in md and head in md
+
+
+def test_an_arm_is_pinned_to_its_tag(capsys: pytest.CaptureFixture[str]) -> None:
+    assert rb.ARMS["B"] == "hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL"
+    rc = rb.main(["--arm", "B", "--model", "qwen3.8:27b", "--no-lease"])
+    assert rc == 2 and "pinned" in capsys.readouterr().out

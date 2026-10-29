@@ -47,7 +47,18 @@ SYSTEM_PROMPT = BENCH / "SYSTEM_PROMPT.txt"
 RUNNER_SRC = BENCH.parents[1] / "runner" / "src"
 WITH_LEASE = Path(r"C:\dev\paradigm-ops\tools\gpu\with_lease.py")
 
-FREEZE_COMMIT = "8447e14"
+# The exam's freeze: 8447e14, moved to amendment A1 (PROTOCOL.md) before any
+# model output existed.
+FREEZE_COMMIT = "f814f9c7860f3cfcc5dd7d8bb934735fbe14b193"
+# The arms, exactly as given to Drew (Daedalus, 2026-10-29). B and E share a
+# quant family so B vs E isolates the abliteration.
+ARMS = {
+    "A": "qwen3:30b",
+    "B": "hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
+    "C": "hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ4_NL_XL",
+    "D": "gpt-oss:120b",
+    "E": "hf.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF:UD-Q4_K_XL",
+}
 LABEL = "text-mode, harness-applied: measures the model's coding output, not the runner pipeline."
 # CONTROLS.md. Never shown to a model; reported apart and must score 0.
 NEGATIVE_CONTROLS = frozenset({"bk-04", "bk-09"})
@@ -82,6 +93,14 @@ def frozen_tree_problems(commit: str = FREEZE_COMMIT) -> list[str]:
                      *[f":(exclude){n}" for n in UNFROZEN]).split()
     problems += [f"untracked in the exam: {p}" for p in untracked]
     return problems
+
+
+def verifier_commit() -> tuple[str, bool]:
+    """(HEAD sha, whether the runner source differs from it). The verifier
+    that scores a run is the runner at this commit."""
+    head = _git("rev-parse", "HEAD").strip()
+    dirty = bool(_git("status", "--porcelain", "--", str(RUNNER_SRC)).strip())
+    return head, dirty
 
 
 def tree_hash(commit: str = FREEZE_COMMIT) -> str:
@@ -259,6 +278,17 @@ class VramSampler:
                 "samples": len(self.samples)}
 
 
+# ---- PROTOCOL.md amendment A1: inline reasoning --------------------------
+
+_THINK = re.compile(r"<think>.*?</think>", re.S)
+
+
+def strip_inline_think(content: str) -> tuple[str, bool]:
+    """Remove every complete `<think>...</think>` block. An unclosed tag stays."""
+    stripped, count = _THINK.subn("", content)
+    return stripped, count > 0
+
+
 # ---- verifying one reply ------------------------------------------------
 
 
@@ -361,6 +391,10 @@ def summarize(arm: str, model: str, records: list[dict[str, Any]], runs: int) ->
         "label": LABEL, "arm": arm, "model": model, "runs_per_card": runs,
         "card_runs": len(exam),
         "pass_at_1": sum(r["passed"] for r in exam) / len(exam) if exam else None,
+        # PROTOCOL.md A1 sensitivity: the same runs scored on the raw reply.
+        "pass_at_1_raw": sum(r.get("raw_passed", r["passed"]) for r in exam) / len(exam)
+        if exam else None,
+        "inline_think_runs": sum(bool(r.get("inline_think")) for r in records),
         "pass_pow_3": (sum(all(v) and len(v) == runs for v in by_card.values()) / len(by_card)
                        if by_card else None),
         "parse_failures": sum(not r["parsed"] for r in exam),
@@ -379,6 +413,8 @@ def run_arm(*, arm: str, client: ModelClient, runs: int, out_dir: Path,
             verify=None, cards: list[Card] | None = None,  # noqa: ANN001
             vram: VramSampler | None = None, probe: bool = True) -> dict[str, Any]:
     cards = cards if cards is not None else load_cards()
+    head, dirty = verifier_commit()
+    labels = {"exam_freeze": FREEZE_COMMIT, "verifier_commit": head, "verifier_dirty": dirty}
     system = SYSTEM_PROMPT.read_text(encoding="utf-8")
     out_dir.mkdir(parents=True, exist_ok=True)
     vram = vram or VramSampler()
@@ -400,10 +436,18 @@ def run_arm(*, arm: str, client: ModelClient, runs: int, out_dir: Path,
                               "thinking_chars": reply.thinking_chars,
                               "model_error": reply.error,
                               "reply_sha256": hashlib.sha256(reply.content.encode()).hexdigest()}
-                    record.update(score_reply(card, reply.content, verify=verify))
+                    stripped, inline_think = strip_inline_think(reply.content)
+                    record.update(labels, inline_think=inline_think)
+                    record.update(score_reply(card, stripped, verify=verify))  # A1: primary
+                    # A1 sensitivity: the raw reply, scored only when it differs.
+                    record["raw_passed"] = (score_reply(card, reply.content, verify=verify)["passed"]
+                                            if inline_think else record["passed"])
                     (out_dir / "replies").mkdir(exist_ok=True)
                     (out_dir / "replies" / f"{card.card_id}-r{run}.txt").write_text(
                         reply.content, encoding="utf-8")
+                    if inline_think:
+                        (out_dir / "replies" / f"{card.card_id}-r{run}.stripped.txt").write_text(
+                            stripped, encoding="utf-8")
                     sink.write(json.dumps(record) + "\n")
                     sink.flush()
                     records.append(record)
@@ -412,7 +456,7 @@ def run_arm(*, arm: str, client: ModelClient, runs: int, out_dir: Path,
         vram_stats = vram.stop()
         client.unload()
     summary = summarize(arm, client.name, records, runs)
-    summary.update(load=load, vram={"baseline_mib": baseline, **vram_stats},
+    summary.update(labels, load=load, vram={"baseline_mib": baseline, **vram_stats},
                    refusal_probes=probes)
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     (out_dir / "summary.md").write_text(render_md(summary), encoding="utf-8")
@@ -423,10 +467,14 @@ def render_md(s: dict[str, Any]) -> str:
     def pct(x: float | None) -> str:
         return "n/a" if x is None else f"{x:.0%}"
     lines = [f"# Bake-off arm {s['arm']}: {s['model']}", "", f"_{s['label']}_", "",
-             f"- Tree: {s.get('tree_hash', 'n/a')} (freeze {FREEZE_COMMIT})",
+             f"- Exam freeze: {s.get('exam_freeze')} (tree {s.get('tree_hash', 'n/a')})",
+             f"- Verifier: {s.get('verifier_commit')}"
+             f"{' (DIRTY runner source)' if s.get('verifier_dirty') else ''}",
              f"- **Valid:** {'yes' if s['arm_valid'] else 'NO, a negative control passed'}",
              f"- pass@1: {pct(s['pass_at_1'])} over {s['card_runs']} card-runs; "
              f"pass^3: {pct(s['pass_pow_3'])}",
+             f"- Sensitivity (A1, raw reply incl. inline <think>): pass@1 "
+             f"{pct(s['pass_at_1_raw'])}; runs with inline think: {s['inline_think_runs']}",
              f"- Parse failures: {s['parse_failures']}; AC failures: {s['ac_failures']}; "
              f"model errors: {s['model_errors']}; touched tests: {s['touched_tests_runs']}",
              f"- Controls: {s['controls']['passes']}/{s['controls']['runs']} passed (must be 0)",
@@ -445,7 +493,10 @@ def render_md(s: dict[str, Any]) -> str:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--arm", required=True)
-    ap.add_argument("--model", required=True, help="Ollama model tag")
+    ap.add_argument("--model", default=None,
+                    help="Ollama tag; defaults to the arm's pinned tag (ARMS)")
+    ap.add_argument("--allow-off-tag", action="store_true",
+                    help="run a model other than the arm's pinned tag (labeled as such)")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--host", default="http://127.0.0.1:11434")
     ap.add_argument("--num-ctx", type=int, default=32768)
@@ -456,6 +507,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args(argv)
 
+    pinned = ARMS.get(args.arm)
+    if args.model is None:
+        if pinned is None:
+            ap.error(f"arm {args.arm!r} has no pinned tag; pass --model")
+        args.model = pinned
+    elif pinned is not None and args.model != pinned and not args.allow_off_tag:
+        print(f"refusing: arm {args.arm} is pinned to {pinned!r}, not {args.model!r}")
+        return 2
+    if verifier_commit()[1]:
+        print("refusing: the runner source differs from HEAD, so the verifier commit "
+              "would not label what scored the run")
+        return 2
     problems = frozen_tree_problems()
     if problems:
         print("refusing: the exam is not the frozen one:\n  " + "\n  ".join(problems))

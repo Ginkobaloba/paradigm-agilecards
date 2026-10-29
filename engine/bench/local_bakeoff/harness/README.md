@@ -1,7 +1,8 @@
 # Bake-off harness
 
 Scores one model ("arm") against the frozen exam in `..` (freeze commit
-`8447e14`), under `../PROTOCOL.md`. Every result is labeled: "text-mode,
+`f814f9c`: the original freeze `8447e14` plus pre-data amendment A1), under
+`../PROTOCOL.md`. Every result is labeled: "text-mode,
 harness-applied: measures the model's coding output, not the runner
 pipeline."
 
@@ -24,8 +25,22 @@ call through `PATH`):
 
 ```
 $py = 'C:\dev\paradigm-agilecards\engine\runner\.venv\Scripts\python.exe'
-& $py run_bakeoff.py --arm A --model <ollama tag> --lease-gb <GB>
+& $py run_bakeoff.py --arm A --lease-gb <GB>
 ```
+
+Each arm is pinned to one tag (`ARMS` in `run_bakeoff.py`), and another tag
+is refused without `--allow-off-tag`:
+
+| Arm | Tag |
+|---|---|
+| A | `qwen3:30b` |
+| B | `hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL` (same quant family as E, so B vs E isolates the abliteration) |
+| C | `hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ4_NL_XL` (19.5 GB, chosen to stay fully in VRAM) |
+| D | `gpt-oss:120b` |
+| E | `hf.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF:UD-Q4_K_XL` |
+
+The script also refuses to run when the runner source differs from HEAD,
+because then the verifier commit would not label what scored the run.
 
 - `--lease-gb` re-runs the script under
   `C:\dev\paradigm-ops\tools\gpu\with_lease.py`, so the GPU lease lives
@@ -57,6 +72,11 @@ invalid; 2 means the exam is not the frozen one.
 - `refused_heuristic` is a keyword match: read the replies themselves.
 - Only `message.content` is scored. Reasoning in Ollama's separate
   `thinking` field is counted (`thinking_chars`) but never parsed.
+- PROTOCOL.md A1: complete `<think>...</think>` blocks are stripped before
+  parsing. That is the primary score. `pass_at_1_raw` scores the same runs
+  on the raw reply, as a sensitivity line, and `inline_think` marks the
+  runs where the two can differ.
+- Every row and summary carries `exam_freeze` and `verifier_commit`.
 
 ## Tests
 
