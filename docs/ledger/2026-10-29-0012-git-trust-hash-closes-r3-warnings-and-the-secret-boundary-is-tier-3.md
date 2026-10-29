@@ -1,0 +1,11 @@
+# 2026-10-29 00:12 CDT - git trust hash closes the #85 r3 warnings, and the secret boundary is tier-3
+- **Who:** PromptBuilder seat (Claude Opus 5.5), the follow-up Daedalus asked for after #85's r3 Deep Verify (PASS WITH WARNINGS, no blocker). Stacked on #85.
+- **Change:**
+  - W1: `branch.<name>.remote` is exempt from the trust hash only when its value is the NAME of a remote configured in the same file. A URL or path there is honoured by any remote-less push, fetch or pull, so it is now hashed.
+  - W2: a bare key (`[http] sslVerify`, meaning true) and an empty value (`sslVerify =`, meaning false) hash differently.
+  - Include targets: config is listed with `--includes`, so editing an unconditional `include.path` target changes the hash (the r3 mutant M15). `includeIf` targets still are not hashed, because their conditions need a repository.
+  - Tests for the r3 survivors: an in-place value edit (M06), the raw-bytes fallback for a config git cannot parse (M03, M07), and no credential or exec key carried into the tool profile (M11).
+  - `verify/tier3_paths.txt` and `.github/AUTO_MERGE.md` now list the secret and execution boundary: git_safety, env_scrub, process_group, spawner, pr_lifecycle, worktree, diff_stats, sdk_invoker and tools.
+- **Why:** #85 was verified as tier-3, but CI classified it `tier3=false (source: none)`. None of its files were on the tier-3 list, and the repo has no `tier-3` label, so the deep-verify gate never ran and future edits to that boundary would merge on ordinary CI. The hash items are the r3 verifier's warnings and surviving mutants.
+- **State after:** runner suite 877/0, ruff clean, ledger check clean. Each new test has a positive control (git honours the plant), and 7 targeted mutants (W1, W2, M03, M06, M07, M11, M15) all turn red. Every new tier-3 pattern matches exactly one tracked file. W3 (one `git config` spawn per config file per call, about 1s with 20 worktrees) is noted and deferred.
+- **Refs:** engine/runner/src/cards_runner/common/git_safety.py `config_entries`, `_is_daemon_written`, `_remote_names`, `fingerprint`; engine/runner/tests/test_secret_isolation.py; verify/tier3_paths.txt; .github/AUTO_MERGE.md; verify/reports/DEEP_2026-10-28_pr85-secret-isolation.md

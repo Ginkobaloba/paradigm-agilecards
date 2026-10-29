@@ -629,13 +629,22 @@ def test_the_hashed_entries_are_exactly_what_git_reads(payload: bytes, tmp_path:
     # only the daemon-written branch.<name>.remote/merge keys.
     work = _repo_with_remote(tmp_path)
     _plant_raw(work / ".git" / "config", payload)
-    proc = subprocess.run([GIT, "config", "--local", "--null", "--list"], cwd=work,
+    proc = subprocess.run([GIT, "config", "--local", "--includes", "--null", "--list"], cwd=work,
                           capture_output=True)
-    git_sees = [tuple(r.decode().partition("\n")[::2]) for r in proc.stdout.split(b"\0") if r]
+    git_sees = []
+    for r in proc.stdout.split(b"\0"):
+        if r:
+            key, sep, value = r.decode().partition("\n")
+            git_sees.append((key, value if sep else None))
     hashed = git_safety.config_entries(work / ".git" / "config")
     assert hashed is not None
-    expected = [e for e in git_sees if not git_safety._is_daemon_written(e[0])]
-    assert [e for e in hashed if not git_safety._is_daemon_written(e[0])] == expected
+    remotes = git_safety._remote_names(git_sees)
+
+    def kept(entries: list) -> list:
+        return [e for e in entries if not git_safety._is_daemon_written(e[0], e[1], remotes)]
+
+    expected = kept(git_sees)
+    assert kept(hashed) == expected
     if b"pushRemote" in payload:  # only remote/merge are exempt, never pushRemote
         assert ("branch.x.pushremote", "evil") in expected
 
@@ -712,3 +721,105 @@ def test_the_tool_shell_does_not_read_the_system_git_config(
     out = subprocess.run([GIT, "config", "--list", "--show-scope"], cwd=worktree,
                          capture_output=True, text=True, env=probe)
     assert "leak-0042" not in out.stdout and "system\t" not in out.stdout
+
+
+# ---- follow-up to #85 r3: W1, W2, M03/M06/M07/M11 gaps, include targets (M15)
+
+
+@needs_git
+def test_a_branch_remote_that_is_a_path_is_hashed(tmp_path: Path) -> None:
+    # W1: `branch.<x>.remote` is exempt only when it NAMES a configured remote.
+    work = _repo_with_remote(tmp_path)
+    git_safety.trust_repo(_common(work))
+    _git(work, "config", "branch.card/x.remote", "origin")  # what push -u writes
+    git_safety.assert_trusted(work)  # control: a remote NAME stays exempt
+    evil = tmp_path / "evil-w1.git"
+    _git(tmp_path, "init", "--bare", str(evil))
+    _git(work, "config", "branch.card/x.remote", evil.as_posix())
+    # Positive control: a remote-less push honours the path.
+    pushed = subprocess.run([GIT, "-c", "push.default=current", "push"], cwd=work,
+                            capture_output=True, text=True)
+    assert pushed.returncode == 0 and "card/x" in _git(evil, "branch", "--list")
+    with pytest.raises(git_safety.RepoQuarantined):
+        git_safety.assert_trusted(work)
+
+
+@needs_git
+def test_a_bare_key_and_an_empty_value_hash_differently(tmp_path: Path) -> None:
+    # W2: `[http] sslVerify` is true; `sslVerify =` is false.
+    work = _repo_with_remote(tmp_path)
+    cfg = work / ".git" / "config"
+    original = cfg.read_bytes()
+    _plant_raw(cfg, b"[http]\n\tsslVerify\n")
+    bare = git_safety.fingerprint(_common(work))
+    cfg.write_bytes(original + b"[http]\n\tsslVerify =\n")
+    empty = git_safety.fingerprint(_common(work))
+    # Positive control: git reads them as different booleans.
+    assert _git(work, "config", "--type=bool", "--get", "http.sslVerify").strip() == "false"
+    assert bare != empty
+
+
+@needs_git
+def test_editing_a_value_in_place_quarantines(tmp_path: Path) -> None:
+    # M06: a value edit with no new key must change the hash.
+    work = _repo_with_remote(tmp_path)
+    _git(work, "config", "core.sshCommand", "ssh -o BatchMode=yes")
+    git_safety.trust_repo(_common(work))
+    _git(work, "config", "core.sshCommand", "sh evil-m06")
+    with pytest.raises(git_safety.RepoQuarantined):
+        git_safety.assert_trusted(work)
+
+
+@needs_git
+def test_an_unparsable_config_is_hashed_as_bytes(tmp_path: Path) -> None:
+    # M03/M07: if git cannot parse the file, every byte edit still counts.
+    work = _repo_with_remote(tmp_path)
+    cfg = work / ".git" / "config"
+    cfg.write_bytes(cfg.read_bytes() + b"[broken\n\tsshCommand = a\n")
+    assert git_safety.config_entries(cfg) is None  # control: git really refuses it
+    git_safety.trust_repo(_common(work))
+    cfg.write_bytes(cfg.read_bytes().replace(b"sshCommand = a", b"sshCommand = b"))
+    with pytest.raises(git_safety.RepoQuarantined):
+        git_safety.assert_trusted(work)
+
+
+@needs_git
+def test_editing_an_include_target_quarantines(tmp_path: Path) -> None:
+    # Closes the declared include-target residual (r3 M15).
+    work = _repo_with_remote(tmp_path)
+    target = tmp_path / "shared.gitconfig"
+    target.write_text("[core]\n\tnote = team\n")
+    _git(work, "config", "include.path", target.as_posix())
+    git_safety.trust_repo(_common(work))
+    git_safety.assert_trusted(work)  # control: an unchanged target stays trusted
+    target.write_text("[core]\n\tnote = team\n\tsshCommand = evil-inc\n")
+    assert _git(work, "config", "--get", "core.sshCommand").strip() == "evil-inc"  # git honours it
+    with pytest.raises(git_safety.RepoQuarantined):
+        git_safety.assert_trusted(work)
+
+
+@needs_git
+def test_no_credential_or_exec_key_is_carried_into_the_tool_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # M11: only the listed, non-executable settings cross into the throwaway config.
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    real_cfg = real_home / ".gitconfig"
+    for key, value in (("user.name", "Owner"), ("user.email", "owner@example.test"),
+                       ("core.autocrlf", "true"), ("credential.helper", "!echo password=leak"),
+                       ("core.sshCommand", "evil"), ("core.hooksPath", "C:/evil"),
+                       ("core.fsmonitor", "evil"), ("url.C:/evil.insteadOf", "https://x.invalid/")):
+        _git(tmp_path, "config", "--file", str(real_cfg), key, value)
+    for var in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(var, str(real_home))
+    for var in ("GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME", "HOMEDRIVE", "HOMEPATH"):
+        monkeypatch.delenv(var, raising=False)
+    worktree = tmp_path / "run" / "worktree"
+    worktree.mkdir(parents=True)
+    SdkInvoker(api_key=FAKE_KEY)._build_tool_belt(SimpleNamespace(worktree=str(worktree)))  # type: ignore[arg-type]
+    carried = _git(tmp_path, "config", "--file", str(tmp_path / "run" / "tool-home" / ".gitconfig"),
+                   "--list", "--name-only").split()
+    assert "user.email" in carried and "core.autocrlf" in carried  # control: carrying works
+    assert not [k for k in carried if k.split(".")[0] in {"credential", "url"}
+                or k in {"core.sshcommand", "core.hookspath", "core.fsmonitor"}]
