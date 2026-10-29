@@ -27,6 +27,7 @@ from typing import Any
 from ..common.canonical_config import ENV_TIER_MAP_PATH, CanonicalConfigMissing, load_tier_map
 from ..common.envfile import ENV_FILE_VAR, load_dotenv
 from ..common.locks import FileLock, pid_alive
+from ..common import git_safety
 from ..common.types import DaemonConfig, RuntimePaths
 from ..daemon import llm_capability
 from ..daemon.daemon import Daemon, DaemonAlreadyRunning
@@ -187,6 +188,14 @@ def main(argv: list[str] | None = None) -> int:
         help="skip the interactive confirmation",
     )
 
+    p_trust = sub.add_parser(
+        "trust-repo",
+        help="record a repository's current git config and hooks as trusted "
+        "(also lifts a quarantine); inspect .git/config and .git/hooks first",
+    )
+    _add_common(p_trust)
+    p_trust.add_argument("project_dir", type=Path)
+
     p_doctor = sub.add_parser(
         "doctor",
         help="diagnostic dump: resolved binaries, project config, "
@@ -302,6 +311,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_status(args)
     if args.cmd == "reclaim":
         return _cmd_reclaim(args)
+    if args.cmd == "trust-repo":
+        return _cmd_trust_repo(args)
     if args.cmd == "doctor":
         return _cmd_doctor(args)
     if args.cmd == "stats":
@@ -615,6 +626,25 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
     finally:
         repo.close()
     print(f"reclaimed: {record.card_id} (status={record.status})")
+    return 0
+
+
+def _cmd_trust_repo(args: argparse.Namespace) -> int:
+    """`cards-runner trust-repo <project>`: (re)record the git baseline.
+
+    The baseline is only as good as the repo is right now, which is why
+    this is a human step: look at .git/config and .git/hooks first.
+    """
+    git_safety.configure(git_safety.state_dir_for(args.todo_root))
+    common = git_safety.common_dir_of(args.project_dir.resolve())
+    if common is None:
+        print(f"error: {args.project_dir} is not a git checkout", file=sys.stderr)
+        return 3
+    previous = git_safety.trust_record(common)
+    value = git_safety.trust_repo(common)
+    if previous is not None and previous.quarantined:
+        print(f"quarantine lifted: {common} (was: {previous.reason})")
+    print(f"trusted: {common} baseline={value[:12]}")
     return 0
 
 

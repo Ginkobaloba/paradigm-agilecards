@@ -40,7 +40,8 @@ from pathlib import Path
 from types import FrameType
 from typing import Any, Optional
 
-from ..common.git_safety import git_exec_surface
+from ..common import git_safety
+from ..common.git_safety import RepoQuarantined, UntrustedRepo
 from ..common.locks import FileLock, LockHeldError, pid_alive
 from ..common.logging_setup import setup_daemon_logging
 from ..common.process_group import ManagedProcess
@@ -129,9 +130,6 @@ class _WorkerHandle:
     claim: ClaimedCard
     process: ManagedProcess
     spawned_at: float
-    # Fingerprint of the repo's git config + hooks at claim (git_safety).
-    # None when the worktree is not a git checkout (skip_worktree).
-    git_surface: str | None = None
 
 
 class Daemon:
@@ -159,6 +157,9 @@ class Daemon:
         self.cfg = cfg
         self.paths = RuntimePaths.from_root(cfg.todo_root)
         self.paths.ensure()
+        # The trusted git baselines and the empty config files every daemon
+        # git call points at (git_safety). Daemon-side, outside any worktree.
+        git_safety.configure(git_safety.state_dir_for(self.paths.todo_root))
         self.tenant_id = DEFAULT_TENANT
         self._workers: dict[str, _WorkerHandle] = {}
         self._stop_event = threading.Event()
@@ -714,6 +715,11 @@ class Daemon:
                 worktree_path=claim.worktree_path,
                 skip_git=self.cfg.skip_worktree,
             )
+        except (RepoQuarantined, UntrustedRepo) as exc:
+            # Not a rollback: re-claiming would hit the same refusal every
+            # poll. A human re-trusts the repo (`cards-runner trust-repo`).
+            self._route_untrusted_repo_to_blocked(claim, str(exc))
+            return False
         except WorktreeCreateError as exc:
             log.error(
                 "worktree prep failed for %s: %s; rolling back",
@@ -732,13 +738,6 @@ class Daemon:
             self._rollback_to_backlog(claim)
             return False
 
-        # Before the executor can touch anything: what git could be made
-        # to run in this repo. Compared at worker exit (_git_surface_changed).
-        git_surface = (
-            None if self.cfg.skip_worktree
-            else git_exec_surface(claim.worktree_path, git_path=self.cfg.git_path)
-        )
-
         try:
             process = spawn_worker(
                 cfg=self.cfg,
@@ -754,7 +753,6 @@ class Daemon:
             claim=claim,
             process=process,
             spawned_at=time.monotonic(),
-            git_surface=git_surface,
         )
         return True
 
@@ -925,10 +923,11 @@ class Daemon:
         self._emit_escalated_events(claim, fields.get("cascade_history"))
         self._record_executor_metrics(claim, fields, sidecar)
 
-        if self._git_surface_changed(handle):
+        untrusted = self._repo_untrusted_after_run(claim)
+        if untrusted is not None:
             # Before ANY routing: the verifier, the merge gate and the
             # shadow ledger would all run git in this repo next.
-            self._route_tamper_to_blocked(claim)
+            self._route_untrusted_repo_to_blocked(claim, untrusted)
         elif rc in (EXIT_COST_CAP_HALT, EXIT_HALT_SIGNAL):
             self._route_halt_to_blocked(claim, rc, sidecar)
         elif rc != 0:
@@ -1405,22 +1404,33 @@ class Daemon:
         # up-front contract did not survive unchanged.
         self._record_contract_outcome(claim.card_id, survived=False)
 
-    def _git_surface_changed(self, handle: _WorkerHandle) -> bool:
-        if handle.git_surface is None:
-            return False
-        now = git_exec_surface(handle.claim.worktree_path, git_path=self.cfg.git_path)
-        return now != handle.git_surface
+    def _repo_untrusted_after_run(self, claim: ClaimedCard) -> str | None:
+        """Why the card's repo can no longer be trusted, or None.
 
-    def _route_tamper_to_blocked(self, claim: ClaimedCard) -> None:
-        """Block a card whose run changed the repo's git config or hooks.
+        Checks the worktree's repo against the baseline the daemon recorded
+        when it first saw the project (never re-taken at claim, so a
+        change left by an earlier card is not absorbed). A mismatch also
+        quarantines the repo for every later card (git_safety).
+        """
+        if self.cfg.skip_worktree:
+            return None
+        try:
+            git_safety.assert_trusted(claim.worktree_path)
+        except (RepoQuarantined, UntrustedRepo) as exc:
+            return str(exc)
+        return None
+
+    def _route_untrusted_repo_to_blocked(self, claim: ClaimedCard, detail: str) -> None:
+        """Block a card whose repo's git config or hooks are not trusted.
 
         Git runs programs named there, so the daemon does not run git in
         this repo again for the card, and a human has to look: the change
         may also be waiting for the owner's next manual git command.
         """
         reason = (
-            "executor run changed the repository's git config or hooks; "
-            "not verifying or merging. Inspect .git/config and .git/hooks"
+            "repository git config or hooks changed since it was trusted; "
+            "not running git there. Inspect .git/config and .git/hooks, then "
+            f"`cards-runner trust-repo`. ({detail})"
         )
         log.error("routing card_id=%s to blocked: %s", claim.card_id, reason)
         try:
@@ -1431,10 +1441,10 @@ class Daemon:
                 actor_id=claim.attempt_trace_id,
                 actor_type=ActorType.EXECUTOR.value,
                 event_type=EventType.BLOCKED.value,
-                payload={"reason": reason, "error": "git_surface_changed"},
+                payload={"reason": reason, "error": "repo_untrusted"},
             )
         except Exception as exc:  # noqa: BLE001
-            log.error("failed to block tampered card %s: %s", claim.card_id, exc)
+            log.error("failed to block card %s on an untrusted repo: %s", claim.card_id, exc)
 
     def _route_halt_to_blocked(
         self, claim: ClaimedCard, rc: int, sidecar: dict[str, Any]

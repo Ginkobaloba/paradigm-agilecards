@@ -32,6 +32,14 @@ from cards_runner.worker_stub.sdk_invoker import SdkInvoker
 from cards_runner.worker_stub.tools import ToolBelt, ToolError, _git_config_is_read_only
 
 FAKE_KEY = "sk-ant-test-isolation-marker-0042"
+
+
+@pytest.fixture(autouse=True)
+def _git_state(tmp_path: Path) -> Path:
+    """Each test gets its own trust store and empty config files."""
+    state = tmp_path / "git-state"
+    git_safety.configure(state)
+    return state
 GIT = shutil.which("git")
 needs_git = pytest.mark.skipif(GIT is None, reason="git not on PATH")
 
@@ -182,11 +190,19 @@ def test_hardened_git_env_drops_keys_and_pins_the_exec_config() -> None:
     assert "GH_TOKEN" not in no_gh
 
 
-def test_a_planted_file_in_the_empty_hooks_dir_gets_a_new_dir() -> None:
+def test_a_planted_file_in_the_empty_hooks_dir_is_removed_before_use() -> None:
     first = git_safety.empty_hooks_dir()
     (first / "pre-push").write_text("#!/bin/sh\nexit 0\n")
-    second = git_safety.empty_hooks_dir()
-    assert second != first and not any(second.iterdir())
+    assert not any(git_safety.empty_hooks_dir().iterdir())
+
+
+def test_the_empty_config_files_are_re_emptied_before_every_use() -> None:
+    env = git_safety.hardened_git_env({"PATH": "x"})
+    for key in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+        Path(env[key]).write_text("[core]\n\tsshCommand = evil\n")
+    env = git_safety.hardened_git_env({"PATH": "x"})
+    for key in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+        assert Path(env[key]).stat().st_size == 0
 
 
 # ---- (f) a planted hook does not fire on the daemon's git push --------------
@@ -236,6 +252,10 @@ def test_a_planted_pre_push_hook_does_not_fire_on_the_daemon_push(via: str, tmp_
     assert marker.exists(), "control: the planted hook should fire on a plain push"
     marker.unlink()
 
+    # Trusted WITH the plant in place (a repo first seen already rigged):
+    # this isolates the env overrides from the baseline check.
+    git_safety.trust_repo(git_safety.common_dir_of(work))
+
     result = SubprocessGhRunner(git_path=GIT).push(work, "card/x", set_upstream=False)
     assert result.ok, result
     assert not marker.exists(), "the daemon's push ran a planted hook"
@@ -258,6 +278,7 @@ def test_diff_stats_does_not_run_a_planted_textconv(tmp_path: Path, monkeypatch:
     _git(work, "diff", "main...card/x")
     assert marker.exists(), "control: textconv should run on a plain patch diff"
     marker.unlink()
+    git_safety.trust_repo(git_safety.common_dir_of(work))  # isolate the flags + env
 
     stats = DiffStats.from_worktree(work, branch="card/x", base_branch="main", git_path=GIT)
     assert not marker.exists(), "diff_stats ran a planted textconv driver"
@@ -281,21 +302,146 @@ def test_diff_stats_passes_the_flags_and_a_keyless_env(tmp_path: Path, monkeypat
     assert isinstance(seen["env"], dict) and FAKE_KEY not in seen["env"].values()
 
 
-# ---- the exec-surface fingerprint ------------------------------------------
+# ---- the persisted trust baseline (F1, F2, F3, F7) -------------------------
+
+def _common(work: Path) -> Path:
+    common = git_safety.common_dir_of(work)
+    assert common is not None
+    return common
+
 
 @needs_git
 def test_the_fingerprint_changes_on_a_config_or_hook_plant_and_only_then(tmp_path: Path) -> None:
     work = _repo_with_remote(tmp_path)
-    before = git_safety.git_exec_surface(work, git_path=GIT)
-    assert before is not None
+    before = git_safety.fingerprint(_common(work))
     (work / "a.txt").write_text("ordinary edit\n")  # tracked-file work is not a change
-    assert git_safety.git_exec_surface(work, git_path=GIT) == before
+    assert git_safety.fingerprint(_common(work)) == before
     _git(work, "config", "core.fsmonitor", "sh -c 'echo x'")
-    after_config = git_safety.git_exec_surface(work, git_path=GIT)
+    after_config = git_safety.fingerprint(_common(work))
     assert after_config != before
     _plant_hook(work / ".git" / "hooks", tmp_path / "m.txt")
-    assert git_safety.git_exec_surface(work, git_path=GIT) != after_config
+    assert git_safety.fingerprint(_common(work)) != after_config
 
 
-def test_the_fingerprint_is_none_outside_a_git_checkout(tmp_path: Path) -> None:
-    assert git_safety.git_exec_surface(tmp_path) is None
+def test_no_common_dir_outside_a_git_checkout(tmp_path: Path) -> None:
+    assert git_safety.common_dir_of(tmp_path) is None
+    assert git_safety.assert_trusted(tmp_path) is None
+
+
+@needs_git
+def test_the_daemons_own_push_u_does_not_trip_the_baseline(tmp_path: Path) -> None:
+    # F7: `push -u` writes a [branch] section; that must not quarantine.
+    work = _repo_with_remote(tmp_path)
+    git_safety.trust_repo(_common(work))
+    assert SubprocessGhRunner(git_path=GIT).push(work, "card/x", set_upstream=True).ok
+    assert "[branch \"card/x\"]" in (work / ".git" / "config").read_text()  # it did write one
+    git_safety.assert_trusted(work)  # and the repo is still trusted
+
+
+@needs_git
+def test_a_plant_quarantines_the_repo_and_it_stays_quarantined_until_re_trusted(tmp_path: Path) -> None:
+    work = _repo_with_remote(tmp_path)
+    git_safety.trust_repo(_common(work))
+    _git(work, "config", "core.fsmonitor", "sh -c 'echo x'")
+    result = SubprocessGhRunner(git_path=GIT).push(work, "card/x")
+    assert not result.ok and "quarantined" in result.reason
+    assert "card/x" not in _git(tmp_path / "remote.git", "branch", "--list", "card/x")
+
+    # F3: reverting does not lift it, and nothing re-baselines silently.
+    _git(work, "config", "--unset", "core.fsmonitor")
+    with pytest.raises(git_safety.RepoQuarantined):
+        git_safety.assert_trusted(work, first_sight_ok=True)
+    git_safety.trust_repo(_common(work))  # the human step
+    git_safety.assert_trusted(work)
+
+
+@needs_git
+def test_a_worktree_repointed_at_another_repo_is_refused(tmp_path: Path) -> None:
+    work = _repo_with_remote(tmp_path)
+    git_safety.trust_repo(_common(work))
+    wt = tmp_path / "wt"
+    _git(work, "worktree", "add", str(wt), "-b", "card/y")
+    git_safety.assert_trusted(wt)  # control: the real worktree resolves to the trusted repo
+    evil = tmp_path / "evil"
+    _git(tmp_path, "init", str(evil))
+    (wt / ".git").unlink()  # git marks it hidden; Windows refuses to overwrite that
+    (wt / ".git").write_text(f"gitdir: {(evil / '.git').as_posix()}\n")
+    with pytest.raises(git_safety.UntrustedRepo):
+        git_safety.assert_trusted(wt)
+
+
+@needs_git
+@pytest.mark.parametrize("planted_after_trust", [False, True])
+def test_worktree_prep_runs_no_planted_hook(planted_after_trust: bool, tmp_path: Path) -> None:
+    # F1: the next card's `git worktree add` runs in the shared .git.
+    from cards_runner.common.types import RuntimePaths
+    from cards_runner.daemon.worktree import prepare_worktree
+
+    work = _repo_with_remote(tmp_path)
+    marker = tmp_path / "post-checkout-fired.txt"
+    hooks = work / ".git" / "hooks"
+    hooks.mkdir(parents=True, exist_ok=True)
+    hook = hooks / "post-checkout"
+    hook.write_text(f"#!/bin/sh\necho fired > '{marker.as_posix()}'\n", newline="\n")
+    hook.chmod(0o755)
+    _git(work, "worktree", "add", str(tmp_path / "control-wt"), "-b", "control")
+    assert marker.exists(), "control: post-checkout should fire on a plain worktree add"
+    marker.unlink()
+
+    if planted_after_trust:
+        hook.rename(hooks / "post-checkout.off")
+        git_safety.trust_repo(_common(work))
+        (hooks / "post-checkout.off").rename(hook)
+    else:
+        git_safety.trust_repo(_common(work))  # rigged at first sight: overrides alone
+
+    paths = RuntimePaths.from_root(tmp_path / "todo")
+    paths.ensure()
+    kwargs = dict(paths=paths, project_dir=work, branch_name="card/z",
+                  base_branch="main", worktree_path=tmp_path / "card-wt")
+    if planted_after_trust:
+        with pytest.raises(git_safety.RepoQuarantined):
+            prepare_worktree(**kwargs)
+    else:
+        prepare_worktree(**kwargs)
+    assert not marker.exists(), "worktree prep ran a planted hook"
+
+
+@needs_git
+def test_a_global_gitconfig_write_does_not_reach_the_daemon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # F2: the tool shell can write ~/.gitconfig; the daemon never reads it.
+    work = _repo_with_remote(tmp_path)
+    evil = tmp_path / "evil.git"
+    _git(tmp_path, "init", "--bare", str(evil))
+    real_url = _git(work, "remote", "get-url", "origin").strip()
+    home = tmp_path / "home"
+    home.mkdir()
+    _git(tmp_path, "config", "--file", str(home / ".gitconfig"),
+         f"url.{evil.as_posix()}.insteadOf", real_url)
+    for var in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(var, str(home))
+    monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
+
+    _git(work, "push", "origin", "card/x:control-branch")
+    assert "control-branch" in _git(evil, "branch", "--list"), "control: insteadOf should redirect"
+
+    git_safety.trust_repo(_common(work))
+    assert SubprocessGhRunner(git_path=GIT).push(work, "card/x", set_upstream=False).ok
+    assert "card/x" in _git(tmp_path / "remote.git", "branch", "--list", "card/x")
+    assert "card/x" not in _git(evil, "branch", "--list", "card/x")
+
+
+@needs_git
+def test_trust_repo_cli_lifts_a_quarantine(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from cards_runner.cli.__main__ import main
+
+    work = _repo_with_remote(tmp_path)
+    todo = tmp_path / "todo"
+    git_safety.configure(git_safety.state_dir_for(todo))
+    git_safety.trust_repo(_common(work))
+    _git(work, "config", "core.sshCommand", "evil")
+    with pytest.raises(git_safety.RepoQuarantined):
+        git_safety.assert_trusted(work)
+    assert main(["trust-repo", "--todo-root", str(todo), str(work)]) == 0
+    assert "quarantine lifted" in capsys.readouterr().out
+    git_safety.assert_trusted(work)

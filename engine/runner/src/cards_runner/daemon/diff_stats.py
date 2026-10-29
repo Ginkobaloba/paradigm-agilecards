@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from ..common.git_safety import hardened_git_env
+from ..common.git_safety import RepoQuarantined, UntrustedRepo, run_git
 
 
 def _glob_to_regex(pattern: str) -> re.Pattern[str]:
@@ -120,20 +120,19 @@ class DiffStats:
         an unreadable diff as "no diff signal" and leans on the other
         inputs (the caller logs the failure)."""
         try:
-            result = subprocess.run(
+            result = run_git(
                 # --no-renames so a rename can't dodge a sensitive-path
                 # escalator (a renamed file shows as add+delete of real
                 # paths rather than an `old => new` entry).
                 # --no-ext-diff / --no-textconv + the hardened env: the
                 # worktree is executor-written, so its config must not get
                 # to run a diff driver or helper here (git_safety).
-                [git_path, "-C", str(worktree), "diff", "--numstat",
+                [git_path, "diff", "--numstat",
                  "--no-renames", "--no-ext-diff", "--no-textconv",
                  f"{base_branch}...{branch}"],
-                capture_output=True, text=True, timeout=30, check=False,
-                env=hardened_git_env(keep_gh_credentials=False),
+                cwd=worktree, timeout=30,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, RepoQuarantined, UntrustedRepo):
             return cls()
         if result.returncode != 0:
             return cls()

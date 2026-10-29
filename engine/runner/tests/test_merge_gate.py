@@ -15,14 +15,17 @@ the gate enabled. Covers:
 """
 from __future__ import annotations
 
+import shutil
+import subprocess
 import textwrap
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from cards_runner.common import git_safety
 from cards_runner.common.types import ClaimedCard, DaemonConfig, RuntimePaths
 from cards_runner.daemon.daemon import Daemon
 from cards_runner.daemon.merge_gate import MergeGate, decide_gate
@@ -537,14 +540,27 @@ def test_daemon_blocks_before_verifying_when_the_git_surface_changed(
     from cards_runner.daemon.daemon import _WorkerHandle
     from cards_runner.store.projection import project_card_file
 
-    cfg = _cfg_pr_on(todo_root, store_spec)
+    # A real worktree, so the daemon's trust check is the thing under test.
+    cfg = replace(_cfg_pr_on(todo_root, store_spec), skip_worktree=False)
     card_id = f"bTST-MG-tamper-{changed}"
     _insert(repo, card_id, points=2)
     attempt = f"att-tamper-{changed}"
     repo.claim_card(card_id, claimed_by="tester", attempt_trace_id=attempt)
     run_dir = paths.runs / attempt
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # A real repo + a real worktree of it, trusted the way the daemon's
+    # first worktree prep would trust it.
+    project = todo_root.parent / f"proj-{changed}"
+    git = shutil.which("git")
+    assert git is not None
+    def _g(cwd: Path, *a: str) -> None:
+        subprocess.run([git, *a], cwd=cwd, check=True, capture_output=True)
+    project.mkdir()
+    _g(project, "init", "-b", "main")
+    _g(project, "-c", "user.email=t@example.test", "-c", "user.name=t",
+       "commit", "--allow-empty", "-m", "init")
     worktree = run_dir / "worktree"
-    worktree.mkdir(parents=True, exist_ok=True)
+    _g(project, "worktree", "add", str(worktree), "-b", f"card/{changed}")
     card_file = run_dir / PROJECTED_CARD_NAME
     project_card_file(repo.get_card(card_id), card_file, verbatim=False)
     (worktree / "anything").write_text("present", encoding="utf-8")
@@ -553,19 +569,19 @@ def test_daemon_blocks_before_verifying_when_the_git_surface_changed(
         card_id=card_id, attempt_trace_id=attempt, trace_id=attempt,
         run_dir=run_dir, worktree_path=worktree, card_file=card_file,
     )
-    monkeypatch.setattr(
-        "cards_runner.daemon.daemon.git_exec_surface",
-        lambda wt, git_path="git": "after" if changed else "before",
-    )
     gh = FakeGhRunner()
     daemon = Daemon(cfg, repo=repo, gh=gh)
+    git_safety.assert_trusted(project, first_sight_ok=True)
+    if changed:  # what an executor's shell could do to the shared .git
+        hook = project / ".git" / "hooks" / "pre-push"
+        hook.write_text("#!/bin/sh\nexit 0\n", newline="\n")
     verified: list[str] = []
     real_dispatch = daemon._dispatch_verifier
     monkeypatch.setattr(
         daemon, "_dispatch_verifier",
         lambda claim, **kw: (verified.append(claim.card_id), real_dispatch(claim, **kw))[1],
     )
-    handle = _WorkerHandle(claim=claim, process=object(), spawned_at=0.0, git_surface="before")  # type: ignore[arg-type]
+    handle = _WorkerHandle(claim=claim, process=object(), spawned_at=0.0)  # type: ignore[arg-type]
     daemon._post_worker_exit(handle, EXIT_CLEAN)
 
     card = repo.get_card(card_id)
@@ -575,7 +591,7 @@ def test_daemon_blocks_before_verifying_when_the_git_surface_changed(
         assert verified == []        # the verifier never ran in the rigged repo
         assert gh.calls == []        # and neither did any git push or gh
         blocked = [e for e in repo.list_events(card_id) if e.type == "blocked"]
-        assert blocked and blocked[-1].payload.get("error") == "git_surface_changed"
+        assert blocked and blocked[-1].payload.get("error") == "repo_untrusted"
     else:
         # control: an unchanged surface routes exactly as before
         assert verified == [card_id]
