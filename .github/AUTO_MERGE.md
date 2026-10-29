@@ -61,6 +61,12 @@ dissent):
 - The merge gate and the (future) confidence gate:
   `engine/runner/src/cards_runner/daemon/merge_gate.py`,
   `engine/runner/src/cards_runner/daemon/confidence_gate.py`.
+- The secret and execution boundary: what model-run code can see and what
+  the daemon's own git/gh runs in an executor-written repo
+  (`common/git_safety.py`, `common/env_scrub.py`, `common/process_group.py`,
+  `daemon/spawner.py`, `daemon/pr_lifecycle.py`, `daemon/worktree.py`,
+  `daemon/diff_stats.py`, `worker_stub/sdk_invoker.py`,
+  `worker_stub/tools.py`, all under `engine/runner/src/cards_runner/`).
 - The verifier decision surface: `engine/runner/src/cards_runner/verifier/**`
   and `engine/lib/verifier/**`.
 - `engine/RUNNER_CONTRACT.md`, `engine/DEFINITION_OF_DONE.md`,

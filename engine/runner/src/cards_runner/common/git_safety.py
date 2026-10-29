@@ -179,29 +179,47 @@ def hardened_git_env(
 # Keys the daemon's own `git push -u` and `gh pr create` write. They are
 # excluded from the hash so the daemon does not quarantine itself; they
 # name a remote and a ref, never a program. Every OTHER branch.* key
-# (pushRemote, ...) is still hashed.
+# (pushRemote, ...) is still hashed, and so is a `remote` whose value is
+# not the NAME of a configured remote: a URL or path there is honoured by
+# any remote-less push/fetch/pull (r3 W1).
 _DAEMON_WRITTEN_BRANCH_KEYS: frozenset[str] = frozenset({"remote", "merge", "gh-merge-base"})
 
+# One config entry as git reports it. `value` is None for a bare key
+# (`[http] sslVerify`, i.e. true), which is not the same as `key =` ("").
+ConfigEntry = tuple[str, "str | None"]
 
-def _is_daemon_written(key: str) -> bool:
-    return key.startswith("branch.") and key.rsplit(".", 1)[-1] in _DAEMON_WRITTEN_BRANCH_KEYS
+
+def _is_daemon_written(key: str, value: str | None, remote_names: frozenset[str]) -> bool:
+    if not key.startswith("branch."):
+        return False
+    leaf = key.rsplit(".", 1)[-1]
+    if leaf not in _DAEMON_WRITTEN_BRANCH_KEYS:
+        return False
+    return leaf != "remote" or value in remote_names
 
 
-def config_entries(path: Path) -> list[tuple[str, str]] | None:
+def _remote_names(entries: list[ConfigEntry]) -> frozenset[str]:
+    """Remotes configured in these entries (`remote.<name>.url`)."""
+    return frozenset(key[len("remote."):-len(".url")] for key, _ in entries
+                     if key.startswith("remote.") and key.endswith(".url"))
+
+
+def config_entries(path: Path) -> list[ConfigEntry] | None:
     """`path`'s entries exactly as git parses them, or None if git can't.
 
-    Parsed BY GIT (`git config --file <path> --no-includes --null --list`),
+    Parsed BY GIT (`git config --file <path> --includes --null --list`),
     never by our own reader: any difference between the two parsers is a
     way to hide a key from the hash while git still honours it (#85 r2 N1:
-    a lone CR). `git config --file` only reads that one file; it runs no
-    hooks or helpers. Includes are not followed, but the `include.path`
-    keys themselves are entries, so adding one changes the hash.
+    a lone CR). `git config --file` reads that file and what it includes;
+    it runs no hooks or helpers. Unconditional `include.path` targets are
+    expanded, so editing one changes the hash. `includeIf` targets are not:
+    their conditions need a repository, which `--file` does not have.
     """
     env = hardened_git_env(keep_gh_credentials=False)
     env["GIT_CEILING_DIRECTORIES"] = str(_state_dir().parent)
     try:
         proc = subprocess.run(
-            [resolved("git"), "config", "--file", str(path), "--no-includes", "--null", "--list"],
+            [resolved("git"), "config", "--file", str(path), "--includes", "--null", "--list"],
             cwd=str(_state_dir()), capture_output=True, timeout=GIT_TIMEOUT_SEC,
             check=False, env=env,
         )
@@ -209,12 +227,12 @@ def config_entries(path: Path) -> list[tuple[str, str]] | None:
         return None
     if proc.returncode != 0:
         return None
-    entries: list[tuple[str, str]] = []
+    entries: list[ConfigEntry] = []
     for record in proc.stdout.decode("utf-8", errors="surrogateescape").split("\0"):
         if not record:
             continue
-        key, _, value = record.partition("\n")
-        entries.append((key, value))
+        key, sep, value = record.partition("\n")
+        entries.append((key, value if sep else None))  # no separator: a bare key
     return entries
 
 def common_dir_of(path: Path) -> Path | None:
@@ -261,7 +279,8 @@ def _config_files(common_dir: Path) -> list[Path]:
 def fingerprint(common_dir: Path) -> str:
     """Hash of what can make git run a program: config (as git parses it) + hooks.
 
-    The daemon-written branch keys are excluded (see `_is_daemon_written`).
+    The daemon-written branch keys are excluded (see `_is_daemon_written`);
+    which remotes count as configured is decided per file.
     A config file git cannot parse is hashed as raw bytes, so any edit to
     it still changes the hash. Per-worktree `config.worktree` files are
     included: with `extensions.worktreeConfig` set, git reads them too.
@@ -276,10 +295,16 @@ def fingerprint(common_dir: Path) -> str:
         if entries is None:
             digest.update(b"<unparsed>\0" + path.read_bytes() + b"\0")
             continue
+        remotes = _remote_names(entries)
         for key, value in entries:
-            if not _is_daemon_written(key):
-                digest.update(key.encode("utf-8", "surrogateescape") + b"\n"
-                              + value.encode("utf-8", "surrogateescape") + b"\0")
+            if _is_daemon_written(key, value, remotes):
+                continue
+            digest.update(key.encode("utf-8", "surrogateescape"))
+            if value is None:
+                digest.update(b"\x01")  # bare key: distinct from `key =`
+            else:
+                digest.update(b"\n" + value.encode("utf-8", "surrogateescape"))
+            digest.update(b"\0")
     hooks = common_dir / "hooks"
     if hooks.is_dir():
         for path in sorted(p for p in hooks.rglob("*") if p.is_file() and p.suffix != ".sample"):

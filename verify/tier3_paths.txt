@@ -22,6 +22,18 @@
 ^engine/runner/src/cards_runner/daemon/merge_gate\.py$
 ^engine/runner/src/cards_runner/daemon/confidence_gate\.py$
 
+# The secret and execution boundary (#85): what model-run code can see, and
+# what the daemon's own git/gh runs in an executor-written repo.
+^engine/runner/src/cards_runner/common/git_safety\.py$
+^engine/runner/src/cards_runner/common/env_scrub\.py$
+^engine/runner/src/cards_runner/common/process_group\.py$
+^engine/runner/src/cards_runner/daemon/spawner\.py$
+^engine/runner/src/cards_runner/daemon/pr_lifecycle\.py$
+^engine/runner/src/cards_runner/daemon/worktree\.py$
+^engine/runner/src/cards_runner/daemon/diff_stats\.py$
+^engine/runner/src/cards_runner/worker_stub/sdk_invoker\.py$
+^engine/runner/src/cards_runner/worker_stub/tools\.py$
+
 # The verifier decision surface.
 ^engine/runner/src/cards_runner/verifier/
 ^engine/lib/verifier/
