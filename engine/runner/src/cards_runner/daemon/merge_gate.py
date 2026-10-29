@@ -31,6 +31,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from ..common import git_safety
 from ..common.canonical_config import CanonicalConfigMissing, TierMap, load_tier_map
 from ..common.project_config import MergeGateRelaxation, ProjectConfig
 from ..common.types import ClaimedCard, DaemonConfig
@@ -192,10 +193,41 @@ class MergeGate:
         title = self._pr_title(record)
         body = self._pr_body(record, decision=decision, verified_at=verified_at)
 
+        # Everything below runs in the daemon's integration clone, never the
+        # worker's (daemon/clones.py), and pushes the exact sha the verifier
+        # checked, not whatever a branch name points at by now. With no
+        # integrated sha outside skip-worktree mode there is nothing
+        # verified to push: fail closed.
+        repo = claim.integration_path
+        if repo is None or claim.integrated_sha is None:
+            if not self.cfg.skip_worktree:
+                return MergeOutcome(
+                    decision=decision,
+                    to_status=CardStatus.BLOCKED.value,
+                    merge_status=_MS_BLOCKED,
+                    reason="no integrated commit to push",
+                    extra_payload={"error": "not_integrated"},
+                )
+            repo = claim.worktree_path
+        else:
+            # The verifier's model-written shell ACs ran while this clone
+            # existed and could write its .git by absolute path. Check it
+            # here, whatever gh runner is wired in, before anything runs.
+            try:
+                git_safety.assert_trusted(repo)
+            except (git_safety.RepoQuarantined, git_safety.UntrustedRepo) as exc:
+                return MergeOutcome(
+                    decision=decision,
+                    to_status=CardStatus.BLOCKED.value,
+                    merge_status=_MS_BLOCKED,
+                    reason=f"integration clone changed after verification: {exc}",
+                    extra_payload={"error": "repo_untrusted"},
+                )
+
         # Push the per-card branch. Failure here halts the gate; the
         # card lands `blocked` with merge_status=blocked and the gh
         # reason in the payload.
-        push_result = self.gh.push(claim.worktree_path, branch)
+        push_result = self.gh.push(repo, branch, sha=claim.integrated_sha)
         if not push_result.ok:
             return MergeOutcome(
                 decision=decision,
@@ -210,11 +242,12 @@ class MergeGate:
 
         # Open the PR. A failure here is also fatal for this attempt.
         open_result = self.gh.open_pr(
-            claim.worktree_path,
+            repo,
             title=title,
             body=body,
             base=base,
             draft=False,
+            head=branch,
         )
         if not open_result.ok:
             return MergeOutcome(
@@ -237,7 +270,7 @@ class MergeGate:
             # because the runner's decision has been made; if the merge
             # later conflicts, gh closes the PR and a human handles it.
             merge_result = self.gh.merge_pr(
-                claim.worktree_path,
+                repo,
                 identifier=pr_url or branch,
                 strategy=self.cfg.auto_merge_strategy,
             )

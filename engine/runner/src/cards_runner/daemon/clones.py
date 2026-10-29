@@ -1,0 +1,295 @@
+"""Throwaway clones: the worker's, the daemon's integration clone, the verifier's.
+
+Why clones and not `git worktree add`: a worktree shares the project's
+`.git` (config, hooks, objects) with the worker, so anything model-run
+code wrote there was read by the daemon's next git call in the project.
+A clone has its own `.git`. Each attempt gets three:
+
+1. **Worker clone** (`ClaimedCard.worktree_path`, under the run dir), made
+   at a pinned `base_sha` before the worker starts. The daemon never runs
+   git there again. The worker hands its changes back as a patch file
+   (data, `PATCH_NAME`), not as commits for the daemon to read.
+2. **Integration clone** (`clones/<attempt>/integration`, daemon state),
+   made only after the worker's whole job has ended. The daemon applies
+   the patch to the index at `base_sha`, checks every resulting path and
+   mode as git itself records them, and commits once, with the identity
+   pinned at boot (`git_safety.commit_identity`). Its sha is the only
+   thing the verifier checks and the merge gate pushes.
+3. **Verify clone** (`clones/<attempt>/verify`), detached at that sha, for
+   the verifier's model-written shell ACs. The daemon runs git there only
+   to create it.
+
+All clones use `--no-hardlinks` (a hardlinked object file is the owner's
+object file) and `--single-branch --no-tags`. A daemon clone is trusted
+in memory the moment `git clone` returns (`git_safety.trust_daemon_clone`)
+and checked before every later call, like any repo.
+"""
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+import re
+import shutil
+import stat
+import sys
+from pathlib import Path
+from typing import Final
+
+from ..common import git_safety
+from ..common.git_safety import resolved, run_git
+from ..common.types import PATCH_DONE_NAME, PATCH_NAME, RuntimePaths
+
+
+log = logging.getLogger(__name__)
+
+# A card's change is source code. Anything bigger is refused, not applied.
+PATCH_MAX_BYTES: Final[int] = 20 * 1024 * 1024
+CLONE_TIMEOUT_SEC: Final[float] = 300.0
+
+_SYMLINK_MODE: Final[str] = "120000"
+_GITLINK_MODE: Final[str] = "160000"
+_SHA_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
+_SHORT_NAME_RE: Final[re.Pattern[str]] = re.compile(r"~[0-9]")
+
+
+class CloneError(Exception):
+    """A clone could not be made or checked. The attempt cannot proceed."""
+
+
+class PatchRejected(Exception):
+    """The worker's patch is missing, malformed, oversized, or touches a
+    path or file mode the daemon will not commit."""
+
+
+def clones_root(paths: RuntimePaths) -> Path:
+    return paths.todo_root / ".cards-runner-state" / "clones"
+
+
+def attempt_clone_dir(paths: RuntimePaths, attempt_trace_id: str) -> Path:
+    return clones_root(paths) / attempt_trace_id
+
+
+def _git(cwd: Path, *args: str, extra_config: tuple[tuple[str, str], ...] = (),
+         first_sight_ok: bool = False) -> str:
+    proc = run_git([resolved("git"), *args], cwd=cwd, timeout=CLONE_TIMEOUT_SEC,
+                   first_sight_ok=first_sight_ok, extra_config=extra_config)
+    if proc.returncode != 0:
+        raise CloneError(f"git {args[0]} failed in {cwd}: rc={proc.returncode} "
+                         f"stderr={proc.stderr.strip()[:400]!r}")
+    return proc.stdout
+
+
+def _clone(source: Path, dest: Path, *, branch: str, checkout: bool = True,
+           first_sight_ok: bool = False) -> None:
+    """`git clone` run FROM the (trusted) source, then trust the result."""
+    if dest.exists():
+        raise CloneError(f"clone destination {dest} already exists")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    args = ["clone", "--quiet", "--no-hardlinks", "--no-tags", "--single-branch",
+            "--branch", branch]
+    if not checkout:
+        args.append("--no-checkout")
+    _git(source, *args, "--", str(source), str(dest), first_sight_ok=first_sight_ok)
+    git_safety.trust_daemon_clone(dest)
+
+
+def resolve_base_sha(project_dir: Path, base_branch: str) -> str:
+    """Pin the base: a branch name can move between clone and push."""
+    sha = _git(project_dir, "rev-parse", "--verify", "--end-of-options",
+               f"{base_branch}^{{commit}}", first_sight_ok=True).strip()
+    if not _SHA_RE.match(sha):
+        raise CloneError(f"unexpected rev-parse output for {base_branch!r}: {sha!r}")
+    return sha
+
+
+def prepare_worker_clone(*, project_dir: Path, base_branch: str, branch: str,
+                         dest: Path) -> str:
+    """Make the worker's clone at the base sha, on `branch`. Returns the sha.
+
+    The clone has no remote (the worker has nothing to push to) and the
+    daemon forgets it once this returns.
+    """
+    if not (project_dir / ".git").exists():
+        raise CloneError(f"project_dir {project_dir} is not a git repo")
+    base_sha = resolve_base_sha(project_dir, base_branch)
+    _clone(project_dir, dest, branch=base_branch, first_sight_ok=True)
+    try:
+        _git(dest, "checkout", "--quiet", "-b", branch, base_sha)
+        _git(dest, "remote", "remove", "origin")
+    finally:
+        # From here on the clone belongs to the worker.
+        git_safety.forget(dest)
+    return base_sha
+
+
+def _project_origin_url(project_dir: Path) -> str | None:
+    proc = run_git([resolved("git"), "config", "--get", "remote.origin.url"],
+                   cwd=project_dir, first_sight_ok=True)
+    url = proc.stdout.strip()
+    return url if proc.returncode == 0 and url else None
+
+
+def read_patch(run_dir: Path, *, max_bytes: int = PATCH_MAX_BYTES) -> bytes:
+    """The worker's finished patch, or PatchRejected. Read once, capped."""
+    if not (run_dir / PATCH_DONE_NAME).is_file():
+        raise PatchRejected("the worker did not finish writing a patch")
+    path = run_dir / PATCH_NAME
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(max_bytes + 1)
+    except OSError as exc:
+        raise PatchRejected(f"could not read the worker's patch: {exc}") from exc
+    if len(data) > max_bytes:
+        raise PatchRejected(f"patch exceeds {max_bytes} bytes")
+    marker = (run_dir / PATCH_DONE_NAME).read_text(encoding="utf-8", errors="replace")
+    if f"sha256={hashlib.sha256(data).hexdigest()}" not in marker.split():
+        raise PatchRejected("patch does not match its done marker (cut off or rewritten)")
+    return data
+
+
+def path_allowed(path: str) -> bool:
+    """A repo-relative path the daemon will commit.
+
+    No absolute or drive paths, no `..`, no backslash or colon (NTFS
+    streams, drive letters), and no component that Windows or macOS would
+    treat as `.git`: case-folded after stripping trailing dots and spaces,
+    and no 8.3 short names (`GIT~1`). git's own protectNTFS/protectHFS
+    checks run too; this is the daemon's, independent of git's version.
+    """
+    if not path or path.startswith("/") or "\\" in path or ":" in path or "\x00" in path:
+        return False
+    for part in path.split("/"):
+        if part in ("", ".", ".."):
+            return False
+        folded = part.rstrip(" .").casefold()
+        if folded in ("", ".git") or _SHORT_NAME_RE.search(part):
+            return False
+    return True
+
+
+def _index_changes(clone: Path, base_sha: str) -> list[tuple[str, str]]:
+    """(new_mode, path) for every entry the index changes vs `base_sha`,
+    read from git's own record of the index (`diff-index --raw -z`)."""
+    out = _git(clone, "diff-index", "--cached", "--raw", "-z", "--no-renames",
+               base_sha)
+    fields = out.split("\x00")
+    changes: list[tuple[str, str]] = []
+    i = 0
+    while i + 1 < len(fields) and fields[i]:
+        meta, path = fields[i], fields[i + 1]
+        parts = meta.lstrip(":").split()
+        if len(parts) < 5:
+            raise PatchRejected(f"unparsable index entry {meta!r}")
+        changes.append((parts[1], path))
+        i += 2
+    return changes
+
+
+def integrate_patch(*, project_dir: Path, base_branch: str, base_sha: str,
+                    branch: str, patch_file: Path, dest: Path, message: str) -> str:
+    """Apply the worker's patch in a fresh daemon clone; commit; return the sha.
+
+    The patch is applied to the INDEX only (`--cached`): no file the patch
+    names is written to disk here. Before committing, every changed path
+    and its new mode is read back from git and refused if it is not a
+    plain relative path or if it is a symlink or submodule. An empty patch
+    leaves the base sha (and the merge gate's PR then has nothing in it,
+    exactly as an executor that committed nothing did before).
+    """
+    _clone(project_dir, dest, branch=base_branch, first_sight_ok=True)
+    _git(dest, "checkout", "--quiet", "-b", branch, base_sha)
+    origin = _project_origin_url(project_dir)
+    if origin is not None:
+        _git(dest, "remote", "set-url", "origin", origin)
+    else:
+        _git(dest, "remote", "remove", "origin")
+    # The baseline was taken before these, the daemon's own config writes;
+    # take it again now. Nothing model-run is alive yet (the worker's job
+    # has ended and the verifier has not started), so this absorbs nothing.
+    git_safety.trust_daemon_clone(dest)
+    if patch_file.stat().st_size == 0:
+        return base_sha
+    proc = run_git([resolved("git"), "apply", "--cached", "--binary", "--whitespace=nowarn",
+                    "--", str(patch_file)], cwd=dest, timeout=CLONE_TIMEOUT_SEC)
+    if proc.returncode != 0:
+        raise PatchRejected(f"git apply refused the patch: {proc.stderr.strip()[:400]}")
+    changes = _index_changes(dest, base_sha)
+    for mode, path in changes:
+        if not path_allowed(path):
+            raise PatchRejected(f"patch touches a refused path: {path!r}")
+        if mode in (_SYMLINK_MODE, _GITLINK_MODE):
+            raise PatchRejected(f"patch adds a symlink or submodule: {path!r} ({mode})")
+    if not changes:
+        return base_sha
+    _git(dest, "commit", "--quiet", "--no-verify", "-m", message,
+         extra_config=tuple(git_safety.commit_identity()))
+    sha = _git(dest, "rev-parse", "--verify", "HEAD^{commit}").strip()
+    if not _SHA_RE.match(sha):
+        raise CloneError(f"unexpected HEAD after commit: {sha!r}")
+    return sha
+
+
+def prepare_verify_clone(*, integration: Path, branch: str, sha: str, dest: Path) -> None:
+    """A clone of the integration clone, detached at exactly `sha`.
+
+    The verifier's shell ACs (often model-written tests) run here, so the
+    daemon forgets this clone once HEAD is confirmed and never runs git in
+    it again.
+    """
+    _clone(integration, dest, branch=branch, checkout=False)
+    try:
+        _git(dest, "checkout", "--quiet", "--detach", sha)
+        head = _git(dest, "rev-parse", "--verify", "HEAD^{commit}").strip()
+        if head != sha:
+            raise CloneError(f"verify clone HEAD {head} is not {sha}")
+    finally:
+        git_safety.forget(dest)
+
+
+def _make_writable(func, path, _exc) -> None:  # noqa: ANN001 - shutil callback
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def remove_tree(path: Path) -> None:
+    """rmtree that also removes git's read-only object files on Windows."""
+    if not path.exists():
+        return
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_make_writable)
+    else:  # pragma: no cover - 3.11
+        shutil.rmtree(path, onerror=_make_writable)
+
+
+def remove_attempt_clones(paths: RuntimePaths, attempt_trace_id: str) -> None:
+    """Best-effort removal of an attempt's daemon clones."""
+    root = attempt_clone_dir(paths, attempt_trace_id)
+    for name in ("integration", "verify"):
+        git_safety.forget(root / name)
+    try:
+        remove_tree(root)
+    except OSError as exc:
+        log.warning("could not remove clones for %s: %s", attempt_trace_id, exc)
+
+
+def reap_stale_clones(paths: RuntimePaths, in_flight_attempts: set[str]) -> int:
+    """Remove clone dirs of attempts that are no longer in flight."""
+    root = clones_root(paths)
+    if not root.is_dir():
+        return 0
+    removed = 0
+    for child in root.iterdir():
+        if child.name in in_flight_attempts or not child.is_dir():
+            continue
+        remove_attempt_clones(paths, child.name)
+        removed += 0 if child.exists() else 1
+    return removed
+
+
+__all__ = [
+    "CloneError", "PATCH_MAX_BYTES", "PatchRejected",
+    "attempt_clone_dir", "clones_root", "integrate_patch",
+    "path_allowed", "prepare_verify_clone", "prepare_worker_clone", "read_patch",
+    "reap_stale_clones", "remove_attempt_clones", "remove_tree", "resolve_base_sha",
+]

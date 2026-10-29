@@ -103,6 +103,9 @@ def spawn_worker(
         "CARDS_RUNNER_INVOKER": cfg.invoker,
         "PYTHONPATH": pythonpath,
     }
+    if claim.base_sha:
+        # The worker diffs its clone against this and writes the patch.
+        injected["CARDS_RUNNER_BASE_SHA"] = claim.base_sha
     if cfg.invoker == "sdk":
         # The SDK executor needs a credential the scrub policy drops
         # by default. RUNNER_CONTRACT.md "Worktree isolation" item 1

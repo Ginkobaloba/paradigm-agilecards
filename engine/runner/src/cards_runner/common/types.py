@@ -302,6 +302,13 @@ class ClaimedCard:
     dir, the git worktree inside it, and the projected card `.md` file
     the worker reads and writes (a per-run view, not canonical state).
     The card's authoritative record lives in the store.
+
+    `worktree_path` is the worker's throwaway clone (the name predates
+    clones). The daemon never runs git there once the worker starts: the
+    worker hands back a patch, and the daemon applies it at `base_sha` in
+    its own `integration_path` clone, committing `integrated_sha`, the only
+    commit the verifier checks and the merge gate pushes. All three stay
+    None in `skip_worktree` mode.
     """
 
     card_id: str
@@ -310,6 +317,17 @@ class ClaimedCard:
     run_dir: Path
     worktree_path: Path
     card_file: Path
+    base_sha: str | None = None
+    integration_path: Path | None = None
+    integrated_sha: str | None = None
+
+
+# The worker's change, handed back as data in its run dir: the patch, then
+# a marker written only once the patch file is complete.
+PATCH_NAME: Final[str] = "result.patch"
+PATCH_DONE_NAME: Final[str] = "result.patch.done"
+# Files the worker itself writes inside its clone; never part of the change.
+WORKER_SCRATCH_FILES: Final[tuple[str, ...]] = (".cards-heartbeat",)
 
 
 # Exit codes from worker processes. Documented here so the daemon

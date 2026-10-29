@@ -74,6 +74,12 @@ _MEMORY: dict[str, "TrustRecord"] = {}
 # not what the daemon's own calls run. The executor's tools still use PATH.
 _PINNED_BINARIES: dict[str, str] = {}
 _PINNABLE: tuple[str, ...] = ("git", "gh", "powershell.exe")
+# The identity on the daemon's own commits (the one commit per card that
+# integrates a worker's patch), read once at configure() from the owner's
+# real config, before any executor ran. Model-chosen identities and
+# commit messages never reach a pushed commit.
+_IDENTITY: dict[str, str] = {}
+_FALLBACK_IDENTITY: dict[str, str] = {"user.name": "cards-runner", "user.email": "cards-runner@localhost"}
 
 
 class RepoQuarantined(RuntimeError):
@@ -101,6 +107,34 @@ def configure(state_dir: Path) -> None:
         found = shutil.which(name)
         if found:
             _PINNED_BINARIES[name] = found
+    _IDENTITY.clear()
+    _IDENTITY.update(_read_identity())
+
+
+def _read_identity() -> dict[str, str]:
+    found: dict[str, str] = {}
+    git = _PINNED_BINARIES.get("git")
+    for key in ("user.name", "user.email"):
+        value = None
+        for scope in ("--global", "--system"):
+            if git is None:
+                break
+            try:
+                cp = subprocess.run([git, "config", scope, "--get", key], capture_output=True,
+                                    text=True, timeout=10, check=False, env=scrub_environment())
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if cp.returncode == 0 and cp.stdout.strip():
+                value = cp.stdout.strip()
+                break
+        found[key] = value or _FALLBACK_IDENTITY[key]
+    return found
+
+
+def commit_identity() -> list[tuple[str, str]]:
+    """`extra_config` for a daemon-authored commit: the identity pinned at boot."""
+    identity = _IDENTITY or _FALLBACK_IDENTITY
+    return [("user.name", identity["user.name"]), ("user.email", identity["user.email"])]
 
 
 def resolved(binary: str) -> str:
@@ -135,6 +169,10 @@ def git_config_overrides(*, gh_path: str | None = None) -> list[tuple[str, str]]
         ("core.askPass", ""),
         ("diff.external", ""),
         ("protocol.ext.allow", "never"),
+        # Refuse paths NTFS or HFS+ would alias to `.git` (`.GIT`, `git~1`,
+        # `.git.`, ...) in any checkout or apply the daemon does.
+        ("core.protectNTFS", "true"),
+        ("core.protectHFS", "true"),
         # An empty value resets the helper list built from every config
         # file, so a repo-set helper is dropped ...
         ("credential.helper", ""),
@@ -151,6 +189,7 @@ def hardened_git_env(
     *,
     keep_gh_credentials: bool = True,
     gh_path: str | None = None,
+    extra_config: Sequence[tuple[str, str]] = (),
 ) -> dict[str, str]:
     """The env for a daemon git/gh call: no keys, no user config, pinned overrides."""
     env = scrub_environment(
@@ -165,7 +204,8 @@ def hardened_git_env(
     env["GIT_TERMINAL_PROMPT"] = "0"
     if keep_gh_credentials and gh_path is None:
         gh_path = _PINNED_BINARIES.get("gh") or shutil.which("gh")
-    overrides = git_config_overrides(gh_path=gh_path if keep_gh_credentials else None)
+    overrides = [*git_config_overrides(gh_path=gh_path if keep_gh_credentials else None),
+                 *extra_config]
     env["GIT_CONFIG_COUNT"] = str(len(overrides))
     for i, (key, value) in enumerate(overrides):
         env[f"GIT_CONFIG_KEY_{i}"] = key
@@ -370,6 +410,29 @@ def trust_repo(common_dir: Path) -> str:
     return value
 
 
+def trust_daemon_clone(path: Path) -> None:
+    """Baseline a clone the daemon itself just made (this process only).
+
+    Called right after `git clone` returns, before any other process is
+    given the path. Never persisted: a restarted daemon has no use for an
+    old attempt's clone, and the reaper removes it.
+    """
+    common = common_dir_of(path)
+    if common is None:
+        raise UntrustedRepo(f"{path} is not a repository after clone")
+    value = fingerprint(common)
+    with _LOCK:
+        _MEMORY[str(common)] = TrustRecord(value)
+
+
+def forget(path: Path) -> None:
+    """Drop this process's record for a daemon clone about to be removed."""
+    common = common_dir_of(path)
+    if common is not None:
+        with _LOCK:
+            _MEMORY.pop(str(common), None)
+
+
 def _quarantine(common_dir: Path, reason: str) -> None:
     with _LOCK:
         previous = _MEMORY.get(str(common_dir))
@@ -423,6 +486,7 @@ def run_git(
     gh_path: str | None = None,
     timeout: float = GIT_TIMEOUT_SEC,
     first_sight_ok: bool = False,
+    extra_config: Sequence[tuple[str, str]] = (),
 ) -> subprocess.CompletedProcess[str]:
     """Run one daemon git or gh command, hardened. The only way the daemon does.
 
@@ -432,7 +496,8 @@ def run_git(
     walking above `cwd` to find some other repo. `cwd=None` is for gh calls
     that touch no checkout.
     """
-    env = hardened_git_env(keep_gh_credentials=keep_gh_credentials, gh_path=gh_path)
+    env = hardened_git_env(keep_gh_credentials=keep_gh_credentials, gh_path=gh_path,
+                           extra_config=extra_config)
     if cwd is not None:
         assert_trusted(cwd, first_sight_ok=first_sight_ok)
         env["GIT_CEILING_DIRECTORIES"] = str(Path(cwd).resolve().parent)
