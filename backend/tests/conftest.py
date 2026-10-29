@@ -82,27 +82,9 @@ def verifier(jwk_client):
     return TokenVerifier(issuer=ISSUER, audience=AUDIENCE, jwk_client=jwk_client)
 
 
-@pytest.fixture
-def seeded_store():
-    """A store with deterministic cards across two orgs for isolation tests."""
-    from cards_api.store import Card, CardStore
-
-    store = CardStore()
-    store.add(Card(id="a1", org_id=ORG_A, title="Acme: ship login"))
-    store.add(Card(id="a2", org_id=ORG_A, title="Acme: fix nav"))
-    store.add(Card(id="b1", org_id=ORG_B, title="Globex: invoice run"))
-    return store
-
-
-@pytest.fixture
-def client(verifier, seeded_store):
-    """TestClient over an app using the offline verifier and seeded store."""
-    from fastapi.testclient import TestClient
-
-    from cards_api.main import create_app
-
-    app = create_app(verifier=verifier, store=seeded_store)
-    return TestClient(app)
+# NOTE: the app/client fixtures live in tests/pg/conftest.py — the API is
+# DB-backed now, so API tests run against the real Postgres harness there.
+# This file keeps only the offline JWKS/token machinery.
 
 
 @pytest.fixture
