@@ -24,7 +24,15 @@
   - F6: `_prepare_and_spawn` is driven on a real repo.
   - F10: the git tool refuses `config` reads of other files or scopes.
   - Results: suite 842/0 and ruff clean. Each F-item has a positive control, and 18 mutants over the r2 changes all turn red.
+- **r3 (after Deep Verify r2 PASS WITH WARNINGS, 2026-10-28 night):**
+  - N1: r2's own config reader split on a lone CR and git doesn't, which hid exec keys from the hash (the verifier demonstrated it). Config is now hashed as GIT parses it (`git config --file --no-includes --null --list`), minus only `branch.<name>.remote/merge/gh-merge-base`. A differential test checks the result against `git config --list`, and the N1 test fails under a faithful copy of the r2 reader.
+  - R18: per-worktree `config.worktree` files are hashed.
+  - The tool shell sets `GIT_CONFIG_NOSYSTEM`, `GCM_INTERACTIVE=never` and `GIT_TERMINAL_PROMPT=0`, so git's system-configured helper (GCM, which reads Windows Credential Manager) is not reachable through git. Commit-relevant settings are carried over.
+  - R30: the push's GitHub credentials are pinned by a test.
+  - The process-launch scan is AST-based (aliases, from-imports, getattr, os.spawn/exec, importlib).
+  - Suite 871/0, and 23 r2+r3 mutants all red.
 - **r2 residuals (said plainly):**
+  - N2: any same-user process can read Windows Credential Manager (Drew's github, gh, ghcr and huggingface entries). `GIT_CONFIG_NOSYSTEM` closes only git's own route to it. Only OS isolation closes it.
   - Everything is still same-user. A payload can write absolute paths. A `git.exe` planted into a user-writable PATH dir such as `C:\Users\Drama\bin` reaches the daemon only if it lands before the daemon boots (the executor's own tool git is always PATH-resolved). The on-disk trust store is re-read by a restarted daemon. It can also read process memory.
   - Tool shells have network access.
   - A repo's legitimate `include.path` target is not hashed.

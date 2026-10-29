@@ -586,3 +586,129 @@ def test_diff_stats_raises_on_a_quarantined_repo_instead_of_reporting_no_diff(tm
     _git(work, "config", "core.sshCommand", "evil")
     with pytest.raises(git_safety.RepoQuarantined):
         DiffStats.from_worktree(work, branch="card/x", base_branch="main", git_path=GIT)
+
+
+# ---- r3: the hash sees what git sees (N1), worktree configs (R18), push creds (R30)
+
+
+def _plant_raw(path: Path, payload: bytes) -> None:
+    path.write_bytes(path.read_bytes() + payload)
+
+
+@needs_git
+def test_a_lone_cr_cannot_hide_an_exec_key_from_the_hash(tmp_path: Path) -> None:
+    # N1: `splitlines()` split on a lone CR and git did not, so a fake
+    # `[branch]` header hid every key after it from the hash.
+    work = _repo_with_remote(tmp_path)
+    cfg = work / ".git" / "config"
+    _plant_raw(cfg, b"[core]\n\tnote = x\n")  # a free-form section, last, and trusted
+    git_safety.trust_repo(_common(work))
+    # The plant only EXTENDS the trusted last line: to a line-splitting
+    # reader the old lines are unchanged and the rest is a [branch] block.
+    cfg.write_bytes(cfg.read_bytes().rstrip(b"\n") + b'\r[branch "z"]\n\tsshCommand = evil-n1-0042\n')
+    # Positive control: git honours the hidden key.
+    got = subprocess.run([GIT, "config", "--file", str(work / ".git" / "config"), "--get",
+                          "core.sshCommand"], capture_output=True, text=True)
+    assert got.stdout.strip() == "evil-n1-0042"
+    with pytest.raises(git_safety.RepoQuarantined):
+        git_safety.assert_trusted(work)
+
+
+@needs_git
+@pytest.mark.parametrize("payload", [
+    b'[core]\n\tnote = x\r[branch "z"]\n\tsshCommand = evil\n',
+    b'[core]\n\tsshCommand = "ev\\\n il"\n',             # continuation inside quotes
+    b'[core] sshCommand = evil ; comment\n',              # key on the header line
+    b'[CoRe]\n\tSSHCOMMAND = evil\n',                     # case
+    b'[remote "a.b"]\n\turl = x\n\tpushurl = y\n',      # dotted subsection
+    b'[include]\n\tpath = elsewhere.cfg\n',               # include key itself
+    b'[branch "x"]\n\tremote = origin\n\tpushRemote = evil\n',  # non-daemon branch key
+])
+def test_the_hashed_entries_are_exactly_what_git_reads(payload: bytes, tmp_path: Path) -> None:
+    # Differential: what the hash covers == what git itself lists, minus
+    # only the daemon-written branch.<name>.remote/merge keys.
+    work = _repo_with_remote(tmp_path)
+    _plant_raw(work / ".git" / "config", payload)
+    proc = subprocess.run([GIT, "config", "--local", "--null", "--list"], cwd=work,
+                          capture_output=True)
+    git_sees = [tuple(r.decode().partition("\n")[::2]) for r in proc.stdout.split(b"\0") if r]
+    hashed = git_safety.config_entries(work / ".git" / "config")
+    assert hashed is not None
+    expected = [e for e in git_sees if not git_safety._is_daemon_written(e[0])]
+    assert [e for e in hashed if not git_safety._is_daemon_written(e[0])] == expected
+    if b"pushRemote" in payload:  # only remote/merge are exempt, never pushRemote
+        assert ("branch.x.pushremote", "evil") in expected
+
+
+@needs_git
+def test_a_write_to_a_worktree_config_quarantines(tmp_path: Path) -> None:
+    # R18: with extensions.worktreeConfig, git reads per-worktree config.
+    work = _repo_with_remote(tmp_path)
+    _git(work, "config", "extensions.worktreeConfig", "true")
+    wt = tmp_path / "wt18"
+    _git(work, "worktree", "add", str(wt), "-b", "card/r18")
+    git_safety.trust_repo(_common(work))  # trusted with the extension already on
+    _git(wt, "config", "--worktree", "core.sshCommand", "evil-r18")
+    assert _git(wt, "config", "--get", "core.sshCommand").strip() == "evil-r18"  # control
+    with pytest.raises(git_safety.RepoQuarantined):
+        git_safety.assert_trusted(wt)
+
+
+@needs_git
+def test_a_write_to_the_main_config_worktree_quarantines(tmp_path: Path) -> None:
+    work = _repo_with_remote(tmp_path)
+    git_safety.trust_repo(_common(work))
+    (work / ".git" / "config.worktree").write_text("[core]\n\tsshCommand = evil\n")
+    with pytest.raises(git_safety.RepoQuarantined):
+        git_safety.assert_trusted(work)
+
+
+def test_the_daemon_push_keeps_its_github_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # R30: the hardening must not strip what an authenticated push needs.
+    monkeypatch.setenv("GH_TOKEN", "gh-push-0042")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", FAKE_KEY)
+    seen: dict[str, object] = {}
+
+    def fake_run(argv: list[str], **kw: object) -> SimpleNamespace:
+        seen["env"] = kw.get("env")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("cards_runner.daemon.pr_lifecycle.shutil.which", lambda name: "C:/gh/gh.exe")
+    assert SubprocessGhRunner().push(tmp_path, "card/x").ok
+    env = seen["env"]
+    assert isinstance(env, dict)
+    assert env["GH_TOKEN"] == "gh-push-0042"
+    assert FAKE_KEY not in env.values()
+    helpers = [env[f"GIT_CONFIG_VALUE_{i}"] for i in range(int(env["GIT_CONFIG_COUNT"]))
+               if env[f"GIT_CONFIG_KEY_{i}"] == "credential.helper"]
+    assert helpers == ["", '!"C:/gh/gh.exe" auth git-credential']
+
+
+@needs_git
+def test_the_tool_shell_does_not_read_the_system_git_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The system config names Git for Windows' credential helper (GCM),
+    # through which `git credential fill` returns stored passwords.
+    system_cfg = tmp_path / "system.gitconfig"
+    system_cfg.write_text("[credential]\n\thelper = !echo password=leak-0042 #\n")
+    from cards_runner.common.env_scrub import scrub_environment
+
+    plain = scrub_environment(base=dict(os.environ))
+    plain["GIT_CONFIG_SYSTEM"] = str(system_cfg)
+    control = subprocess.run([GIT, "config", "--list", "--show-scope"], cwd=tmp_path,
+                             capture_output=True, text=True, env=plain)
+    assert "system\tcredential.helper" in control.stdout  # control: the system scope is read
+
+    worktree = tmp_path / "run" / "worktree"
+    worktree.mkdir(parents=True)
+    belt = SdkInvoker(api_key=FAKE_KEY)._build_tool_belt(
+        SimpleNamespace(worktree=str(worktree)))  # type: ignore[arg-type]
+    assert belt.env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert belt.env["GCM_INTERACTIVE"] == "never"
+    # Even with a system file named, NOSYSTEM wins: nothing from it is read.
+    probe = dict(belt.env, GIT_CONFIG_SYSTEM=str(system_cfg))
+    out = subprocess.run([GIT, "config", "--list", "--show-scope"], cwd=worktree,
+                         capture_output=True, text=True, env=probe)
+    assert "leak-0042" not in out.stdout and "system\t" not in out.stdout

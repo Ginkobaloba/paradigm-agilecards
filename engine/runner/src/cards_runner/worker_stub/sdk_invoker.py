@@ -57,41 +57,65 @@ from .tools import TOOL_DESCRIPTORS, ToolBelt, ToolError, ToolResult
 _PROFILE_VARS: tuple[str, ...] = (
     "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME",
 )
-_IDENTITY_KEYS: tuple[str, ...] = ("user.name", "user.email")
+# Settings carried from the real global/system config into the throwaway
+# one: commit identity, and the line-ending / filesystem behaviour commits
+# depend on. None of them names a program, a helper, or a credential.
+_CARRIED_KEYS: tuple[str, ...] = (
+    "user.name", "user.email",
+    "core.autocrlf", "core.eol", "core.safecrlf", "core.symlinks",
+    "core.longpaths", "core.ignorecase", "init.defaultBranch",
+)
+
+
+def _git_config_get(scope: str, key: str, env: dict[str, str]) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", "config", scope, "--get", key],
+            capture_output=True, text=True, timeout=10, check=False,
+            env={k: v for k, v in env.items() if not k.startswith("GIT_")},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = proc.stdout.strip()
+    return value if proc.returncode == 0 and value else None
 
 
 def _isolate_profile(env: dict[str, str], home: Path) -> None:
     """Point every profile variable in `env` at a fresh dir under `home`.
 
-    The commit identity from the real global config is carried over, so the
-    executor's commits are attributed as before. Nothing else is: the new
-    global config holds exactly those two keys. Absolute-path writes into
-    the real profile stay possible (same user); see the PR's residuals.
+    The new global config holds ONLY `_CARRIED_KEYS`, read from the real
+    global config (else the system one), so commits attribute and
+    normalise line endings as before. The system config itself is not
+    read (it names the credential helper). Absolute-path writes into the
+    real profile stay possible (same user); see the PR's residuals.
     """
-
-
-    identity: list[tuple[str, str]] = []
-    for key in _IDENTITY_KEYS:
-        try:
-            proc = subprocess.run(
-                ["git", "config", "--global", "--get", key],
-                capture_output=True, text=True, timeout=10, check=False,
-                env={k: v for k, v in env.items() if not k.startswith("GIT_")},
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if proc.returncode == 0 and proc.stdout.strip():
-            identity.append((key, proc.stdout.strip()))
+    carried = []
+    for key in _CARRIED_KEYS:
+        value = _git_config_get("--global", key, env) or _git_config_get("--system", key, env)
+        if value is not None:
+            carried.append((key, value))
     home.mkdir(parents=True, exist_ok=True)
     for var, sub in zip(_PROFILE_VARS, ("", "", "AppData/Roaming", "AppData/Local", ".config")):
         path = home / sub if sub else home
         path.mkdir(parents=True, exist_ok=True)
         env[var] = str(path)
     env["HOMEDRIVE"], env["HOMEPATH"] = home.drive, str(home)[len(home.drive):]
-    for key in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"):
+    for key in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
         env.pop(key, None)
-    lines = ["[user]"] + [f"\t{k.split('.', 1)[1]} = {v}" for k, v in identity]
-    (home / ".gitconfig").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # The system config is where Git for Windows names its credential
+    # helper (GCM, backed by Windows Credential Manager): without this, a
+    # model-run `git credential fill` gets the owner's stored passwords.
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GCM_INTERACTIVE"] = "never"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    gitconfig = home / ".gitconfig"
+    gitconfig.write_text("", encoding="utf-8")
+    for key, value in carried:  # written by git, so values are escaped correctly
+        subprocess.run(
+            ["git", "config", "--file", str(gitconfig), key, value],
+            capture_output=True, timeout=10, check=False,
+            env={k: v for k, v in env.items() if not k.startswith("GIT_")},
+        )
 
 
 log = logging.getLogger(__name__)

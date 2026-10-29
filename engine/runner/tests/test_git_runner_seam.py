@@ -29,21 +29,76 @@ ALLOWED = {
     "store/dolt_store.py": "runs the dolt binary on the card store",
     "verifier/handlers/deterministic.py": "runs card AC commands with env={}",
     "cli/doctor.py": "`<binary> --version` only, no repo",
+    "common/locks.py": "ctypes OpenProcess/GetExitCodeProcess for PID liveness only",
 }
-LAUNCHERS = {"run", "Popen", "call", "check_call", "check_output", "system", "popen",
-             "create_subprocess_exec", "create_subprocess_shell"}
+# What `subprocess` may be used for outside the allowlist: its exception
+# and constant names, never a launcher.
+SAFE_SUBPROCESS = {"CalledProcessError", "TimeoutExpired", "SubprocessError",
+                   "CompletedProcess", "PIPE", "DEVNULL", "STDOUT"}
+OS_LAUNCHERS = {"system", "popen", "startfile", "fork", "forkpty", "posix_spawn", "posix_spawnp"}
+OS_LAUNCHER_PREFIXES = ("spawn", "exec")
+ASYNCIO_LAUNCHERS = {"create_subprocess_exec", "create_subprocess_shell", "subprocess"}
+# Importing any of these at all is a launch path.
+FORBIDDEN_MODULES = {"multiprocessing", "ctypes", "_winapi", "pty", "pexpect", "asyncio.subprocess"}
+LAUNCH_NAMES = ({"run", "Popen", "call", "check_call", "check_output", "getoutput",
+                 "getstatusoutput"} | OS_LAUNCHERS | ASYNCIO_LAUNCHERS)
+
+
+def _is_os_launcher(name: str) -> bool:
+    return name in OS_LAUNCHERS or name.startswith(OS_LAUNCHER_PREFIXES)
 
 
 def _launches(path: Path) -> list[int]:
+    """Lines that launch, or could launch, a process. Errs toward flagging."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    found = []
+    aliases: dict[str, str] = {}  # local name -> "subprocess" | "os" | "asyncio"
+    found: set[int] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            owner = node.func.value
-            if (node.func.attr in LAUNCHERS and isinstance(owner, ast.Name)
-                    and owner.id in {"subprocess", "os", "asyncio"}):
-                found.append(node.lineno)
-    return found
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                root = a.name.split(".")[0]
+                if a.name in FORBIDDEN_MODULES or root in FORBIDDEN_MODULES:
+                    found.add(node.lineno)
+                if a.name in ("subprocess", "os", "asyncio"):
+                    aliases[a.asname or a.name] = a.name
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if mod in FORBIDDEN_MODULES or mod.split(".")[0] in FORBIDDEN_MODULES:
+                found.add(node.lineno)
+            for a in node.names:
+                if ((mod == "subprocess" and a.name not in SAFE_SUBPROCESS)
+                        or (mod == "os" and (_is_os_launcher(a.name) or a.name == "*"))
+                        or (mod == "asyncio" and a.name in ASYNCIO_LAUNCHERS | {"*"})):
+                    found.add(node.lineno)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            kind = aliases.get(node.value.id)
+            if ((kind == "subprocess" and node.attr not in SAFE_SUBPROCESS)
+                    or (kind == "os" and _is_os_launcher(node.attr))
+                    or (kind == "asyncio" and node.attr in ASYNCIO_LAUNCHERS)):
+                found.add(node.lineno)
+        elif isinstance(node, ast.Name) and aliases.get(node.id) == "subprocess":
+            # the module object itself, not an attribute of it (getattr, aliasing)
+            parent_is_attr = any(isinstance(p, ast.Attribute) and p.value is node
+                                 for p in ast.walk(tree))
+            if not parent_is_attr:
+                found.add(node.lineno)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            fn, args = node.func.id, node.args
+            if fn == "getattr" and len(args) >= 2:
+                attr, owner = args[1], args[0]
+                dynamic_on_module = (not isinstance(attr, ast.Constant)
+                                     and isinstance(owner, ast.Name) and owner.id in aliases)
+                literal = attr.value if isinstance(attr, ast.Constant) else None
+                if dynamic_on_module or (isinstance(literal, str) and (
+                        literal in LAUNCH_NAMES or _is_os_launcher(literal))):
+                    found.add(node.lineno)
+            elif fn in {"__import__", "eval", "exec"}:
+                found.add(node.lineno)
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "import_module"):
+            found.add(node.lineno)
+    return sorted(found)
 
 
 def test_no_daemon_module_launches_a_process_outside_the_allowlist() -> None:
@@ -56,11 +111,41 @@ def test_no_daemon_module_launches_a_process_outside_the_allowlist() -> None:
     assert offenders == [], f"route these through git_safety.run_git: {offenders}"
 
 
-def test_the_scan_catches_a_bare_subprocess_run(tmp_path: Path) -> None:
-    # control: the scanner is not blind
+@pytest.mark.parametrize("source", [
+    "import subprocess\nsubprocess.run(['git', 'push'])\n",
+    "from subprocess import run\nrun(['git'])\n",
+    "from subprocess import run as r\nr(['git'])\n",
+    "import subprocess as sp\nsp.Popen(['git'])\n",
+    "import subprocess\nf = getattr(subprocess, 'run')\n",
+    "import subprocess\nname = 'run'\nf = getattr(subprocess, name)\n",
+    "import subprocess\nmod = subprocess\n",
+    "import os\nos.system('git push')\n",
+    "import os as o\no.spawnv(0, 'git', ['git'])\n",
+    "import os\nos.execv('git', ['git'])\n",
+    "from os import startfile\nstartfile('x')\n",
+    "import os\nos.posix_spawn('git', ['git'], {})\n",
+    "import asyncio\nasyncio.create_subprocess_exec('git')\n",
+    "import importlib\nimportlib.import_module('subprocess')\n",
+    "m = __import__('subprocess')\n",
+    "import multiprocessing\n",
+    "import ctypes\n",
+])
+def test_the_scan_catches_every_launch_form(source: str, tmp_path: Path) -> None:
+    # control: the scanner is not blind to any of these shapes
     probe = tmp_path / "probe.py"
-    probe.write_text("import subprocess\nsubprocess.run(['git', 'push'])\n")
-    assert _launches(probe) == [2]
+    probe.write_text(source)
+    assert _launches(probe), source
+
+
+def test_the_scan_allows_the_exception_names() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        probe = Path(d) / "ok.py"
+        probe.write_text("import subprocess\nimport os\n"
+                         "try:\n    pass\nexcept subprocess.CalledProcessError:\n    pass\n"
+                         "x = os.environ.get('A')\n")
+        assert _launches(probe) == []
 
 
 def test_every_daemon_git_and_gh_call_carries_the_hardened_env(

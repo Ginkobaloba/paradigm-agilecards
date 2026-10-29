@@ -24,8 +24,9 @@ without first proving it unchanged:
    operator runs `cards-runner trust-repo`), stored daemon-side, and
    checked before EVERY call. A mismatch QUARANTINES the repo: the call
    is refused and no further card from it runs until a human re-trusts
-   it. `[branch "..."]` sections are excluded from the hash: the daemon's
-   own `push -u` writes them, and they name no program.
+   it. Config is hashed as GIT parses it (never by a reader of our own,
+   which could disagree with git), minus the `branch.<name>.remote/merge`
+   keys the daemon's own `push -u` writes.
 
 The empty hooks dir and the trust store live in a daemon state dir. Same-
 user files are never truly private, so the hooks dir is re-emptied before
@@ -175,18 +176,46 @@ def hardened_git_env(
 # ---- the baseline ---------------------------------------------------------
 
 
-def _strip_branch_sections(config_text: str) -> str:
-    """Config text without `[branch "..."]` sections (the daemon writes those)."""
-    kept: list[str] = []
-    skipping = False
-    for line in config_text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("["):
-            skipping = stripped.lower().startswith("[branch")
-        if not skipping:
-            kept.append(line)
-    return "\n".join(kept)
+# Keys the daemon's own `git push -u` and `gh pr create` write. They are
+# excluded from the hash so the daemon does not quarantine itself; they
+# name a remote and a ref, never a program. Every OTHER branch.* key
+# (pushRemote, ...) is still hashed.
+_DAEMON_WRITTEN_BRANCH_KEYS: frozenset[str] = frozenset({"remote", "merge", "gh-merge-base"})
 
+
+def _is_daemon_written(key: str) -> bool:
+    return key.startswith("branch.") and key.rsplit(".", 1)[-1] in _DAEMON_WRITTEN_BRANCH_KEYS
+
+
+def config_entries(path: Path) -> list[tuple[str, str]] | None:
+    """`path`'s entries exactly as git parses them, or None if git can't.
+
+    Parsed BY GIT (`git config --file <path> --no-includes --null --list`),
+    never by our own reader: any difference between the two parsers is a
+    way to hide a key from the hash while git still honours it (#85 r2 N1:
+    a lone CR). `git config --file` only reads that one file; it runs no
+    hooks or helpers. Includes are not followed, but the `include.path`
+    keys themselves are entries, so adding one changes the hash.
+    """
+    env = hardened_git_env(keep_gh_credentials=False)
+    env["GIT_CEILING_DIRECTORIES"] = str(_state_dir().parent)
+    try:
+        proc = subprocess.run(
+            [resolved("git"), "config", "--file", str(path), "--no-includes", "--null", "--list"],
+            cwd=str(_state_dir()), capture_output=True, timeout=GIT_TIMEOUT_SEC,
+            check=False, env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    entries: list[tuple[str, str]] = []
+    for record in proc.stdout.decode("utf-8", errors="surrogateescape").split("\0"):
+        if not record:
+            continue
+        key, _, value = record.partition("\n")
+        entries.append((key, value))
+    return entries
 
 def common_dir_of(path: Path) -> Path | None:
     """The shared `.git` dir for a checkout or worktree root, or None.
@@ -220,29 +249,43 @@ def common_dir_of(path: Path) -> Path | None:
         return None
 
 
-def fingerprint(common_dir: Path) -> str:
-    """Hash of what can make git run a program: shared config + hooks.
+def _config_files(common_dir: Path) -> list[Path]:
+    """Every config file git may read for this repo or one of its worktrees."""
+    files = [common_dir / "config", common_dir / "config.worktree"]
+    worktrees = common_dir / "worktrees"
+    if worktrees.is_dir():
+        files += sorted(worktrees.glob("*/config.worktree"))
+    return files
 
-    Read straight from disk, never through git. `[branch]` sections are
-    excluded (the daemon's own `push -u` writes them; they name no program).
+
+def fingerprint(common_dir: Path) -> str:
+    """Hash of what can make git run a program: config (as git parses it) + hooks.
+
+    The daemon-written branch keys are excluded (see `_is_daemon_written`).
+    A config file git cannot parse is hashed as raw bytes, so any edit to
+    it still changes the hash. Per-worktree `config.worktree` files are
+    included: with `extensions.worktreeConfig` set, git reads them too.
     """
     digest = hashlib.sha256()
-    for name in ("config", "config.worktree"):
-        path = common_dir / name
-        digest.update(name.encode() + b"\0")
-        if path.is_file():
-            text = path.read_text(encoding="utf-8", errors="replace")
-            digest.update(_strip_branch_sections(text).encode("utf-8"))
-        else:
-            digest.update(b"<absent>")
-        digest.update(b"\0")
+    for path in _config_files(common_dir):
+        digest.update(str(path.relative_to(common_dir)).encode() + b"\0")
+        if not path.is_file():
+            digest.update(b"<absent>\0")
+            continue
+        entries = config_entries(path)
+        if entries is None:
+            digest.update(b"<unparsed>\0" + path.read_bytes() + b"\0")
+            continue
+        for key, value in entries:
+            if not _is_daemon_written(key):
+                digest.update(key.encode("utf-8", "surrogateescape") + b"\n"
+                              + value.encode("utf-8", "surrogateescape") + b"\0")
     hooks = common_dir / "hooks"
     if hooks.is_dir():
         for path in sorted(p for p in hooks.rglob("*") if p.is_file() and p.suffix != ".sample"):
             digest.update(str(path.relative_to(common_dir)).encode() + b"\0")
             digest.update(path.read_bytes() + b"\0")
     return digest.hexdigest()
-
 
 @dataclass
 class TrustRecord:
