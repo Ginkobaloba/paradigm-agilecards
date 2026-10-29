@@ -24,12 +24,19 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ..common.canonical_config import ENV_TIER_MAP_PATH, CanonicalConfigMissing, load_tier_map
 from ..common.envfile import ENV_FILE_VAR, load_dotenv
 from ..common.locks import FileLock, pid_alive
 from ..common.types import DaemonConfig, RuntimePaths
 from ..daemon import llm_capability
 from ..daemon.daemon import Daemon, DaemonAlreadyRunning
 from ..daemon.orphan import force_reclaim
+from ..providers.registry import (
+    KEYLESS_LOCAL_PROVIDERS,
+    LOCAL_BASE_URL_ENV,
+    base_url_problem,
+    tiers_needing_a_key,
+)
 from ..store import CardStatus, build_repository, default_store_spec
 from ..store.repository import CardRepository
 
@@ -338,6 +345,85 @@ def _open_store(args: argparse.Namespace) -> CardRepository:
     return repo
 
 
+def _anthropic_key_problem(args: argparse.Namespace) -> str | None:
+    """Why this `start` needs ANTHROPIC_API_KEY and lacks it, or None.
+
+    The key may be absent only when nothing would call Anthropic: the
+    reasoning-only `sdk` executor, no Claude reviewer, and every tier of
+    the map the WORKER will load resolving to a non-Anthropic provider
+    (the worker calls `load_tier_map()` with the same env, which the
+    spawner passes through). `sdk-tools` always needs it: the tool loop
+    is Anthropic-only, as the OpenAI-compatible adapter has no tool turns.
+    """
+    if args.invoker not in ("sdk", "sdk-tools") or os.environ.get("ANTHROPIC_API_KEY"):
+        return None
+    if args.invoker == "sdk-tools":
+        return "--invoker sdk-tools needs ANTHROPIC_API_KEY (the tool loop is Anthropic-only)"
+    for flag in ("sibling_reviewer", "amendment_reviewer"):
+        if getattr(args, flag, False):
+            return f"--{flag.replace('_', '-')} uses a Claude reviewer and needs ANTHROPIC_API_KEY"
+    tier_map = load_tier_map()
+    hosted = tiers_needing_a_key(tier_map.points_to_model_map())
+    if hosted:
+        named = ", ".join(
+            f"tier {points} ({model}, provider {provider})" for points, model, provider in hosted
+        )
+        return (
+            f"--invoker sdk without ANTHROPIC_API_KEY runs only keyless local "
+            f"providers ({', '.join(sorted(KEYLESS_LOCAL_PROVIDERS))}): {named} "
+            f"in {tier_map.source} is not one"
+        )
+    return None
+
+
+def _tier_map_problem() -> str | None:
+    """Why the tier map the worker will load is unusable, or None.
+
+    Checked once at start so a bad map is a clean refusal naming the
+    problem, not a traceback here or a failure on the first card. A SET
+    env var is a pin (canonical_config.load_tier_map), so broken YAML
+    raises rather than falling back to another map.
+    """
+    try:
+        tier_map = load_tier_map()
+    except CanonicalConfigMissing as exc:
+        return f"{ENV_TIER_MAP_PATH}: {exc}"
+    for points, entry in sorted(tier_map.tiers.items()):
+        model = entry.get("model")
+        if not isinstance(model, str) or not model.strip():
+            return f"tier {points} in {tier_map.source} has no `model`"
+    return None
+
+
+def _pin_worker_env() -> str | None:
+    """Make the env the worker inherits mean what the CLI checked, or say why not.
+
+    The worker runs in the card's worktree, not the CLI's cwd, so a
+    RELATIVE `CARDS_RUNNER_TIER_MAP_YAML` would resolve somewhere else
+    there, miss, and fall through to the repo-root Claude map: the CLI
+    approves a local map while the worker bills Claude. So it is made
+    absolute here, before the key check reads it, and the spawner passes
+    the absolute path on. A path that names no file is refused for the
+    same reason. Base URLs are forwarded past the env scrub, so one that
+    carries a credential is refused (the URL itself is not echoed).
+    """
+    raw = os.environ.get(ENV_TIER_MAP_PATH)
+    if raw:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = path.resolve()
+        if not path.is_file():
+            return f"{ENV_TIER_MAP_PATH} points at {path}, which is not a file"
+        os.environ[ENV_TIER_MAP_PATH] = str(path)
+    for name in LOCAL_BASE_URL_ENV:
+        url = os.environ.get(name)
+        if url:
+            why = base_url_problem(url)
+            if why:
+                return f"{name} {why}; it reaches the worker, so it must be an endpoint only"
+    return None
+
+
 def _cmd_start(args: argparse.Namespace) -> int:
     cfg_kwargs: dict[str, Any] = dict(
         todo_root=args.todo_root,
@@ -378,9 +464,15 @@ def _cmd_start(args: argparse.Namespace) -> int:
         if value is not None:
             cfg_kwargs[cfg_name] = value
     cfg = DaemonConfig(**cfg_kwargs)
-    if args.invoker in ("sdk", "sdk-tools") and not os.environ.get("ANTHROPIC_API_KEY"):
+    if args.invoker in ("sdk", "sdk-tools"):
+        env_problem = _pin_worker_env() or _tier_map_problem()
+        if env_problem is not None:
+            print(f"error: {env_problem}", file=sys.stderr)
+            return 2
+    key_problem = _anthropic_key_problem(args)
+    if key_problem is not None:
         print(
-            "error: --invoker sdk/sdk-tools needs ANTHROPIC_API_KEY in "
+            f"error: {key_problem}; set ANTHROPIC_API_KEY in "
             "the environment (or in a gitignored .env in the working "
             f"directory, or the file named by {ENV_FILE_VAR})",
             file=sys.stderr,

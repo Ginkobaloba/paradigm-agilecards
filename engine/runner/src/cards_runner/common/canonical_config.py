@@ -284,7 +284,17 @@ def load_tier_map(
     # FREE local map, never the paid Claude map: a misconfiguration must
     # not silently bill. `claude` is the one known paid map.
     embedded = _EMBEDDED_TIER_MAPS.get(provider, _EMBEDDED_TIER_MAP_LOCAL)
-    candidates = _candidate_paths(ENV_TIER_MAP_PATH, filename, path)
+    pinned = os.environ.get(ENV_TIER_MAP_PATH) if path is None else None
+    if pinned:
+        # A SET env var is a pin, not a hint: only that file counts, and a
+        # missing or broken one raises. Falling through to the repo-root
+        # map (or the embedded defaults) would let a map deleted or broken
+        # while the daemon runs turn the next worker into a Claude worker,
+        # which with a key means silent paid calls. Fallback is for unset.
+        strict = True
+        candidates = [Path(pinned).expanduser()]
+    else:
+        candidates = _candidate_paths(ENV_TIER_MAP_PATH, filename, path)
     found = _first_existing(candidates)
     if found is None:
         if strict:

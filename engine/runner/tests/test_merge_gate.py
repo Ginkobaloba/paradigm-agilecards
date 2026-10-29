@@ -464,3 +464,62 @@ def test_null_runner_returns_disabled_reason() -> None:
     assert null.push(Path("/tmp"), "x").reason == "gh disabled"
     assert null.open_pr(Path("/tmp"), title="t", body="b", base="main").reason == "gh disabled"
     assert null.merge_pr(Path("/tmp"), identifier="42").reason == "gh disabled"
+
+
+# ---- a pinned tier map that vanishes mid-run (#84 r3, item b) -----------
+
+
+@pytest.mark.parametrize("pr_gate", [True, False])
+def test_apply_blocks_the_card_when_the_pinned_tier_map_is_gone(
+    pr_gate: bool, repo: SqliteRepository, paths: RuntimePaths, todo_root: Path,
+    store_spec: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CARDS_RUNNER_TIER_MAP_YAML", str(tmp_path / "vanished.yaml"))
+    cfg = _cfg_pr_on(todo_root, store_spec)
+    if not pr_gate:
+        cfg = DaemonConfig(**{**cfg.__dict__, "pr_gate_enabled": False})
+    _insert(repo, "bTST-MG-nomap", points=2)
+    claim = _claim(repo, paths, "bTST-MG-nomap")
+    record = repo.get_card("bTST-MG-nomap")
+    assert record is not None
+    gh = FakeGhRunner()
+    out = MergeGate(cfg=cfg, gh=gh).apply(claim, record, verified_at="2026-10-28T20:00:00Z")
+    assert out.to_status == CardStatus.BLOCKED.value
+    assert out.merge_status == "blocked"
+    assert "tier map unavailable" in out.reason
+    assert gh.calls == []  # never pushed or merged on a guessed tier
+
+
+def test_daemon_lands_the_card_blocked_not_stuck_when_the_map_vanishes(
+    repo: SqliteRepository, paths: RuntimePaths, todo_root: Path, store_spec: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cards_runner.common.types import EXIT_CLEAN, WORKER_RESULT_NAME, PROJECTED_CARD_NAME
+    from cards_runner.daemon.daemon import _WorkerHandle
+    from cards_runner.store.projection import project_card_file
+
+    monkeypatch.setenv("CARDS_RUNNER_TIER_MAP_YAML", str(tmp_path / "vanished.yaml"))
+    cfg = _cfg_pr_on(todo_root, store_spec)
+    _insert(repo, "bTST-MG-nomap2", points=2)
+    attempt = "att-nomap"
+    repo.claim_card("bTST-MG-nomap2", claimed_by="tester", attempt_trace_id=attempt)
+    run_dir = paths.runs / attempt
+    worktree = run_dir / "worktree"
+    worktree.mkdir(parents=True, exist_ok=True)
+    card_file = run_dir / PROJECTED_CARD_NAME
+    project_card_file(repo.get_card("bTST-MG-nomap2"), card_file, verbatim=False)
+    (worktree / "anything").write_text("present", encoding="utf-8")
+    (run_dir / WORKER_RESULT_NAME).write_text('{"exit_code": 0}', encoding="utf-8")
+    claim = ClaimedCard(
+        card_id="bTST-MG-nomap2", attempt_trace_id=attempt, trace_id=attempt,
+        run_dir=run_dir, worktree_path=worktree, card_file=card_file,
+    )
+    gh = FakeGhRunner()
+    daemon = Daemon(cfg, repo=repo, gh=gh)
+    daemon._post_worker_exit(_WorkerHandle(claim=claim, process=object(), spawned_at=0.0), EXIT_CLEAN)  # type: ignore[arg-type]
+
+    card = repo.get_card("bTST-MG-nomap2")
+    assert card is not None
+    assert card.status == CardStatus.BLOCKED.value  # visible, not stuck in active
+    assert card.merge_status == "blocked"
+    assert gh.calls == []

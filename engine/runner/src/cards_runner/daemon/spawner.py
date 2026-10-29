@@ -17,9 +17,11 @@ import sys
 from pathlib import Path
 
 import cards_runner
+from ..common.canonical_config import ENV_TIER_MAP_PATH
 from ..common.env_scrub import scrub_environment
 from ..common.process_group import ManagedProcess, spawn_in_job
 from ..common.types import ClaimedCard, DaemonConfig
+from ..providers.registry import LOCAL_BASE_URL_ENV, base_url_problem
 
 
 log = logging.getLogger(__name__)
@@ -92,9 +94,11 @@ def spawn_worker(
         if api_key:
             injected["ANTHROPIC_API_KEY"] = api_key
         else:
-            log.error(
-                "invoker=sdk but ANTHROPIC_API_KEY is not set in the "
-                "daemon environment; the SDK worker will fail to start"
+            # The CLI already refused unless every tier is non-Anthropic
+            # (cli._anthropic_key_problem), so this is an all-local run.
+            log.info(
+                "invoker=sdk without ANTHROPIC_API_KEY; only "
+                "non-Anthropic tiers can run"
             )
         # Optional executor knobs: pass through only when set, so the
         # worker's `SdkInvoker.from_env` defaults otherwise apply.
@@ -108,10 +112,32 @@ def spawn_worker(
             # sets this in the daemon environment.
             "CARDS_RUNNER_USE_TOOLS",
             "CARDS_RUNNER_MAX_TOOL_TURNS",
+            # Which tier map the worker loads. Without it the scrub drops
+            # it, so the worker silently loads the default (Claude) map
+            # while the CLI checked a local one. The CLI made it absolute
+            # (cli._pin_worker_env): the worker's cwd is the worktree.
+            ENV_TIER_MAP_PATH,
         ):
             value = os.environ.get(passthrough)
             if value:
+                if passthrough == ENV_TIER_MAP_PATH:
+                    # Absolute here too, not only in the CLI, so any direct
+                    # caller of spawn_worker is covered: the worker's cwd is
+                    # the worktree, where a relative path would miss.
+                    value = str(Path(value).expanduser().resolve())
                 injected[passthrough] = value
+        # Where the keyless local providers listen. Endpoints only: a URL
+        # carrying a credential is never forwarded (the CLI refuses one at
+        # start; this guards any other caller of spawn_worker).
+        for name in LOCAL_BASE_URL_ENV:
+            url = os.environ.get(name)
+            if not url:
+                continue
+            why = base_url_problem(url)
+            if why:
+                log.error("not passing %s to the worker: %s", name, why)
+                continue
+            injected[name] = url
     if extra_env:
         injected.update(extra_env)
 

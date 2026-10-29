@@ -31,7 +31,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from ..common.canonical_config import TierMap, load_tier_map
+from ..common.canonical_config import CanonicalConfigMissing, TierMap, load_tier_map
 from ..common.project_config import MergeGateRelaxation, ProjectConfig
 from ..common.types import ClaimedCard, DaemonConfig
 from ..store import CardRecord, CardStatus
@@ -138,9 +138,23 @@ class MergeGate:
         relaxation = (
             project_config.merge_gate if project_config else None
         )
-        decision = decide_gate(
-            record, tier_map=self.tier_map, relaxation=relaxation
-        )
+        try:
+            decision = decide_gate(
+                record, tier_map=self.tier_map, relaxation=relaxation
+            )
+        except CanonicalConfigMissing as exc:
+            # A pinned tier map (CARDS_RUNNER_TIER_MAP_YAML) deleted or
+            # broken while the daemon runs. The loader refuses to fall back
+            # to the Claude map, so the card cannot be gated: land it
+            # visibly `blocked` with the reason, never silently stuck in
+            # `active` and never auto-merged on a guessed tier.
+            return MergeOutcome(
+                decision="human_review",
+                to_status=CardStatus.BLOCKED.value,
+                merge_status=_MS_BLOCKED,
+                reason=f"tier map unavailable, cannot gate: {exc}",
+                extra_payload={"error": "tier_map_unavailable"},
+            )
 
         if not self.cfg.pr_gate_enabled:
             # PR gate not wired (the default until a project opts in).

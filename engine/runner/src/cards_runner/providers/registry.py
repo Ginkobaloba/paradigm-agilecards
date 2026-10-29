@@ -9,7 +9,10 @@ secrets), with safe defaults for the well-known local ones.
 from __future__ import annotations
 
 import os
+import re
+from collections.abc import Mapping
 from typing import Any
+from urllib.parse import urlsplit
 
 from .anthropic_adapter import AnthropicAdapter
 from .base import PostJson, ProviderAdapter, urllib_post_json
@@ -56,6 +59,68 @@ def split_model(model_id: str) -> tuple[str, str]:
         if low.startswith(prefix):
             return provider, model_id[len(prefix):]
     return "anthropic", model_id
+
+
+# Providers a worker can call with no credential at all. openai, gemini
+# and azure are NOT here: they need a key the spawner never forwards, so a
+# map using them is not keyless even though it is not Anthropic.
+KEYLESS_LOCAL_PROVIDERS: frozenset[str] = frozenset({"ollama", "vllm", "local"})
+
+# Their endpoints, the only provider env the spawner forwards to a worker.
+# ENDPOINTS ONLY (see base_url_problem): a path is allowed by design, so a
+# secret placed in the path is not caught here. Keyless local servers need
+# none; never put one there (documented in engine/runner/.env.example).
+LOCAL_BASE_URL_ENV: tuple[str, ...] = tuple(
+    f"CARDS_RUNNER_{p.upper()}_BASE_URL" for p in sorted(KEYLESS_LOCAL_PROVIDERS)
+)
+
+
+def tiers_needing_a_key(points_to_model: Mapping[int, str]) -> list[tuple[int, str, str]]:
+    """The `(points, model_id, provider)` tiers a keyless worker cannot run.
+
+    Empty means every tier routes to a keyless local provider, so the map
+    can start without ANTHROPIC_API_KEY. Decided by `split_model`, the same
+    routing `build_adapter` uses, so this cannot drift from where a call
+    actually goes.
+    """
+    hits = []
+    for points, model in sorted(points_to_model.items()):
+        provider = split_model(model)[0]
+        if provider not in KEYLESS_LOCAL_PROVIDERS:
+            hits.append((points, model, provider))
+    return hits
+
+
+_HOST_PORT = re.compile(r"^[A-Za-z0-9.\-]+(:[0-9]{1,5})?$|^\[[0-9A-Fa-f:.]+\](:[0-9]{1,5})?$")
+
+
+def base_url_problem(url: str) -> str | None:
+    """Why `url` must not be passed to a worker, or None if it is clean.
+
+    An ALLOWLIST, not a list of suspicious names: a base URL is forwarded
+    to the worker verbatim, past the env scrub that exists to keep
+    credentials out, and a local endpoint is only ever
+    `http(s)://host[:port][/path]`. So any userinfo, query, fragment or
+    `;` parameter is refused outright, whatever it is called (key, jwt,
+    bearer, sas, ...). The reasons never quote the URL.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "is not a parseable URL"
+    if parts.scheme not in ("http", "https"):
+        return "must use http or https"
+    if "@" in parts.netloc:
+        return "must not carry userinfo"
+    if not _HOST_PORT.match(parts.netloc):
+        return "must name only a host and optional port"
+    if parts.query or "?" in url:
+        return "must not carry a query string"
+    if parts.fragment or "#" in url:
+        return "must not carry a fragment"
+    if ";" in parts.path:
+        return "must not carry ';' parameters"
+    return None
 
 
 def _env(provider: str, suffix: str) -> str | None:
