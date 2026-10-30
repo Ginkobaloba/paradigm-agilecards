@@ -111,8 +111,13 @@ than edited there:
 
 - **pass@1** is over exam card-runs that are not infra errors; next to it,
   the same passes over all exam card-runs (errors as fails) and the infra
-  error count. **pass^3** is over cards with no infra error; the number left
-  out is reported. Both controls (bk-04, bk-09) must never pass.
+  error count. **pass^3** is over all 10 exam cards, an errored card counting
+  as a fail; `pass_pow_3_clean_cards` is the protocol's figure over cards
+  with no infra error, with the number left out. Both controls (bk-04,
+  bk-09) must never pass.
+- An arm is run at 3 runs and a 1800 s request timeout (PROTOCOL.md names a
+  timeout but no number). Any other `--runs` or `--timeout` is listed in
+  `config.off_protocol` and makes the arm invalid.
 - Each card-run has exactly one outcome: pass, parse failure, truncated, AC
   failure, verifier timeout, forged, model timeout or infra error.
 - `config` in `summary.json` holds the Ollama version, the digest and every

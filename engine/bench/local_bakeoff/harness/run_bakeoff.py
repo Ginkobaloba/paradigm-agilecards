@@ -91,6 +91,10 @@ ARMS = {
 NUM_CTX = 32768
 NUM_PREDICT = 26624
 SEED_BASE = 20261029  # + run index: one seed per run, the same for every card and arm
+RUNS = 3  # PROTOCOL.md: pass^3 is the share of cards passing in all 3 runs
+# PROTOCOL.md names a request timeout but no number; this is the value every
+# arm runs at (harness/README.md).
+REQUEST_TIMEOUT_SEC = 1800.0
 # The first release that applies GGUF sampling defaults (PROTOCOL.md v2).
 MIN_OLLAMA = (0, 34, 0)
 LABEL = "text-mode, harness-applied: measures the model's coding output, not the runner pipeline."
@@ -1071,11 +1075,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="Ollama tag; defaults to the arm's pinned tag (ARMS)")
     ap.add_argument("--allow-off-tag", action="store_true",
                     help="run a model other than the arm's pinned tag (labeled as such)")
-    ap.add_argument("--runs", type=int, default=3)
+    ap.add_argument("--runs", type=int, default=RUNS)
     ap.add_argument("--host", default="http://127.0.0.1:11434")
     ap.add_argument("--num-ctx", type=int, default=NUM_CTX)
     ap.add_argument("--gpu-index", type=int, default=0, help="nvidia-smi GPU for VRAM reads")
-    ap.add_argument("--timeout", type=float, default=1800.0,
+    ap.add_argument("--timeout", type=float, default=REQUEST_TIMEOUT_SEC,
                     help="seconds per model request; exceeding it is a model failure")
     lease = ap.add_mutually_exclusive_group(required=True)
     lease.add_argument("--lease-gb", type=float, help="re-run under with_lease.py")
@@ -1098,6 +1102,10 @@ def main(argv: list[str] | None = None) -> int:
         off_protocol.append(f"model {args.model!r}, not the arm's tag {pinned!r}")
     if args.num_ctx != NUM_CTX:
         off_protocol.append(f"num_ctx {args.num_ctx}, not {NUM_CTX}")
+    if args.runs != RUNS:  # pass^3 means nothing at another run count
+        off_protocol.append(f"runs {args.runs}, not {RUNS}")
+    if args.timeout != REQUEST_TIMEOUT_SEC:
+        off_protocol.append(f"timeout {args.timeout:g} s, not {REQUEST_TIMEOUT_SEC:g}")
     for why, problems in (
             ("the runner or harness source differs from HEAD, so the labels would not "
              "name what scored the run", scorer_problems()),

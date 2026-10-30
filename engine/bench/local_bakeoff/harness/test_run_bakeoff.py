@@ -940,6 +940,42 @@ def test_a_digest_change_during_the_arm_invalidates_it(tmp_path: Path, flip_afte
     assert all(r["digest"] for r in rows)
 
 
+def test_an_unreadable_digest_after_a_card_run_invalidates(tmp_path: Path) -> None:
+    """N3b: a None read (the tag gone, or /api/tags down) counts as a change."""
+    cards = [c for c in rb.load_cards() if c.card_id == "bk-01"]
+
+    class Gone(_Digests):
+        def digest(self) -> str | None:
+            self.reads += 1
+            return None if self.reads > 1 else "c" * 64
+
+    summary = rb.run_arm(arm="T", client=Gone(None), runs=1, out_dir=tmp_path / "out",
+                         vram=NoVram(), probe=False, cards=cards, config={"digest": "c" * 64})
+    assert any("digest changed" in r and "None" in r for r in summary["invalid_reasons"])
+
+
+@pytest.mark.parametrize("argv,expected", [
+    (["--allow-off-tag", "--model", "qwen3:32b"],
+     ["model 'qwen3:32b', not the arm's tag 'qwen3:30b'"]),  # F8c
+    (["--runs", "1"], ["runs 1, not 3"]),
+    (["--timeout", "60"], ["timeout 60 s, not 1800"]),
+    ([], []),  # control: the protocol run is not flagged
+])
+def test_main_lists_every_off_protocol_setting(monkeypatch: pytest.MonkeyPatch,
+                                               argv: list[str], expected: list[str]) -> None:
+    reached: list[dict[str, Any]] = []
+    for name in ("scorer_problems", "frozen_tree_problems", "results_problems",
+                 "positive_control"):
+        monkeypatch.setattr(rb, name, lambda: [])
+    monkeypatch.setattr(rb.OllamaClient, "describe",
+                        lambda self: {"model": self.name, "ollama_version": "0.40.13",
+                                      "digest": "c" * 64})
+    monkeypatch.setattr(rb, "run_arm", lambda **kw: reached.append(kw) or {"arm_valid": True})
+    monkeypatch.setattr(rb, "render_md", lambda s: "")
+    rb.main(["--arm", "A", "--no-lease", *argv])
+    assert reached[0]["config"]["off_protocol"] == expected
+
+
 def test_a_block_ntfs_folds_into_tests_is_a_flag_not_a_crash(tmp_path: Path) -> None:
     """I-F7: `tests./x.py` raised FileNotFoundError in suspect_hits and killed the arm."""
     cards = [c for c in rb.load_cards() if c.card_id == "bk-01"]
