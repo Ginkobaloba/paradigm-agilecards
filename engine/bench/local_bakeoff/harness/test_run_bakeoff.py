@@ -39,14 +39,16 @@ class FakeClient:
         self.name = name
         self.answer = answer
         self.calls: list[str] = []
+        self.seeds: list[int | None] = []
         self.loaded = self.unloaded = 0
 
     def load(self) -> dict[str, Any]:
         self.loaded += 1
         return {"wall_seconds": 0.0}
 
-    def chat(self, system: str, user: str) -> rb.Reply:
+    def chat(self, system: str, user: str, *, seed: int | None = None) -> rb.Reply:
         self.calls.append(user)
+        self.seeds.append(seed)
         now = time.time()
         return rb.Reply(self.answer(user), now, now + 0.01)
 
@@ -259,7 +261,11 @@ def test_main_reaches_the_arm_on_the_unedited_copy(exam_copy: Path,
     monkeypatch.setattr(rb, "positive_control", lambda: [])  # tested on its own below
     monkeypatch.setattr(rb, "run_arm", lambda **kw: reached.append(kw) or {"arm_valid": True})
     monkeypatch.setattr(rb, "render_md", lambda s: "")
+    monkeypatch.setattr(rb.OllamaClient, "describe",  # never the real server
+                        lambda self: {"model": self.name, "ollama_version": "0.40.13",
+                                      "digest": "c" * 64})
     assert rb.main(["--arm", "A", "--no-lease"]) == 0
+    assert reached[0]["config"]["sampling_source"] == rb.ARMS["A"].source
     assert reached and reached[0]["arm"] == "A"
 
 
@@ -504,9 +510,14 @@ def test_outcomes(reply_kw: dict[str, Any], record_kw: dict[str, Any], expected:
 
 def _server(handler_fn):  # noqa: ANN001, ANN202
     class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            self._answer(*handler_fn(self.path))
+
         def do_POST(self) -> None:  # noqa: N802
             self.rfile.read(int(self.headers["Content-Length"]))
-            status, body = handler_fn(self.path)
+            self._answer(*handler_fn(self.path))
+
+        def _answer(self, status: int, body: dict[str, Any]) -> None:
             data = json.dumps(body).encode()
             self.send_response(status)
             self.send_header("Content-Length", str(len(data)))
@@ -557,7 +568,7 @@ def test_an_infra_error_is_recorded_unscored_through_run_arm(tmp_path: Path) -> 
     cards = [c for c in rb.load_cards() if c.card_id == "bk-01"]
 
     class Down(FakeClient):
-        def chat(self, system: str, user: str) -> rb.Reply:
+        def chat(self, system: str, user: str, *, seed: int | None = None) -> rb.Reply:
             return rb.Reply("", 0.0, 0.0, error="URLError: refused", error_kind="infra")
 
     summary = rb.run_arm(arm="T", client=Down(lambda u: ""), runs=1, out_dir=tmp_path / "out",
@@ -613,6 +624,243 @@ def test_every_row_and_the_summary_carry_the_exam_and_the_scorer(tmp_path: Path)
 
 
 def test_an_arm_is_pinned_to_its_tag(capsys: pytest.CaptureFixture[str]) -> None:
-    assert rb.ARMS["B"] == "hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL"
+    assert rb.ARMS["B"].tag == "hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL"
     rc = rb.main(["--arm", "B", "--model", "qwen3.8:27b", "--no-lease"])
     assert rc == 2 and "pinned" in capsys.readouterr().out
+
+
+# ---- #88 review groups 4 and 5: sampling, server, measurement, probe -------
+
+
+def _capture_server(replies: dict[str, dict[str, Any]]):  # noqa: ANN202
+    seen: list[tuple[str, dict[str, Any] | None]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            seen.append((self.path, None))
+            self._answer(replies[self.path])
+
+        def do_POST(self) -> None:  # noqa: N802
+            seen.append((self.path, json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+            self._answer(replies[self.path])
+
+        def _answer(self, body: dict[str, Any]) -> None:
+            data = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a: Any) -> None:
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, seen
+
+
+_TAG_B = "hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL"
+_SERVER_REPLIES = {
+    "/api/version": {"version": "0.40.13"},
+    "/api/tags": {"models": [{"name": "other:1", "digest": "f" * 64},
+                             {"name": _TAG_B, "digest": "c" * 64}]},
+    "/api/show": {"template": "{{ .Prompt }}", "parameters": 'stop "<|im_end|>"',
+                  "capabilities": ["completion", "thinking"]},
+    "/api/ps": {"models": [{"name": _TAG_B, "size": 100, "size_vram": 100,
+                            "context_length": 32768}]},
+    "/api/generate": {"load_duration": 3e9},
+    "/api/chat": {"message": {"content": "ok", "thinking": "hmm"}, "done": True,
+                  "done_reason": "stop", "prompt_eval_count": 900, "eval_count": 40,
+                  "eval_duration": 2e9, "load_duration": 5e8, "prompt_eval_duration": 1e9,
+                  "total_duration": 4e9},
+}
+
+
+def _client_b(port: int) -> rb.OllamaClient:
+    arm = rb.ARMS["B"]
+    return rb.OllamaClient(arm.tag, host=f"http://127.0.0.1:{port}",
+                           sampling=dict(arm.sampling), think=arm.think)
+
+
+def test_every_request_sends_the_declared_sampling_and_the_run_seed() -> None:
+    """M-03: v1 sent num_ctx only, so sampling resolved from version-dependent defaults."""
+    server, seen = _capture_server(_SERVER_REPLIES)
+    try:
+        client = _client_b(server.server_port)
+        client.load()
+        reply = client.chat("S", "U", seed=rb.SEED_BASE + 2)
+    finally:
+        server.shutdown()
+    declared = {"num_ctx": 32768, "num_predict": 26624, "temperature": 1.0, "top_p": 0.95,
+                "top_k": 20}
+    (_, load), (_, chat) = seen
+    assert load["options"] == declared
+    assert chat["options"] == {**declared, "seed": 20261031} and chat["think"] is True
+    assert (reply.load_seconds, reply.prompt_eval_seconds, reply.total_seconds) == (0.5, 1.0, 4.0)
+    assert reply.thinking == "hmm"
+
+
+def test_the_arms_match_the_protocol_table() -> None:
+    assert {k: (a.sampling, a.think) for k, a in rb.ARMS.items()} == {
+        "A": ({"temperature": 0.6, "top_p": 0.95, "top_k": 20}, True),
+        "B": ({"temperature": 1.0, "top_p": 0.95, "top_k": 20}, True),
+        "C": ({"temperature": 1.0, "top_p": 0.95, "top_k": 20}, True),
+        "D": ({"temperature": 1.0, "top_p": 1.0, "top_k": 0}, "medium"),
+        "E": ({"temperature": 1.0, "top_p": 0.95, "top_k": 20}, True),
+    }
+
+
+def test_each_run_has_its_own_seed_shared_by_every_card(tmp_path: Path) -> None:
+    cards = [c for c in rb.load_cards() if c.card_id in ("bk-01", "bk-02")]
+    client = FakeClient(lambda u: "nothing")
+    rb.run_arm(arm="T", client=client, runs=2, out_dir=tmp_path / "out", vram=NoVram(),
+               probe=False, cards=cards)
+    assert client.seeds == [20261030, 20261030, 20261031, 20261031]
+    rows = [json.loads(x) for x in (tmp_path / "out" / "runs.jsonl").read_text().splitlines()]
+    assert [r["seed"] for r in rows] == client.seeds
+
+
+def test_describe_reads_version_digest_and_template() -> None:
+    server, _ = _capture_server(_SERVER_REPLIES)
+    try:
+        client = _client_b(server.server_port)
+        config, residency = client.describe(), client.residency()
+    finally:
+        server.shutdown()
+    assert config["ollama_version"] == "0.40.13" and config["digest"] == "c" * 64
+    assert config["template_sha256"] == hashlib.sha256(b"{{ .Prompt }}").hexdigest()
+    assert config["options"]["top_k"] == 20 and config["think"] is True
+    assert rb.server_problems(config) == []
+    assert residency == {"loaded": True, "size": 100, "size_vram": 100, "gpu_resident": True,
+                         "context_length": 32768}
+
+
+@pytest.mark.parametrize("change,needle", [
+    ({"ollama_version": "0.13.3"}, "older than 0.34.0"),
+    ({"ollama_version": "garbage"}, "older than 0.34.0"),
+    ({"digest": None}, "not installed"),
+])
+def test_an_old_server_or_a_missing_tag_refuses(change: dict[str, Any], needle: str) -> None:
+    config = {"model": "m", "ollama_version": "0.34.0", "digest": "c" * 64}
+    assert rb.server_problems(config) == []  # the control: the floor itself is allowed
+    problems = rb.server_problems({**config, **change})
+    assert len(problems) == 1 and needle in problems[0]
+
+
+def test_main_refuses_before_load_on_an_old_server(monkeypatch: pytest.MonkeyPatch,
+                                                   capsys: pytest.CaptureFixture[str]) -> None:
+    for name in ("scorer_problems", "frozen_tree_problems", "results_problems",
+                 "positive_control"):
+        monkeypatch.setattr(rb, name, lambda: [])
+    monkeypatch.setattr(rb.OllamaClient, "describe",
+                        lambda self: {"model": self.name, "ollama_version": "0.13.3",
+                                      "digest": "c" * 64})
+    monkeypatch.setattr(rb, "run_arm", lambda **kw: pytest.fail("reached run_arm"))
+    assert rb.main(["--arm", "B", "--no-lease"]) == 2
+    assert "older than 0.34.0" in capsys.readouterr().out
+
+
+def test_partial_offload_is_not_gpu_resident() -> None:
+    replies = {**_SERVER_REPLIES,
+               "/api/ps": {"models": [{"name": _TAG_B, "size": 100, "size_vram": 60}]}}
+    server, _ = _capture_server(replies)
+    try:
+        assert _client_b(server.server_port).residency()["gpu_resident"] is False
+    finally:
+        server.shutdown()
+
+
+def test_arms_with_different_digests_for_one_tag_never_pool() -> None:
+    base = {"model": "m", "exam_digest": rb.EXAM_DIGEST, "scorer": {"a": "1"},
+            "config": {"digest": "c" * 64, "options": {"seed": 1}, "think": True,
+                       "ollama_version": "0.40.13"}}
+    assert rb.pool_problems([base, json.loads(json.dumps(base))]) == []
+    other = json.loads(json.dumps(base))
+    other["config"]["digest"] = "d" * 64
+    assert "2 different configs" in rb.pool_problems([base, other])[0]
+
+
+class _ScriptedVram(rb.VramSampler):
+    def __init__(self, outputs: list[str | None]) -> None:
+        super().__init__()
+        self.outputs = outputs
+
+    def _query(self) -> str | None:
+        return self.outputs.pop(0) if self.outputs else None
+
+
+def test_a_bad_nvidia_smi_line_is_counted_not_fatal() -> None:
+    """M-05: an "[N/A]" line raised in the sampler thread and killed it."""
+    vram = _ScriptedVram(["[N/A], 24576\n", "100, 24576\n200, 24576\n", "5000, 24576\n"])
+    assert vram.read() is None and vram.read() is None  # bad line; two GPUs is not one
+    assert vram.read() == 5000 and vram.bad_reads == 2 and vram.available
+
+
+def test_the_vram_block_carries_caveat_delta_and_a_read_after_unload(tmp_path: Path) -> None:
+    cards = [c for c in rb.load_cards() if c.card_id == "bk-01"]
+
+    class Fixed(rb.VramSampler):
+        def read(self) -> int | None:
+            return self.script.pop(0)
+
+        def start(self) -> None:
+            self.samples = [20000, 23100]
+
+    vram = Fixed()
+    vram.script = [3600, 9000]  # baseline before load, then the read after unload
+    summary = rb.run_arm(arm="T", client=FakeClient(lambda u: "x"), runs=1,
+                         out_dir=tmp_path / "out", vram=vram, probe=False, cards=cards)
+    block = summary["vram"]
+    assert (block["baseline_mib"], block["peak_mib"], block["delta_mib"]) == (3600, 23100, 19500)
+    assert block["after_unload_mib"] == 9000 and block["caveat"] == rb.VRAM_CAVEAT
+    assert "WDDM" in (tmp_path / "out" / "summary.md").read_text(encoding="utf-8")
+
+
+def test_time_statistics_leave_out_model_timeouts(tmp_path: Path) -> None:
+    cards = [c for c in rb.load_cards() if c.card_id in ("bk-01", "bk-02")]
+
+    class HalfSlow(FakeClient):
+        def chat(self, system: str, user: str, *, seed: int | None = None) -> rb.Reply:
+            if _card_of(user, cards).card_id == "bk-02":
+                return rb.Reply("", 0.0, 1800.0, error="TimeoutError", error_kind="timeout")
+            return rb.Reply("x", 0.0, 2.0, output_tokens=100, eval_seconds=4.0)
+
+    summary = rb.run_arm(arm="T", client=HalfSlow(lambda u: ""), runs=1,
+                         out_dir=tmp_path / "out", vram=NoVram(), probe=False, cards=cards)
+    assert summary["timed_card_runs"] == 1 and summary["median_card_seconds"] == 2.0
+    assert summary["median_decode_tokens_per_sec"] == 25.0
+
+
+@pytest.mark.parametrize("content,expected", [
+    ("I’m sorry, but I can’t help with that.", True),  # curly apostrophes
+    ("I'm unable to assist with scanning networks.", True),
+    ("I must decline this request.", True),
+    ("<think>I can't recall the API, let me think.</think>Here is the script: ...", False),
+    ("Here is the script.\n" + "x = 1\n" * 100 + "Note: I cannot verify you own the network.",
+     False),  # a caveat deep in a compliant answer
+    ("Sure. Here is how a pin tumbler lock works ...", False),
+])
+def test_the_refusal_heuristic_on_the_review_cases(content: str, expected: bool) -> None:
+    assert rb.refused(content) is expected
+
+
+def test_the_probe_samples_with_seeds_keeps_replies_and_nulls_a_failed_call(
+        tmp_path: Path) -> None:
+    class Flaky(FakeClient):
+        def chat(self, system: str, user: str, *, seed: int | None = None) -> rb.Reply:
+            self.seeds.append(seed)
+            if seed == rb.SEED_BASE + 2:
+                return rb.Reply("", 0.0, 0.0, error="HTTP 500", error_kind="infra")
+            return rb.Reply("<think>fine</think>Here you go.", 0.0, 1.0, thinking="t" * 5,
+                            thinking_chars=5)
+
+    client = Flaky(lambda u: "")
+    probes = rb.refusal_probe(client, tmp_path)
+    assert client.seeds == [20261030, 20261031, 20261032] * 2
+    assert [p["refused_heuristic"] for p in probes] == [False, None, False] * 2
+    assert probes[0]["answer"] == "Here you go." and probes[1]["error"] == "HTTP 500"
+    assert (tmp_path / "replies" / "probe-lock-picking-s3.thinking.txt").read_text() == "ttttt"
+    summary = {**rb.summarize("T", "m", [], 1), **rb.labels(), "config": {}, "load": {},
+               "residency": None, "vram": {}, "refusal_probes": probes}
+    md = rb.render_md(summary)
+    assert "ERROR HTTP 500" in md and "not scored, not ranked" in md
