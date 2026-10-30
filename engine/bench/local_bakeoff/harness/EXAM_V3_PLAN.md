@@ -49,16 +49,12 @@ negative controls, 3 runs each. Class 2 is a separate sub-exam with its own
      fails half the class.
    (The other shape, several readings all accepted, was dropped: it loosens
    scoring and adds to saturation.)
-4. **Real failures.** Cards drawn from tasks that failed in real AgileCards
-   use. **Not available to this seat yet:** they have to be sourced from the
-   runner's own records (blocked or failed cards, verifier rejections, ledger
-   entries), rewritten against the seed repo, with provenance noted per card.
-   None will be invented. Only AgileCards' own history is a valid source.
-   **Selection bias:** a failure of `qwen3:30b` is a card chosen for A's
-   blind spot. So this class takes failures from whatever model ran the
-   task, records which model failed it, and is reported per class with that
-   provenance next to it, never folded silently into A's rank. This class
-   waits on someone with access to those records naming candidates.
+4. **Real failures.** Real defects that fleet seats shipped and an
+   independent verify caught, taken from AgileCards' own ledgers and verify
+   reports (see "Decisions"). Each card has its own buggy context and
+   held-out tests, with the bug's author model recorded. **Selection bias:**
+   a defect is chosen for its author's blind spot. So provenance sits next to
+   the class's results, and it's never folded silently into one arm's rank.
 
 **Controls.** At least 3 negative controls, all scored by file checks the
 harness evaluates in Python, as in v2. At least one is an impossible
@@ -127,11 +123,22 @@ draft and the v2 numbers, and each is folded in above:
   scored by the visible suite
   invited vacuous self-written tests.
 
-## Decisions needed before writing cards
+## Decisions (Daedalus, 2026-10-30)
 
-- The long-context sub-exam's `num_ctx` and its lease. That's a protocol call
-  for Daedalus, or Drew if it changes the lease budget.
-- Who sources the real-failure cards, and from which records.
-- Whether arm D is in the v3 field. On this machine it needs about 72.5 GB of
-  commit free to load (`RESULTS_EXAM_V2.md`), which is a machine-configuration
-  call for Drew.
+- **Long-context sub-exam:** `num_ctx` 65536. Each arm takes the lease it
+  measures, up to 22 GB, only in an announced window with Studio confirmed
+  idle. GPU residency is reported per arm, and offload is part of this
+  sub-exam's result, never pooled with the main exam's. An arm that can't
+  hold 64K resident at 22 GB is reported "doesn't fit at 64K". The context
+  is never shrunk to make an arm fit.
+- **Real-failure cards:** drawn from real defects that fleet seats shipped
+  and an independent verify then caught (ledgers and verify reports). Each
+  card carries the original task, the buggy context, held-out tests, and the
+  provenance (which model wrote the bug).
+- **Author:** Curie writes and freezes the v3 cards. The harness author
+  (PromptBuilder) doesn't write the exam it grades: that's the author-as-judge
+  problem. PromptBuilder supplies the card format and harness constraints
+  (`CARD_FORMAT_V3.md`), builds the harness features that format needs before
+  any card exists, and sees the cards only after the freeze.
+- **Arm D:** out of v3 until Drew decides on the machine configuration
+  (pagefile or apps).
