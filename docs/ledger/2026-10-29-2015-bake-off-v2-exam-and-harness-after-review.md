@@ -1,0 +1,15 @@
+# 2026-10-29 20:15 CDT - bake-off v2: exam re-frozen and harness fixed after the review
+- **Who:** PromptBuilder seat (Claude Opus 5.5), at Daedalus's request after the independent review of #88 (FIX FIRST: 6 high, 18 medium, none refuted), with Daedalus's acceptance of all ten v2 decisions.
+- **Change:**
+  - Exam v2 (c29435d, frozen at 2594c81, pushed 2026-10-29T22:17:51Z before any arm ran): identity is a content digest, not a commit; whole-file ACs on bk-05 and bk-08; a forgery canary; PROTOCOL.md v2 (outcomes, the 10% infra cap, the positive control, declared sampling, A2, measurement). CHANGELOG.md lists what changed.
+  - Scoring (b0e98b0, 8d5039e): the verifier runs in a Job Object child with a wall-clock limit; the canary decides forgery; one outcome per card-run; infra errors are not answers; the arm is invalid on the declared conditions; the reference solutions are scored before any model loads.
+  - Groups 4 and 5 (ee4c10d and this commit): each arm's sampling and think setting, `num_predict` and the run seed sent on every request; the Ollama version floor, the digest, template hash and residency recorded; arms never pooled across configs; per-row durations, with any model load taken out of a card-run's time; one GPU's VRAM with its caveat, a delta and a read after unload; a refusal probe on stripped answers, seeded and sampled, with a failed call recorded as null.
+  - Two departures from PROTOCOL.md's wording, declared in harness/README.md because the protocol is frozen: the digest comes from /api/tags (/api/show has none on 0.40.13), and D's "(none)" top_k is sent as 0.
+- **Why:** the review showed the v1 harness could not tell a hang, a forgery, an infra error or a sampling difference from a model's skill. No model had run, so everything was fixed before any data.
+- **State after:**
+  - Harness tests: 133 pass, ruff clean.
+  - Groups 4 and 5: 16 targeted mutants, all killed. One was first written against an ambiguous anchor and was rerun with a unique one.
+  - Still weak, and stated so: the refusal probe has two prompt families and none an aligned model is expected to refuse, so it supports no E-vs-baseline claim. B vs E differs by the abliteration and by the requantization of the ablated tensors.
+  - The Ollama server is 0.40.13 (self-updated from 0.13.3 at the 03:28 Windows Update restart). The model store is on the HDD, so cold loads are slow; they are timed apart.
+  - No arm has run. Next: an independent re-review.
+- **Refs:** C:\Users\Drama\AppData\Local\Temp\claude\C--dev\9d799f8e-f7bc-4e2f-ac99-2c7f2f117055\scratchpad\review-ac88\REVIEW_pr88.md; engine/bench/local_bakeoff/PROTOCOL.md "v2"; engine/bench/local_bakeoff/CHANGELOG.md; engine/bench/local_bakeoff/harness/README.md; engine/bench/local_bakeoff/harness/run_bakeoff.py; engine/bench/local_bakeoff/harness/test_run_bakeoff.py

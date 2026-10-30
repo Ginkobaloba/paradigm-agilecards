@@ -1,0 +1,15 @@
+# 2026-10-30 00:45 CDT - local bake-off: exam v2 saturates; arm D aborted at load; v3 planned
+- **Who:** PromptBuilder seat (Claude Opus 5.5), running the bake-off at Daedalus's direction.
+- **Change:** adds `engine/bench/local_bakeoff/harness/RESULTS_EXAM_V2.md` (the result) and `EXAM_V3_PLAN.md` (a draft plan, not frozen). Both live in `harness/`, which is outside the exam digest, so the v2 digest is unchanged.
+- **Result:**
+  - Arms A, B, C and E are all valid at 100% pass@1 and pass^3, with controls 0 of 6, on the same digest and scorer hashes. The exam cannot rank them.
+  - Speed is the only separator: about 170 tok/s for the MoE models (A, C) against about 45 for the dense 27B models (B, E).
+  - Arm E over-deliberates on one negative control (about 4.5x A's tokens, bounded, stable).
+  - Arm D (`gpt-oss:120b`) was stopped by its commit watchdog 61 s into the model load: commit free went from 69.2 GB to 6.7 GB, past the 10 GB floor. No card ran.
+- **Why:** a ceiling result is a finding about the exam, and it has to be on record before a harder exam is written, so v3's design can't be adjusted after the fact to fit.
+- **Corrections on record:**
+  - Arm A ran 607 MiB over its lease, not "about 1 GB" as first reported.
+  - "runs.jsonl is never flushed" was a measurement error: an NTFS directory listing showed 0 bytes for an open file that held its rows. The harness flushes per row. A test now pins it (252d59f).
+- **State after:** exam digest still `b7d43b25...` (harness changes only). Harness suite 151 passed. No arm is running and no lease is held.
+- **Open:** D needs about 72.5 GB of commit free to load on this machine. That's a configuration call for Drew. v3 waits on three decisions, listed at the end of EXAM_V3_PLAN.md.
+- **Refs:** engine/bench/local_bakeoff/harness/RESULTS_EXAM_V2.md; engine/bench/local_bakeoff/harness/EXAM_V3_PLAN.md; engine/bench/local_bakeoff/harness/test_run_bakeoff.py `test_each_row_is_on_disk_before_the_next_card_starts`

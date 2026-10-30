@@ -1,0 +1,12 @@
+# 2026-10-29 21:25 CDT - bake-off harness fixed after the #88 re-review
+- **Who:** PromptBuilder seat (Claude Opus 5.5), at Daedalus's request after the independent re-review of #88 at 5136c0e (READY WITH NOTES: 16 prior items fixed; 27 of 28 mutants killed, the survivor equivalent).
+- **Change:**
+  - N1: the headline pass^3 counts an errored card as a fail. Leaving errored cards out let infra errors on an arm's unsolvable cards raise its pass^3 (0.700 to 1.000, still valid). The protocol's clean-cards figure is reported next to it.
+  - N3/N4: the model's digest is pinned. It is read before load (refuse if absent), after load, and after every card-run, and any change invalidates the arm.
+  - I-F7: an unreadable written file is a suspect flag, not a crash. Any exception while scoring one row is recorded on it, counted with infra errors, and invalidates the arm instead of stopping it.
+  - I-F8: an arm not in ARMS is refused. An off-tag model or a non-default num_ctx is listed in `config.off_protocol` and invalidates the arm.
+  - N6: a body cut off mid-read is an infra error. N7: card time is clamped at 0, and rows where the load exceeds the wall time are counted. M-11: unload reports its error and whether `/api/ps` still lists the model. S-F9: a BOM before a marker is ignored.
+  - Declared in harness/README.md, because PROTOCOL.md is frozen: the pass^3 change, three scorer files (not two), the BOM rule, the harness-error rule, the A1/A2 gaps (`<THINK>`, `<thinking>`, harmony text in content, a literal `</think>` in a block), the canary evasion (N2), and the reloads the harness cannot see. Also that no "first use" stamp exists (nothing in the repo claimed one), and that `pool_problems` is a helper, not enforcement.
+- **Why:** each of the four must-fix items would have made a result wrong without making the arm invalid.
+- **State after:** harness tests 145 pass, ruff clean. 12 targeted mutants for this round, all killed. The exam digest and the scorer check are unchanged. No arm has run; all five are pulled.
+- **Refs:** C:\Users\Drama\AppData\Local\Temp\claude\C--dev\9d799f8e-f7bc-4e2f-ac99-2c7f2f117055\scratchpad\review-ac88-v2\REVIEW_pr88_v2.md; engine/bench/local_bakeoff/harness/README.md "Where the harness departs"; engine/bench/local_bakeoff/harness/run_bakeoff.py; engine/bench/local_bakeoff/harness/test_run_bakeoff.py

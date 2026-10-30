@@ -1,0 +1,14 @@
+# 2026-10-29 02:07 CDT - bake-off amendment A1, and every result labeled
+- **Who:** PromptBuilder seat (Claude Opus 5.5), on Daedalus's decision of 2026-10-29 about inline reasoning and labels.
+- **Change:**
+  - PROTOCOL.md gains a pre-data amendment, A1. Complete `<think>...</think>` blocks are stripped from a reply before parsing.
+  - The primary score uses the stripped reply. The raw reply is scored as a sensitivity line (`pass_at_1_raw`), and each run records `inline_think`.
+  - The freeze moves from 8447e14 to the amendment commit, f814f9c.
+  - Every result row and summary carries `exam_freeze` and `verifier_commit`, and the harness refuses to run when the runner source differs from HEAD.
+  - The five arms are pinned to Daedalus's tags; another tag is refused without `--allow-off-tag`.
+- **Why:** PROTOCOL.md did not say what happens to file blocks a model writes inside inline reasoning. Choosing that after seeing results would let the rule favour a model, so it is decided and committed before any arm runs. A result that does not name the exam and the verifier that scored it cannot be compared with anything.
+- **State after:**
+  - Harness tests: 55 passed, including both A1 directions. A block that exists only inside `<think>` fails the primary score and passes raw; a decoy inside `<think>` is ignored by the primary score.
+  - The reference-solution positive control still passes all 10 exam cards and neither control.
+  - No arm has run.
+- **Refs:** engine/bench/local_bakeoff/PROTOCOL.md "Amendments (pre-data)"; engine/bench/local_bakeoff/harness/run_bakeoff.py `strip_inline_think`, `ARMS`, `verifier_commit`; engine/bench/local_bakeoff/harness/test_run_bakeoff.py
