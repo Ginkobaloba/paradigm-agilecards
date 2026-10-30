@@ -46,6 +46,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,6 +94,14 @@ class RepoQuarantined(RuntimeError):
 
 class UntrustedRepo(RuntimeError):
     """A path resolves to a repo the daemon was never told to trust."""
+
+
+class GitUnavailable(UntrustedRepo):
+    """git could not be run to read a repo's config (timeout, OSError).
+
+    Refused for this call, never a fingerprint change: hashing the failure
+    made the baseline mismatch and quarantined the PROJECT persistently
+    (#87 v2 re-verify L4-2-config-timeout)."""
 
 
 def state_dir_for(todo_root: Path) -> Path:
@@ -281,9 +290,9 @@ def config_entries(path: Path) -> list[ConfigEntry] | None:
             cwd=str(_state_dir()), capture_output=True, timeout=GIT_TIMEOUT_SEC,
             check=False, env=env,
         )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GitUnavailable(f"git config could not read {path}: {exc}") from exc
+    if proc.returncode != 0:  # git ran and could not parse it: hashed as raw bytes
         return None
     entries: list[ConfigEntry] = []
     for record in proc.stdout.decode("utf-8", errors="surrogateescape").split("\0"):
@@ -462,12 +471,14 @@ def trust_repo(common_dir: Path) -> str:
 def trust_daemon_clone(path: Path) -> None:
     """Baseline a clone the daemon itself just made (this process only).
 
-    Called right after `git clone` returns, before any other process is
-    given the path. Never persisted: a restarted daemon has no use for an
-    old attempt's clone, and the reaper removes it. The clone's own `.git`
-    must be its common dir, and that pairing is recorded: every later call
-    and `forget` use the record, never a fresh read of a `.git` a sibling
-    worker could have repointed (#87 deep verify L4-1, gitexec-F1).
+    Called once `git init` has filled the clone's pinned, daemon-made
+    `.git`, and again after the daemon's own config writes. Never persisted:
+    a restarted daemon has no use for an old attempt's clone, and the
+    reaper removes it. The clone's own `.git` must be its common dir, with
+    no `commondir` file redirecting git's writes elsewhere, and that pairing
+    is recorded: every later call and `forget` use the record, never a
+    fresh read of a `.git` a sibling worker could have repointed (#87 deep
+    verify L4-1, gitexec-F1; v2 re-verify L4-1-pre-pin).
     """
     common = common_dir_of(path)
     expected = Path(os.path.abspath(path)) / ".git"
@@ -475,6 +486,7 @@ def trust_daemon_clone(path: Path) -> None:
         raise UntrustedRepo(f"{path} is not a repository after clone")
     if _key(common) != _key(expected.resolve()) or _is_reparse_point(expected):
         raise UntrustedRepo(f"daemon clone {path} resolves to {common}, not its own .git")
+    _refuse_indirection(Path(path))
     value = fingerprint(common)
     with _LOCK:
         _MEMORY[str(common)] = TrustRecord(value)
@@ -569,21 +581,33 @@ def _kernel32():  # noqa: ANN202
     return k32
 
 
+_ERROR_SHARING_VIOLATION = 32
+_PIN_RETRY_DELAYS: tuple[float, ...] = (0.05, 0.25)
+
+
 def _open_pin(path: Path) -> object:
     import ctypes
 
     k32 = _kernel32()
-    handle = k32.CreateFileW(
-        # FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES. A data access right is
-        # what makes the share mode bind: a handle with attribute access only
-        # takes no part in sharing checks, and a rename went through.
-        str(path), 0x1 | 0x80,
-        0x1 | 0x2,  # FILE_SHARE_READ | FILE_SHARE_WRITE, deliberately NOT FILE_SHARE_DELETE
-        None, 3,  # OPEN_EXISTING
-        0x02000000 | 0x00200000,  # FILE_FLAG_BACKUP_SEMANTICS (a dir) | OPEN_REPARSE_POINT
-        None)
-    if handle in (None, ctypes.c_void_p(-1).value):
-        raise ClonePinned(f"cannot pin {path}: {ctypes.WinError(ctypes.get_last_error())}")
+    # Another opener holding DELETE access (an indexer, a scanner, or a
+    # sibling on purpose) makes the open fail with a sharing violation. Try
+    # twice more, briefly, then fail closed (#87 v2 re-verify L4-1-pin-dos).
+    for delay in (*_PIN_RETRY_DELAYS, None):
+        handle = k32.CreateFileW(
+            # FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES. A data access right is
+            # what makes the share mode bind: a handle with attribute access only
+            # takes no part in sharing checks, and a rename went through.
+            str(path), 0x1 | 0x80,
+            0x1 | 0x2,  # FILE_SHARE_READ | FILE_SHARE_WRITE, deliberately NOT FILE_SHARE_DELETE
+            None, 3,  # OPEN_EXISTING
+            0x02000000 | 0x00200000,  # FILE_FLAG_BACKUP_SEMANTICS (a dir) | OPEN_REPARSE_POINT
+            None)
+        if handle not in (None, ctypes.c_void_p(-1).value):
+            break
+        error = ctypes.get_last_error()
+        if error != _ERROR_SHARING_VIOLATION or delay is None:
+            raise ClonePinned(f"cannot pin {path}: {ctypes.WinError(error)}")
+        time.sleep(delay)
     try:
         # The name is held now; what it names cannot be swapped. Check it.
         attrs = k32.GetFileAttributesW(str(path))
@@ -622,6 +646,16 @@ class pinned_clones:  # noqa: N801 - used as a context manager, like open()
             pins.close()
 
 
+def _refuse_indirection(path: Path) -> None:
+    """A daemon clone's `.git` is a plain directory with no `commondir`:
+    with one, git writes refs and objects wherever it points (the project's
+    `.git`), while the fingerprint covers only this clone's config."""
+    dot_git = path / ".git"
+    if not dot_git.is_dir() or (dot_git / "commondir").exists():
+        raise UntrustedRepo(f"daemon clone {path}: .git is not a plain directory "
+                            f"(a gitdir file or commondir redirects it)")
+
+
 def _check_daemon_clone(path: Path) -> None:
     """At the moment of use: a daemon clone must still be itself."""
     with _LOCK:
@@ -630,6 +664,7 @@ def _check_daemon_clone(path: Path) -> None:
         return
     if _is_reparse_point(Path(path)) or _is_reparse_point(Path(path) / ".git"):
         raise UntrustedRepo(f"daemon clone {path} was replaced by a link")
+    _refuse_indirection(Path(path))
     now = common_dir_of(Path(path))
     if now is None or str(now) != common:
         raise UntrustedRepo(f"daemon clone {path} now resolves to {now}, not {common}")

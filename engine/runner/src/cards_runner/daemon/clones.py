@@ -19,10 +19,12 @@ A clone has its own `.git`. Each attempt gets three:
    the verifier's model-written shell ACs. The daemon runs git there only
    to create it.
 
-All clones use `--no-hardlinks` (a hardlinked object file is the owner's
-object file) and `--single-branch --no-tags`. A daemon clone is trusted
-in memory the moment `git clone` returns (`git_safety.trust_daemon_clone`)
-and checked before every later call, like any repo.
+Every clone is built inside directories the daemon made and pinned while
+empty (`_clone`): `git init`, then a fetch of the one branch over file://
+(the pack transport: no hardlinked object files, no other branch's objects,
+no tags), and no remote. A daemon clone is trusted in memory once `git init`
+fills it (`git_safety.trust_daemon_clone`) and checked before every later
+call, like any repo.
 """
 from __future__ import annotations
 
@@ -66,6 +68,8 @@ _SYMLINK_MODE: Final[str] = "120000"
 _GITLINK_MODE: Final[str] = "160000"
 _SHA_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 _SHORT_NAME_RE: Final[re.Pattern[str]] = re.compile(r"~[0-9]")
+# HEAD of a fresh clone before its branch is fetched; never committed to.
+_INIT_BRANCH: Final[str] = "cards-runner-init"
 
 
 class CloneError(Exception):
@@ -97,27 +101,49 @@ def _git(cwd: Path, *args: str, extra_config: tuple[tuple[str, str], ...] = (),
     return proc.stdout
 
 
+def _pinned_empty_dir(pins: git_safety._Pins, path: Path) -> None:
+    """Make `path`, pin it, and only then check it is the empty dir just
+    made. A swap between mkdir and the pin leaves a pinned dir that is not
+    empty (refused) or an empty one nobody else holds (harmless: git fills it
+    under the pin)."""
+    try:
+        path.mkdir()
+    except FileExistsError as exc:
+        raise CloneError(f"clone destination {path} already exists") from exc
+    pins.pin(path)
+    if any(path.iterdir()):
+        raise CloneError(f"{path} was not empty once pinned: swapped after mkdir")
+
+
 def _clone(source: Path, dest: Path, *, pins: git_safety._Pins, branch: str,
            checkout: bool = True, first_sight_ok: bool = False) -> None:
-    """`git clone` run FROM the (trusted) source; pin the result, then trust it."""
-    if dest.exists():
-        raise CloneError(f"clone destination {dest} already exists")
+    """A single-branch clone of `source` built INSIDE pinned directories.
+
+    `git clone` made `dest` itself and the daemon pinned it only after
+    clone returned: a sibling that swapped in a real, pre-staged dir in that
+    gap (about 55 us) had its `.git/config` pinned and baselined as trusted
+    (#87 v2 re-verify L4-1-pre-pin, 1 win in about 540). Now the daemon
+    makes `dest` and `dest/.git`, pins both while empty, and `git init`
+    fills that `.git`; from then to release neither can be renamed or
+    replaced (L4-1). The clone has no remote: callers that push add one.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
-    args = ["clone", "--quiet", "--no-hardlinks", "--no-tags", "--single-branch",
-            "--branch", branch]
-    if not checkout:
-        args.append("--no-checkout")
-    # A file:// URL, not a path: a local-path clone copies objects/ wholesale,
-    # so --single-branch kept other branches' REFS out but not their objects,
-    # which a worker could read by sha (#87 deep verify, tests lens note).
-    # The pack transport sends only what the cloned branch reaches.
-    _git(source, *args, "--", Path(os.path.abspath(source)).as_uri(), str(dest),
-         first_sight_ok=first_sight_ok)
-    # Pinned before it is trusted: from here to release, `dest` and its
-    # `.git` cannot be renamed or replaced by any process (L4-1).
-    pins.pin(dest)
-    pins.pin(dest / ".git")
+    _pinned_empty_dir(pins, dest)
+    _pinned_empty_dir(pins, dest / ".git")
+    # Run FROM the trusted source. The default template, as `git clone` uses:
+    # only `.sample` hooks, which never run (and hooksPath is the null device).
+    _git(source, "init", "--quiet", f"--initial-branch={_INIT_BRANCH}",
+         str(dest), first_sight_ok=first_sight_ok)
     git_safety.trust_daemon_clone(dest)
+    # A file:// URL, not a path: a local-path clone copied objects/ wholesale,
+    # so other branches' objects were readable by sha (#87 deep verify, tests
+    # lens note). The pack transport sends only what this branch reaches.
+    _git(dest, "fetch", "--quiet", "--no-tags", "--",
+         Path(os.path.abspath(source)).as_uri(), f"+refs/heads/{branch}:refs/heads/{branch}")
+    if checkout:
+        _git(dest, "checkout", "--quiet", branch)
+    else:
+        _git(dest, "symbolic-ref", "HEAD", f"refs/heads/{branch}")
 
 
 def _pin_ancestors(pins: git_safety._Pins, path: Path, levels: int) -> None:
@@ -151,7 +177,6 @@ def prepare_worker_clone(*, project_dir: Path, base_branch: str, branch: str,
         try:
             _clone(project_dir, dest, pins=pins, branch=base_branch, first_sight_ok=True)
             _git(dest, "checkout", "--quiet", "-b", branch, base_sha)
-            _git(dest, "remote", "remove", "origin")
         finally:
             # From here on the clone belongs to the worker.
             git_safety.forget(dest)
@@ -257,10 +282,8 @@ def _integrate(*, project_dir: Path, base_sha: str, branch: str, patch_file: Pat
                dest: Path, message: str) -> str:
     _git(dest, "checkout", "--quiet", "-b", branch, base_sha)
     origin = _project_origin_url(project_dir)
-    if origin is not None:
-        _git(dest, "remote", "set-url", "origin", origin)
-    else:
-        _git(dest, "remote", "remove", "origin")
+    if origin is not None:  # the merge gate pushes the integrated sha here
+        _git(dest, "remote", "add", "origin", origin)
     # The baseline was taken before these, the daemon's own config writes;
     # take it again now. Nothing from THIS attempt is alive (its worker's
     # job has ended; its verifier has not started). A sibling attempt's
@@ -401,8 +424,7 @@ def prepare_verify_clone(*, integration: Path, branch: str, sha: str, dest: Path
             head = _git(dest, "rev-parse", "--verify", "HEAD^{commit}").strip()
             if head != sha:
                 raise CloneError(f"verify clone HEAD {head} is not {sha}")
-            # No path back to the integration clone for an AC to push into.
-            _git(dest, "remote", "remove", "origin")
+            # No remote: no path back to the integration clone for an AC to push into.
         finally:
             git_safety.forget(dest)
             # The ACs own this clone now; only the daemon's use was pinned.

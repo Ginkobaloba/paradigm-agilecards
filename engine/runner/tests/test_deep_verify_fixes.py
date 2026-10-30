@@ -13,6 +13,8 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -122,21 +124,154 @@ def test_the_clone_dot_git_itself_cannot_be_renamed_aside(tmp_path: Path,
 @windows_only
 def test_the_attempt_dir_is_pinned_before_the_clone_exists(tmp_path: Path,
                                                             monkeypatch: pytest.MonkeyPatch) -> None:
-    """Before `git clone` there is no clone handle beneath the attempt dir, so
-    only the ancestor pins stop a swap that would send the clone elsewhere."""
+    """At `git init` the clone dirs are pinned but empty; the ancestor pins
+    stop a swap of the attempt dir that would send the clone elsewhere."""
     project, base = _trusted_project(tmp_path)
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
 
-    def swap_attempt_dir(cwd: Path) -> None:  # runs before `git clone`, cwd = the project
+    def swap_attempt_dir(cwd: Path) -> None:  # runs before `git init`, cwd = the project
         attempt = tmp_path / "state" / "clones" / "att1"
         os.rename(attempt, attempt.with_name("att1-aside"))
         _junction(attempt, elsewhere)
 
-    seen = _swap_on(monkeypatch, "clone", swap_attempt_dir)
+    seen = _swap_on(monkeypatch, "init", swap_attempt_dir)
     _integrate(project, base, tmp_path)
     assert isinstance(seen[0], PermissionError), seen
     assert list(elsewhere.iterdir()) == []
+
+
+# ---- v2 re-verify L4-1-pre-pin: nothing is filled before it is pinned -------
+
+
+def _stage_repo(where: Path) -> Path:
+    """A sibling's pre-staged REAL dir (not a junction) with its own .git."""
+    subprocess.run(["git", "init", "-q", str(where)], check=True)
+    subprocess.run(["git", "-C", str(where), "config", "core.sshCommand", "evil"], check=True)
+    return where
+
+
+def _swap_before_pin(monkeypatch: pytest.MonkeyPatch, leaf: str, swap) -> list[str]:  # noqa: ANN001
+    """Run `swap(path)` in the gap between the daemon's mkdir and its pin of
+    the integration dir (`leaf` "integration") or of its .git (".git")."""
+    seen: list[str] = []
+    real = git_safety._Pins.pin
+
+    def racing(self: git_safety._Pins, path: Path) -> None:
+        p = Path(path)
+        if p.name == leaf and "integration" in p.parts and not seen:
+            swap(p)
+            seen.append("swapped")
+        real(self, path)
+
+    monkeypatch.setattr(git_safety._Pins, "pin", racing)
+    return seen
+
+
+@pytest.mark.parametrize("leaf", ["integration", ".git"])
+def test_a_real_dir_swapped_in_before_the_pin_is_refused(tmp_path: Path,
+                                                         monkeypatch: pytest.MonkeyPatch,
+                                                         leaf: str) -> None:
+    """The v2 gap was between `git clone` returning and the pin: a staged
+    dir's .git/config was then pinned and baselined as trusted."""
+    project, base = _trusted_project(tmp_path)
+    staged = _stage_repo(tmp_path / "staged")
+    staged_git = staged / ".git" if leaf == ".git" else staged
+
+    def swap(path: Path) -> None:
+        os.rmdir(path)  # the empty dir the daemon just made
+        os.rename(staged_git, path)
+
+    seen = _swap_before_pin(monkeypatch, leaf, swap)
+    with pytest.raises(clones.CloneError, match="not empty once pinned"):
+        _integrate(project, base, tmp_path)
+    assert seen == ["swapped"]
+    dest = tmp_path / "state" / "clones" / "att1" / "integration"
+    assert git_safety._key(dest) not in git_safety._DAEMON_CLONES  # never trusted
+    assert _g(project, "rev-parse", "main").strip() == base
+
+
+def test_an_empty_dir_swapped_in_before_the_pin_is_harmless(tmp_path: Path,
+                                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    """Control: what the emptiness check lets through is an empty dir, which
+    git then fills under the pin, so the integration is the daemon's own."""
+    project, base = _trusted_project(tmp_path)
+    (tmp_path / "empty").mkdir()
+
+    def swap(path: Path) -> None:
+        os.rmdir(path)
+        os.rename(tmp_path / "empty", path)
+
+    seen = _swap_before_pin(monkeypatch, ".git", swap)
+    sha = _integrate(project, base, tmp_path)
+    assert seen == ["swapped"] and sha != base
+    assert _g(project, "rev-parse", "main").strip() == base
+
+
+def test_a_commondir_planted_in_a_daemon_clone_is_refused(tmp_path: Path,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    """With .git/commondir git writes refs and objects where it points (the
+    project), while the fingerprint covers only the clone's own config."""
+    project, base = _trusted_project(tmp_path)
+
+    def plant(dest: Path) -> None:
+        (dest / ".git" / "commondir").write_text(str(project / ".git") + "\n")
+
+    _swap_on(monkeypatch, "commit", plant)
+    with pytest.raises(git_safety.UntrustedRepo, match="commondir"):
+        _integrate(project, base, tmp_path)
+    assert _g(project, "rev-parse", "main").strip() == base
+
+
+def _hold_delete_handle(path: Path, seconds: float) -> threading.Thread:
+    """An opener with DELETE access (what an indexer or a sibling holds)."""
+    import ctypes
+    k32 = git_safety._kernel32()
+    handle = k32.CreateFileW(str(path), 0x10000 | 0x80, 0x7, None, 3, 0x02000000, None)
+    assert handle not in (None, ctypes.c_void_p(-1).value), ctypes.get_last_error()
+    thread = threading.Thread(target=lambda: (time.sleep(seconds), k32.CloseHandle(handle)))
+    thread.start()
+    return thread
+
+
+@windows_only
+def test_a_pin_retries_a_brief_sharing_violation_then_fails_closed(tmp_path: Path) -> None:
+    """v2 re-verify L4-1-pin-dos: one DELETE opener blocked the card for good."""
+    brief, held = tmp_path / "brief", tmp_path / "held"
+    brief.mkdir()
+    held.mkdir()
+    pins = git_safety._Pins()
+    try:
+        thread = _hold_delete_handle(brief, 0.02)
+        pins.pin(brief)  # released within the retry window
+        thread.join()
+        thread = _hold_delete_handle(held, 2.0)
+        with pytest.raises(git_safety.ClonePinned, match="WinError 32"):
+            pins.pin(held)
+        thread.join()
+    finally:
+        pins.close()
+
+
+def test_a_config_read_timeout_refuses_without_quarantine(tmp_path: Path,
+                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    """v2 re-verify L4-2-config-timeout: the timeout was hashed as a config
+    change, and the PROJECT was quarantined persistently."""
+    project, _ = _trusted_project(tmp_path)
+    real = subprocess.run
+
+    def slow(argv, *a: Any, **kw: Any):  # noqa: ANN001, ANN202
+        if "--file" in argv:
+            raise subprocess.TimeoutExpired(argv, 1)
+        return real(argv, *a, **kw)
+
+    monkeypatch.setattr(git_safety.subprocess, "run", slow)
+    with pytest.raises(git_safety.GitUnavailable):
+        git_safety.assert_trusted(project)
+    monkeypatch.setattr(git_safety.subprocess, "run", real)
+    git_safety.assert_trusted(project)  # not quarantined: trusted again once git answers
+    record = git_safety.trust_record(git_safety.common_dir_of(project))
+    assert record is not None and not record.quarantined
 
 
 @windows_only
