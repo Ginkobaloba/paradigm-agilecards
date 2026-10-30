@@ -35,6 +35,14 @@ engine/bench/local_bakeoff_v3/
   AFTER the reply is applied and BEFORE the ACs run. They overwrite any file
   the reply wrote at the same path. They are never in the prompt. Use them
   for tests the reply must not see or be able to edit.
+  - A held-out test may import a module the reply is expected to create:
+    the order is seed, then reply, then held-out, then ACs. If the reply
+    didn't create it, collection fails and the anchored AC fails.
+  - Never put a file the reply must write inside `heldout/<id>/`. It's
+    copied last and overwrites the reply's version, so an empty reply would
+    pass.
+  - The card body must name any path a held-out test imports. The reply
+    can't see the test, so it can't infer a module name.
 - **The digest** covers everything under `local_bakeoff_v3/`. Any change
   after the freeze is a new version.
 
