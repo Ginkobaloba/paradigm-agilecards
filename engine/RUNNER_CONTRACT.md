@@ -233,7 +233,11 @@ The runner MUST:
    commits once with its own identity, and verifies and pushes exactly
    that commit's sha.
 3. On a failed clone, treat the claim as failed and roll back (move the
-   card back to backlog).
+   card back to backlog). git that cannot run at all (a config-read
+   timeout) is not an untrusted repo: before the executor runs it rolls
+   back the same way; after, the card is blocked with
+   `error: git_unavailable`, never requeued, since a requeue would rerun
+   the executor on every poll while git stays down.
 4. Hold the runner's own clones as themselves while it runs git there:
    no other process may rename or replace a clone dir, its `.git` or the
    dirs above it, and every git call refuses a clone that now resolves
@@ -246,11 +250,16 @@ reader assumes otherwise):
   Scheduler or COM. That process survives `end_job`.
 - Same-user writes by absolute path: the state dir, other attempts'
   files, the project dir; Credential Manager and other ambient
-  same-user access; another process's memory. This includes a write into
-  a daemon clone's pinned, empty `.git` before its baseline (a planted
-  `config` or `info/attributes`): `git init` keeps it, the baseline trusts
-  it, and the daemon's own git then runs it (a smudge filter at checkout).
-  Pins stop swaps, not writes.
+  same-user access; another process's memory. Pins stop swaps, not
+  writes, so a sibling can still write into a daemon clone's `.git`. The
+  baseline refuses any config key outside what `git init`, `remote add`
+  and the push write (so no filter, fsmonitor, sshCommand or include), and
+  every daemon git call refuses `objects/info/alternates` and
+  `info/attributes`. What stays open is a changed VALUE of an allowed key
+  (`remote.origin.url` before the second baseline) and files git reads
+  that are not code (refs, objects, `info/exclude`). Those run no
+  program, but they can change what is committed or, through a changed
+  origin URL, where the integrated commit is pushed.
 - Cards are verified and pushed against the base pinned at claim. Two
   cards that merge cleanly but break each other, or a base rewritten
   after the pin, are caught by the project's CI and branch protection,

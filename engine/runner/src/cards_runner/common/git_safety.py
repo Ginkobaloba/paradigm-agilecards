@@ -487,6 +487,8 @@ def trust_daemon_clone(path: Path) -> None:
     if _key(common) != _key(expected.resolve()) or _is_reparse_point(expected):
         raise UntrustedRepo(f"daemon clone {path} resolves to {common}, not its own .git")
     _refuse_indirection(Path(path))
+    _refuse_foreign_files(Path(path))
+    _refuse_foreign_config(Path(path))
     value = fingerprint(common)
     with _LOCK:
         _MEMORY[str(common)] = TrustRecord(value)
@@ -646,6 +648,53 @@ class pinned_clones:  # noqa: N801 - used as a context manager, like open()
             pins.close()
 
 
+# What a daemon clone's config may hold (#87 V3-1): what `git init` writes,
+# the origin `remote add` writes, and the daemon-written branch keys. The
+# fingerprint only proves the config did not change after trust; this
+# proves what was trusted is the daemon's own, so a key a sibling worker
+# slipped in before the baseline (or between the two baselines) is refused
+# rather than recorded as trusted.
+_DAEMON_CLONE_KEYS: frozenset[str] = frozenset({
+    "core.repositoryformatversion", "core.filemode", "core.bare",
+    "core.logallrefupdates", "core.symlinks", "core.ignorecase",
+    "core.precomposeunicode",  # macOS init
+    "remote.origin.url", "remote.origin.fetch",
+})
+# Read by git but outside the fingerprint: alternates make the clone read
+# objects from another repo, attributes can route paths to drivers.
+_DAEMON_CLONE_REFUSED_FILES: tuple[str, ...] = (
+    "objects/info/alternates", "objects/info/http-alternates", "info/attributes",
+)
+
+
+def _daemon_clone_key_allowed(key: str, value: str | None) -> bool:
+    if key in _DAEMON_CLONE_KEYS:
+        return True
+    # branch.<name>.<leaf>: `<name>` may contain dots, so split from the right.
+    # A `remote` that is a URL or path is honoured by a remote-less push, so
+    # it must name the one remote a daemon clone has.
+    return key.startswith("branch.") and _is_daemon_written(key, value, frozenset({"origin"}))
+
+
+def _refuse_foreign_files(path: Path) -> None:
+    for name in _DAEMON_CLONE_REFUSED_FILES:
+        if (path / ".git" / name).exists():
+            raise UntrustedRepo(f"daemon clone {path} has .git/{name}, which the daemon never writes")
+
+
+def _refuse_foreign_config(path: Path) -> None:
+    for config in _config_files(path / ".git"):
+        if not config.is_file():
+            continue
+        entries = config_entries(config)
+        if entries is None:
+            raise UntrustedRepo(f"daemon clone {path}: git cannot parse {config.name}")
+        for key, value in entries:
+            if not _daemon_clone_key_allowed(key, value):
+                raise UntrustedRepo(f"daemon clone {path}: config key {key!r} is not one "
+                                    f"the daemon writes")
+
+
 def _refuse_indirection(path: Path) -> None:
     """A daemon clone's `.git` is a plain directory with no `commondir`:
     with one, git writes refs and objects wherever it points (the project's
@@ -665,6 +714,8 @@ def _check_daemon_clone(path: Path) -> None:
     if _is_reparse_point(Path(path)) or _is_reparse_point(Path(path) / ".git"):
         raise UntrustedRepo(f"daemon clone {path} was replaced by a link")
     _refuse_indirection(Path(path))
+    # Config changes after trust move the fingerprint; these files do not.
+    _refuse_foreign_files(Path(path))
     now = common_dir_of(Path(path))
     if now is None or str(now) != common:
         raise UntrustedRepo(f"daemon clone {path} now resolves to {now}, not {common}")
