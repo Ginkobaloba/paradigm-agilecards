@@ -14,6 +14,13 @@ the verifier (see C:\\dev\\_status\\WORKER_ISOLATION_OPTIONS_2026-10-28.md).
 What every launcher must guarantee: when `run_command` returns, or after
 `ManagedProcess.end_job()` for a spawned worker, nothing it started is
 still running. Callers read and apply outputs only after that.
+
+`LocalProcessLauncher` meets that for every process the child creates
+itself, but NOT for one it asks another service to create: WMI
+(`Win32_Process.Create`) and by extension the Task Scheduler or COM start
+processes outside the job, and those survive `end_job` (#87 deep verify
+L3-01). Only an OS-level launcher (container, VM) closes that; see
+RUNNER_CONTRACT.md "What this does not isolate".
 """
 from __future__ import annotations
 

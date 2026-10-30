@@ -234,6 +234,26 @@ The runner MUST:
    that commit's sha.
 3. On a failed clone, treat the claim as failed and roll back (move the
    card back to backlog).
+4. Hold the runner's own clones as themselves while it runs git there:
+   no other process may rename or replace a clone dir, its `.git` or the
+   dirs above it, and every git call refuses a clone that now resolves
+   anywhere but its own `.git`.
+
+**What this does not isolate** (same user, same machine; stated so no
+reader assumes otherwise):
+- A worker or a shell AC can start a process outside its Job Object
+  through WMI (`Win32_Process.Create`), and by extension the Task
+  Scheduler or COM. That process survives `end_job`.
+- Same-user writes by absolute path: the state dir, other attempts'
+  files, the project dir; Credential Manager and other ambient
+  same-user access; another process's memory.
+- Cards are verified and pushed against the base pinned at claim. Two
+  cards that merge cleanly but break each other, or a base rewritten
+  after the pin, are caught by the project's CI and branch protection,
+  not by the runner.
+- OpenSSH identities and the agent are reachable through the user's
+  profile, not the environment the runner scrubs.
+Closing these needs OS-level isolation (a container or VM launcher).
 
 A clone only reads the project's `.git`, so concurrent clones do not
 contend on `.git/config.lock` (Claude Code issue #34645), and no mutex is
