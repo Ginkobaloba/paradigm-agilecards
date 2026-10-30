@@ -647,7 +647,7 @@ def test_git_unavailable_at_prep_retries_the_card(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project, _, daemon = setup
-    card_id = f"bTST-CL-gu-prep-{exc.__name__}"
+    card_id = f"bTST-CL-gup{exc.__name__[0]}"
     _insert(repo, card_id, project)
 
     def refuse(**_: Any) -> str:
@@ -671,7 +671,9 @@ def test_git_unavailable_after_the_worker_blocks_with_its_own_reason(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project, gh, daemon = setup
-    card_id = f"bTST-CL-gu-{stage}-{exc.__name__}"
+    # Short: the id is in the branch ref path, and CI's temp dir is deep
+    # enough that a long one passes Windows' 260-character limit at checkout.
+    card_id = f"bTST-CL-gu{len(stage)}{exc.__name__[0]}"
     _insert(repo, card_id, project)
     claim = _spawned(daemon, repo, paths, card_id, monkeypatch)
     (claim.worktree_path / "anything").write_text("x\n", encoding="utf-8")
