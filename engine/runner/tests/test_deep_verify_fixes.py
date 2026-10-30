@@ -224,6 +224,31 @@ def test_shell_output_is_text_mode_again(tmp_path: Path) -> None:
     assert out.passed, out.evidence
 
 
+def test_a_lone_cr_is_a_newline_as_under_text_mode(tmp_path: Path) -> None:
+    """#87 v2 V2-2: text=True used universal newlines; v2 mapped only CRLF."""
+    from cards_runner.verifier.handlers.deterministic import HandlerContext, handle_shell
+    from cards_runner.common.sandbox import LocalProcessLauncher
+    script = tmp_path / "w.py"
+    script.write_text("import sys\nsys.stdout.buffer.write(b'x\\ry\\r\\nz\\n')\n")
+    # Unquoted and relative: cmd.exe strips a leading quote pair oddly.
+    out = handle_shell({"command": f"{sys.executable} {script.name}", "expect_contains": "x\ny\nz"},
+                       HandlerContext(worktree=tmp_path, env={}, launcher=LocalProcessLauncher()))
+    assert out.passed, out.evidence
+
+
+def test_the_ext_transport_stays_off_whatever_the_repo_says(tmp_path: Path) -> None:
+    """M20: protocol.ext.allow=never had no test. A repo config turning ext
+    on is overridden for the daemon's git, and not for plain git (control)."""
+    project, _ = _trusted_project(tmp_path)
+    _g(project, "config", "protocol.ext.allow", "always")
+    git_safety.trust_repo(git_safety.common_dir_of(project))
+    url = "ext::git --version"
+    plain = subprocess.run(["git", "ls-remote", url], cwd=project, capture_output=True, text=True)
+    assert "not allowed" not in plain.stderr  # control: the repo's setting reached git
+    daemon = git_safety.run_git([git_safety.resolved("git"), "ls-remote", url], cwd=project)
+    assert daemon.returncode != 0 and "transport 'ext' not allowed" in daemon.stderr
+
+
 @windows_only
 def test_a_command_inherits_only_its_std_handles(tmp_path: Path) -> None:
     """L3-03: with no handle list, a child wrote through an inheritable
@@ -438,6 +463,82 @@ def test_binary_hunks_that_inflate_past_the_cap_are_refused_before_apply(tmp_pat
     # the hunk, and git's own refusal mentions "inflate" too.
     with pytest.raises(clones.PatchRejected, match=r"^binary hunks inflate to"):
         _apply(project, base, tmp_path, huge, "huge")
+
+
+def _commit_file(repo: Path, name: str, data: bytes) -> str:
+    (repo / name).write_bytes(data)
+    _g(repo, "add", name)
+    _g(repo, "-c", "user.email=t@example.test", "-c", "user.name=t", "commit", "-q", "-m", name)
+    return _g(repo, "rev-parse", "HEAD").strip()
+
+
+def _varint(n: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte, n = n & 0x7F, n >> 7
+        out.append(byte | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def _b85_hunk(data: bytes) -> bytes:
+    import base64
+    out = []
+    for i in range(0, len(data), 52):
+        chunk = data[i:i + 52]
+        letter = chr(ord("A") + len(chunk) - 1) if len(chunk) <= 26 else chr(ord("a") + len(chunk) - 27)
+        out.append(letter.encode() + base64.b85encode(chunk + b"\0" * (-len(chunk) % 4)))
+    return b"\n".join(out) + b"\n"
+
+
+def _copy_delta_patch(base: bytes, copies: int) -> bytes:
+    """The V2-1 shape: a delta of `copies` copy ops of the whole base, so a
+    few KB of patch builds len(base) * copies bytes."""
+    import hashlib
+    import zlib
+    size = len(base) * copies
+    delta = _varint(len(base)) + _varint(size) + bytes([0x90, len(base)]) * copies
+    new = hashlib.sha1(b"blob %d\0" % size)
+    for _ in range(copies):
+        new.update(base)
+    old = hashlib.sha1(b"blob %d\0" % len(base) + base).hexdigest()
+    return (f"diff --git a/big.bin b/big.bin\nindex {old}..{new.hexdigest()} 100644\n"
+            f"GIT binary patch\ndelta {len(delta)}\n").encode() + _b85_hunk(zlib.compress(delta, 9)) + \
+        f"\nliteral {len(base)}\n".encode() + _b85_hunk(zlib.compress(base, 9)) + b"\n"
+
+
+def test_a_binary_delta_is_capped_by_the_result_it_builds(tmp_path: Path) -> None:
+    """#87 v2 V2-1: the cap read only the delta's own size, so 3.7 KB of
+    patch built and committed a 260 MB blob."""
+    project, _ = _trusted_project(tmp_path)
+    base_bytes = bytes(range(33, 233))
+    base = _commit_file(project, "big.bin", base_bytes)
+    git_safety.trust_repo(git_safety.common_dir_of(project))
+    small = _copy_delta_patch(base_bytes, 10)
+    assert _apply(project, base, tmp_path, small, "ok") != base  # control: git takes this shape
+    copies = clones.PATCH_MAX_INFLATED_BYTES // len(base_bytes) + 1
+    huge = _copy_delta_patch(base_bytes, copies)
+    stated = int(huge.split(b"delta ")[1].split(b"\n")[0])
+    assert stated < clones.PATCH_MAX_INFLATED_BYTES  # the delta line alone passes the old cap
+    with pytest.raises(clones.PatchRejected, match=r"^binary hunks inflate to"):
+        _apply(project, base, tmp_path, huge, "huge")
+
+
+def test_a_delta_git_itself_wrote_still_applies(tmp_path: Path) -> None:
+    """Control for the header decode: a real `git diff --binary` delta."""
+    import random
+    project, _ = _trusted_project(tmp_path)
+    data = random.Random(7).randbytes(20000)
+    base = _commit_file(project, "blob.bin", data)
+    git_safety.trust_repo(git_safety.common_dir_of(project))
+    scratch = tmp_path / "scratch"
+    subprocess.run(["git", "init", "-q", str(scratch)], check=True)
+    old = _commit_file(scratch, "blob.bin", data)
+    (scratch / "blob.bin").write_bytes(data[:100] + b"changed" + data[107:])
+    patch = subprocess.run(["git", "diff", "--binary", "--full-index", old], cwd=scratch,
+                           capture_output=True, check=True).stdout
+    assert b"\ndelta " in patch  # git chose a delta, so the decode path ran
+    assert _apply(project, base, tmp_path, patch, "real") != base
 
 
 def test_a_patch_over_the_file_count_is_refused(tmp_path: Path) -> None:

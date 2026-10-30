@@ -26,6 +26,7 @@ and checked before every later call, like any repo.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import logging
 import os
@@ -34,6 +35,7 @@ import shutil
 import stat
 import sys
 import unicodedata
+import zlib
 from pathlib import Path
 from typing import Final
 
@@ -51,7 +53,14 @@ PATCH_MAX_INFLATED_BYTES: Final[int] = 64 * 1024 * 1024
 PATCH_MAX_FILES: Final[int] = 2000
 CLONE_TIMEOUT_SEC: Final[float] = 300.0
 _DIFF_HEADER_RE: Final[re.Pattern[bytes]] = re.compile(rb"^diff --git ", re.M)
-_BINARY_SIZE_RE: Final[re.Pattern[bytes]] = re.compile(rb"^(literal|delta) ([0-9]+)\r?$", re.M)
+_BINARY_SIZE_RE: Final[re.Pattern[bytes]] = re.compile(rb"(literal|delta) ([0-9]+)")
+# Hunk lines read for a delta's size header: 52 bytes each, far more than
+# the 20 compressed bytes two varints can need.
+_DELTA_HEAD_LINES: Final[int] = 4
+_B85_LINE_SIZES: Final[dict[bytes, int]] = {
+    **{bytes([ord("A") + i]): i + 1 for i in range(26)},
+    **{bytes([ord("a") + i]): i + 27 for i in range(26)},
+}
 
 _SYMLINK_MODE: Final[str] = "120000"
 _GITLINK_MODE: Final[str] = "160000"
@@ -291,15 +300,69 @@ def _integrate(*, project_dir: Path, base_sha: str, branch: str, patch_file: Pat
 
 
 def _refuse_oversized(patch: bytes) -> None:
-    """Refuse before git inflates anything (#87 deep verify patch-F3): a
-    binary hunk states its inflated size, and 6 MB of patch inflated to 1 GiB."""
+    """Refuse before git inflates anything (#87 deep verify patch-F3): 6 MB
+    of patch inflated to 1 GiB. A `literal N` hunk inflates to N bytes. A
+    `delta N` hunk inflates to an N-byte delta that then BUILDS a result
+    whose size is only in the delta's own header: 3.7 KB of patch built a
+    260 MB blob (#87 v2 V2-1), so both are counted."""
     files = len(_DIFF_HEADER_RE.findall(patch))
     if files > PATCH_MAX_FILES:
         raise PatchRejected(f"patch touches {files} files, over {PATCH_MAX_FILES}")
-    inflated = sum(int(m.group(2)) for m in _BINARY_SIZE_RE.finditer(patch))
+    lines = patch.split(b"\n")
+    inflated = 0
+    for i, line in enumerate(lines):
+        m = _BINARY_SIZE_RE.fullmatch(line.rstrip(b"\r"))
+        if m is None:
+            continue
+        inflated += int(m.group(2))
+        if m.group(1) == b"delta":
+            inflated += _delta_result_size(lines[i + 1:i + 1 + _DELTA_HEAD_LINES])
     if inflated > PATCH_MAX_INFLATED_BYTES:
         raise PatchRejected(f"binary hunks inflate to {inflated} bytes, "
                             f"over {PATCH_MAX_INFLATED_BYTES}")
+
+
+def _b85_line(line: bytes) -> bytes:
+    """One line of a git binary hunk: a length letter, then base85 (the same
+    alphabet as `base64.b85decode`)."""
+    line = line.rstrip(b"\r")
+    size = _B85_LINE_SIZES.get(line[:1])
+    try:
+        if size is None:
+            raise ValueError("no length letter")
+        return base64.b85decode(line[1:])[:size]
+    except ValueError as exc:
+        raise PatchRejected(f"malformed binary hunk line: {exc}") from exc
+
+
+def _delta_result_size(lines: list[bytes]) -> int:
+    """The result size in a git delta's header (source size, then result
+    size, each a 7-bit little-endian varint), read from the first lines of
+    the hunk without inflating the rest."""
+    hunk: list[bytes] = []
+    for line in lines:
+        if not line.strip():  # a blank line ends the hunk
+            break
+        hunk.append(line)
+    data = b"".join(_b85_line(line) for line in hunk)
+    try:
+        head = zlib.decompressobj().decompress(data, 32)
+    except zlib.error as exc:
+        raise PatchRejected(f"undecodable binary delta: {exc}") from exc
+    pos, sizes = 0, []
+    for _ in range(2):
+        value = shift = 0
+        while True:
+            if pos >= len(head) or shift > 63:
+                raise PatchRejected("binary delta has no readable size header")
+            byte = head[pos]
+            pos += 1
+            value |= (byte & 0x7F) << shift
+            shift += 7
+            if not byte & 0x80:
+                break
+        sizes.append(value)
+    return sizes[1]
 
 
 def _tree_paths(dest: Path, sha: str) -> list[str]:

@@ -67,8 +67,9 @@ def _read_capped(handle: BinaryIO) -> str:
     text = data[:OUTPUT_CAP_BYTES].decode("utf-8", errors="replace")
     # Text mode, as `subprocess.run(text=True)` gave the shell handler
     # before the launcher seam: an AC expecting "a\nb" passed on main and
-    # failed on cmd.exe's "a\r\nb" (#87 deep verify L3-02).
-    text = text.replace("\r\n", "\n")
+    # failed on cmd.exe's "a\r\nb" (#87 deep verify L3-02). Universal
+    # newlines, like text=True: a lone CR is a newline too (#87 v2 V2-2).
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     return text + ("\n[output truncated]" if len(data) > OUTPUT_CAP_BYTES else "")
 
 

@@ -991,9 +991,11 @@ class Daemon:
 
         Runs only after the worker's whole job has ended (`_reap_workers`),
         so nothing from THIS attempt is alive to race the read or the apply.
-        Another attempt's worker may be (`max_parallel > 1`, same user): the
-        trust fingerprint, the committed-tree check in `integrate_patch` and
-        the sha-pinned push bound what it can do (see the PR residuals). Returns
+        Another attempt's worker may be (`max_parallel > 1`, same user). It
+        cannot swap the daemon's clones (they are pinned and re-checked at
+        every call), but it can still write into them by absolute path: that
+        is the declared same-user residual (RUNNER_CONTRACT.md "What this does
+        not isolate"), not something these checks bound. Returns
         the claim with `integration_path` / `integrated_sha` set, the claim
         unchanged in skip-worktree mode, or None after routing the card to
         `blocked` (no patch, a refused patch, or an untrusted project).
