@@ -833,6 +833,26 @@ def test_time_statistics_leave_out_model_timeouts(tmp_path: Path) -> None:
     assert summary["median_decode_tokens_per_sec"] == 25.0
 
 
+def test_each_row_is_on_disk_before_the_next_card_starts(tmp_path: Path) -> None:
+    """Rows are flushed one by one, so a running arm can be inspected.
+
+    Read by opening the file: on NTFS a directory listing can still show 0
+    bytes for an open file that holds rows (arm E, 2026-10-29: the listing
+    read as "never flushed" while every row was there)."""
+    cards = [c for c in rb.load_cards() if c.card_id in ("bk-01", "bk-02", "bk-03")]
+    sink = tmp_path / "out" / "runs.jsonl"
+    seen: list[int] = []
+
+    class Peeks(FakeClient):
+        def chat(self, system: str, user: str, *, seed: int | None = None) -> rb.Reply:
+            seen.append(len(sink.read_text(encoding="utf-8").splitlines()))
+            return super().chat(system, user, seed=seed)
+
+    rb.run_arm(arm="T", client=Peeks(lambda u: "x"), runs=1, out_dir=tmp_path / "out",
+               vram=NoVram(), probe=False, cards=cards)
+    assert seen == [0, 1, 2]
+
+
 def test_a_reload_inside_a_card_run_is_never_counted_as_its_time(tmp_path: Path) -> None:
     """Daedalus 2026-10-29: the model store is on an HDD, so a reload is slow."""
     cards = [c for c in rb.load_cards() if c.card_id == "bk-01"]
