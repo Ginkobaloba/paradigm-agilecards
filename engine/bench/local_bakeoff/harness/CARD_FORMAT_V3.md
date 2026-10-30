@@ -100,14 +100,17 @@ bk-10); one control reply of 19,311 (B, bk-04).
 | main | 32768 | 26624 | about 6,000 tokens, as in v2 |
 | longctx | 65536 | 26624 if unchanged | about 38,900 tokens |
 
-**Open conflict:** the plan wants long-context cards over 50K tokens, but
-65536 minus a 26624 output budget leaves about 38.9K. Lowering `num_predict`
-to make room isn't free: 12288 would leave about 53K, but it would have
-truncated B's 19.3K-token reply on a v2 control. Thinking models spend their
-output budget on thinking. The choices are a smaller `num_predict` (with
-truncation recorded as its own outcome, as the harness already does) or a
-target below 39K. That's Daedalus's call, before any long-context card is
-written.
+**Decided (Daedalus, 2026-10-30):** long-context `num_predict` stays 26624.
+Prompts target **35K to 38K tokens, 38K maximum**, measured as the whole
+prompt (card body, every seed file, and the harness's block scaffolding)
+with the same tokenizer the harness counts with, not by characters or by
+eye. The harness's count is each model's own (Ollama's `prompt_eval_count`),
+and the models disagree: v2's largest prompt was 5,859 tokens for A and
+6,214 for B and E, about 6% apart. So the 38K maximum must hold for the
+highest-counting arm in the field. Leave about 6% under 38K if you measure
+with one model's tokenizer. The harness reports each card's prompt tokens
+on every row, so a card over budget shows up in a pilot run before the
+freeze.
 
 Main-exam real-failure cards have to fit their buggy context into about 6K
 tokens, or move to the sub-exam.

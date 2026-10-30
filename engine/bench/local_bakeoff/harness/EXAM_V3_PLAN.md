@@ -27,7 +27,10 @@ negative controls, 3 runs each. Class 2 is a separate sub-exam with its own
    never sees** (copied in by the harness after the reply is applied), plus
    the whole visible suite. A half-done change fails, and so does a reply
    that passes by writing its own vacuous test.
-2. **Long context (over 50K tokens).** A larger seed repo, or the v2 repo
+2. **Long context (35K to 38K-token prompts).** The first draft said "over
+   50K", which doesn't fit: 65536 `num_ctx` minus the 26624 `num_predict`
+   kept from the main exam leaves 38,912 tokens for the prompt. A larger
+   seed repo, or the v2 repo
    plus realistic logs or fixtures, so that the fact the change depends on
    sits deep in the prompt. **This class runs as a separate sub-exam.** v2
    fixes `num_ctx` at 32768, and Ollama reserves the KV cache for the full
@@ -131,6 +134,15 @@ draft and the v2 numbers, and each is folded in above:
   sub-exam's result, never pooled with the main exam's. An arm that can't
   hold 64K resident at 22 GB is reported "doesn't fit at 64K". The context
   is never shrunk to make an arm fit.
+- **Long-context budget:** `num_predict` stays 26624, as in the main exam, so
+  context length is the only variable between the two. Prompts target 35K to
+  38K tokens: 38K is the maximum, measured as the full prompt (card, seed and
+  harness scaffolding) with the same tokenizer the harness counts with:
+  each model's own, so the maximum must hold for the highest-counting arm
+  (v2 prompts measured about 6% apart between A and B). A
+  smaller `num_predict` was rejected because thinking models spend output on
+  thinking: B used 19,311 output tokens on a v2 control, which a 12288 cap
+  would have truncated.
 - **Real-failure cards:** drawn from real defects that fleet seats shipped
   and an independent verify then caught (ledgers and verify reports). Each
   card carries the original task, the buggy context, held-out tests, and the
