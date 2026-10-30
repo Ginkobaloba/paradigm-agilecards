@@ -255,8 +255,8 @@ def _integrate(*, project_dir: Path, base_sha: str, branch: str, patch_file: Pat
     # The baseline was taken before these, the daemon's own config writes;
     # take it again now. Nothing from THIS attempt is alive (its worker's
     # job has ended; its verifier has not started). A sibling attempt's
-    # worker could write files here by absolute path (the same-user
-    # residual, bounded by the fingerprint and the committed-tree check),
+    # worker could write files here by absolute path (the declared
+    # same-user residual, RUNNER_CONTRACT.md "What this does not isolate"),
     # but cannot swap this dir or its .git for a link: they are pinned
     # (git_safety "daemon clones"), and every call re-checks the pairing.
     git_safety.trust_daemon_clone(dest)
