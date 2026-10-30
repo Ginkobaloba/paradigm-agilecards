@@ -1575,7 +1575,8 @@ class Daemon:
         stays unavailable.
         """
         reason = (f"git could not run during {stage} (transient, the repo is "
-                  f"unchanged); safe to move back to backlog. ({detail})")
+                  f"unchanged); safe to move back to backlog, which starts a fresh "
+                  f"attempt: this attempt's patch is not reused. ({detail})")
         log.error("routing card_id=%s to blocked: %s", claim.card_id, reason)
         try:
             self.repo.transition(
