@@ -330,18 +330,30 @@ def _refuse_oversized(patch: bytes) -> None:
     of patch inflated to 1 GiB. A `literal N` hunk inflates to N bytes. A
     `delta N` hunk inflates to an N-byte delta that then BUILDS a result
     whose size is only in the delta's own header: 3.7 KB of patch built a
-    260 MB blob (#87 v2 V2-1), so both are counted."""
+    260 MB blob (#87 v2 V2-1), so both are counted.
+
+    Each `GIT binary patch` has a forward hunk, then a reverse one. A forward
+    apply inflates both but builds only the forward result, so a reverse
+    delta counts its N and not its result size (#87 V3-5: counting it
+    refused real patches whose OLD blob was large)."""
     files = len(_DIFF_HEADER_RE.findall(patch))
     if files > PATCH_MAX_FILES:
         raise PatchRejected(f"patch touches {files} files, over {PATCH_MAX_FILES}")
     lines = patch.split(b"\n")
     inflated = 0
+    hunk = 0  # hunks seen since the last `GIT binary patch`
     for i, line in enumerate(lines):
-        m = _BINARY_SIZE_RE.fullmatch(line.rstrip(b"\r"))
+        stripped = line.rstrip(b"\r")
+        if stripped == b"GIT binary patch":
+            hunk = 0
+            continue
+        m = _BINARY_SIZE_RE.fullmatch(stripped)
         if m is None:
             continue
+        hunk += 1
         inflated += int(m.group(2))
-        if m.group(1) == b"delta":
+        # Only the reverse slot is spared; any other hunk counts in full.
+        if m.group(1) == b"delta" and hunk != 2:
             inflated += _delta_result_size(lines[i + 1:i + 1 + _DELTA_HEAD_LINES])
     if inflated > PATCH_MAX_INFLATED_BYTES:
         raise PatchRejected(f"binary hunks inflate to {inflated} bytes, "

@@ -223,6 +223,90 @@ def test_a_commondir_planted_in_a_daemon_clone_is_refused(tmp_path: Path,
     assert _g(project, "rev-parse", "main").strip() == base
 
 
+def _plant_after(monkeypatch: pytest.MonkeyPatch, step: str, plant) -> list[str]:  # noqa: ANN001
+    """Run `plant(cwd)` just AFTER the daemon's git `step` returns: inside the
+    gap a fingerprint cannot see, right before the clone is re-baselined."""
+    seen: list[str] = []
+    real = clones._git
+
+    def racing(cwd: Path, *args: str, **kw: Any) -> str:
+        out = real(cwd, *args, **kw)
+        if args and args[0] == step and not seen:
+            plant(Path(cwd))
+            seen.append("planted")
+        return out
+
+    monkeypatch.setattr(clones, "_git", racing)
+    return seen
+
+
+@pytest.mark.parametrize("key,value", [
+    ("core.sshCommand", "evil"), ("core.fsmonitor", "evil"), ("include.path", "elsewhere"),
+    ("branch.card/x/1.remote", "https://example.invalid/r.git"),
+])
+def test_a_key_planted_before_the_rebaseline_is_refused_not_trusted(
+    key: str, value: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """V3-1: the daemon re-baselines after `remote add`. A key a sibling
+    wrote in that gap would be recorded as trusted; the allowlist refuses it."""
+    project, base = _trusted_project(tmp_path)
+    seen = _plant_after(monkeypatch, "remote",
+                        lambda dest: _g(dest, "config", "--file", str(dest / ".git" / "config"),
+                                        key, value))
+    with pytest.raises(git_safety.UntrustedRepo, match="is not one the daemon writes"):
+        _integrate(project, base, tmp_path)
+    assert seen == ["planted"]
+    assert _g(project, "rev-parse", "main").strip() == base
+
+
+def test_the_daemon_written_keys_still_trust() -> None:
+    # Control for the refusals above: what init, `remote add` and push -u write.
+    allowed = git_safety._daemon_clone_key_allowed
+    for key in ("core.repositoryformatversion", "core.ignorecase", "remote.origin.url",
+                "remote.origin.fetch", "branch.card/x.y.merge"):
+        assert allowed(key, "v"), key
+    assert allowed("branch.card/x.y.remote", "origin")
+    assert not allowed("branch.card/x.y.remote", "https://example.invalid/r.git")
+    assert not allowed("branch.card/x.y.pushremote", "origin")
+
+
+def test_a_clone_with_alternates_is_never_recorded_as_trusted(tmp_path: Path) -> None:
+    # The at-use check would catch it on the next call; this pins that the
+    # trust step itself refuses, so no record of it exists to rely on.
+    git_safety.configure(tmp_path / "state")
+    clone = tmp_path / "clone"
+    _g(tmp_path, "init", "-q", str(clone))
+    (clone / ".git" / "objects" / "info" / "alternates").write_text("elsewhere\n")
+    with pytest.raises(git_safety.UntrustedRepo, match="which the daemon never writes"):
+        git_safety.trust_daemon_clone(clone)
+    assert git_safety._key(clone) not in git_safety._DAEMON_CLONES
+
+
+@pytest.mark.parametrize("name", ["objects/info/alternates", "info/attributes"])
+@pytest.mark.parametrize("when", ["before trust", "at use"])
+def test_alternates_or_attributes_in_a_daemon_clone_are_refused(
+    name: str, when: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """V3-1: neither file is in the fingerprint, so a plant after trust would
+    pass it; each daemon git call checks for them too."""
+    project, base = _trusted_project(tmp_path)
+
+    def plant(dest: Path) -> None:
+        target = dest / ".git" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(str(project / ".git" / "objects") + "\n" if "alternates" in name
+                          else "* filter=x\n", encoding="utf-8")
+
+    if when == "before trust":
+        seen = _plant_after(monkeypatch, "remote", plant)
+    else:
+        seen = _swap_on(monkeypatch, "diff-index", plant)
+    with pytest.raises(git_safety.UntrustedRepo, match="which the daemon never writes"):
+        _integrate(project, base, tmp_path)
+    assert seen == ["planted"] or seen == ["swapped"]
+    assert _g(project, "rev-parse", "main").strip() == base
+
+
 def _hold_delete_handle(path: Path, seconds: float) -> threading.Thread:
     """An opener with DELETE access (what an indexer or a sibling holds)."""
     import ctypes
@@ -659,6 +743,37 @@ def test_a_binary_delta_is_capped_by_the_result_it_builds(tmp_path: Path) -> Non
         _apply(project, base, tmp_path, huge, "huge")
 
 
+def _delta_hunk(result_size: int) -> bytes:
+    import zlib
+    delta = _varint(200) + _varint(result_size) + bytes([0x90, 200])
+    return f"delta {len(delta)}\n".encode() + _b85_hunk(zlib.compress(delta, 9)) + b"\n"
+
+
+def _literal_hunk() -> bytes:
+    import zlib
+    return b"literal 4\n" + _b85_hunk(zlib.compress(b"tiny", 9)) + b"\n"
+
+
+def test_a_reverse_delta_counts_its_size_not_the_result_it_never_builds() -> None:
+    """V3-5: a forward apply never builds the reverse hunk's result, so a
+    large OLD blob must not refuse the patch. Each slot is pinned against
+    the other: the same delta in the forward slot is refused."""
+    huge = clones.PATCH_MAX_INFLATED_BYTES + 1
+    head = b"diff --git a/b.bin b/b.bin\nGIT binary patch\n"
+    clones._refuse_oversized(head + _literal_hunk() + _delta_hunk(huge))
+    # Per file, not per patch: a second file's reverse slot is spared too.
+    clones._refuse_oversized((head + _literal_hunk() + _delta_hunk(huge)) * 2)
+    with pytest.raises(clones.PatchRejected, match=r"^binary hunks inflate to"):
+        clones._refuse_oversized(head + _delta_hunk(huge) + _literal_hunk())
+    # Past the two slots, with no new header: counted in full.
+    with pytest.raises(clones.PatchRejected, match=r"^binary hunks inflate to"):
+        clones._refuse_oversized(head + _literal_hunk() + _literal_hunk() + _delta_hunk(huge))
+    # A second file's header resets the slots: its forward delta counts.
+    with pytest.raises(clones.PatchRejected, match=r"^binary hunks inflate to"):
+        clones._refuse_oversized(head + _literal_hunk() + _literal_hunk()
+                                 + head + _delta_hunk(huge) + _literal_hunk())
+
+
 def test_a_delta_git_itself_wrote_still_applies(tmp_path: Path) -> None:
     """Control for the header decode: a real `git diff --binary` delta."""
     import random
@@ -702,7 +817,34 @@ def test_an_unreadable_diff_is_logged(tmp_path: Path, caplog: pytest.LogCaptureF
     from cards_runner.daemon.diff_stats import DiffStats
     project, base = _trusted_project(tmp_path)
     stats = DiffStats.from_worktree(project, branch="no-such-rev", base_branch=base)
-    assert stats.total_lines == 0 and "diff stats unreadable" in caplog.text
+    assert stats.total_lines == 0 and stats.readable is False
+    # M8, M9: the rc and git's own words, not just "unreadable".
+    assert "diff stats unreadable" in caplog.text and "git rc=128" in caplog.text
+    assert "no-such-rev" in caplog.text  # from git's stderr
+
+
+def test_a_diff_git_could_not_start_is_logged_and_unreadable(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M6: the exception path logs too, naming the exception."""
+    from cards_runner.daemon import diff_stats
+
+    def no_git(*_: object, **__: object) -> object:
+        raise FileNotFoundError("git not found")
+
+    monkeypatch.setattr(diff_stats, "run_git", no_git)
+    stats = diff_stats.DiffStats.from_worktree(tmp_path, branch="b", base_branch="main")
+    assert stats.readable is False
+    assert "diff stats unreadable" in caplog.text
+    assert "FileNotFoundError" in caplog.text and "git not found" in caplog.text
+
+
+def test_a_read_empty_diff_is_readable(tmp_path: Path) -> None:
+    """Control for the two above: an empty diff git did read stays readable."""
+    from cards_runner.daemon.diff_stats import DiffStats
+    project, base = _trusted_project(tmp_path)
+    stats = DiffStats.from_worktree(project, branch=base, base_branch=base)
+    assert stats.total_lines == 0 and stats.readable is True
 
 
 def test_a_patch_over_the_file_count_is_refused(tmp_path: Path) -> None:

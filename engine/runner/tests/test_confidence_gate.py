@@ -150,6 +150,7 @@ def _strong_inputs(**over: object) -> GateInputs:
     ("sibling_decision", "request_changes", "sibling_disagreement"),
     ("change_request_unresolved", True, "executor_change_request_unresolved"),
     ("verifier_incomplete_metrics", True, "verifier_incomplete_metrics"),
+    ("diff_unreadable", True, "diff_unreadable"),
 ])
 def test_hard_escalator_forces_human(field: str, value: object,
                                      escalator: str) -> None:
@@ -198,6 +199,33 @@ def test_policy_escalator_cannot_be_disabled() -> None:
     # large_diff is a soft escalator -> can be disabled.
     big = gate.decide(_strong_inputs(diff_total_lines=600), BucketHistory())
     assert "large_diff" not in big.escalators
+
+
+def test_an_unreadable_diff_cannot_be_disabled_or_read_as_clean() -> None:
+    """#87 CI: git failed on a long path, the gate saw an empty diff, and an
+    empty diff scores as clean. An unread diff is policy: it escalates, even
+    with every escalator listed as disabled, and the audit records it."""
+    gate = ConfidenceGate(ConfidenceGateConfig(
+        hard_escalators_disabled=("diff_unreadable",)))
+    dec = gate.decide(_strong_inputs(diff_unreadable=True, diff_total_lines=0),
+                      BucketHistory())
+    assert dec.outcome == OUTCOME_HUMAN and "diff_unreadable" in dec.escalators
+    clean = gate.decide(_strong_inputs(diff_total_lines=0), BucketHistory())
+    assert "diff_unreadable" not in clean.escalators  # control: a read empty diff
+
+
+def test_build_gate_inputs_carries_an_unreadable_diff() -> None:
+    from cards_runner.store.models import CardRecord
+    from cards_runner.verifier.runner import VerifierResult
+
+    record = CardRecord(card_id="c", tenant_id="default", status="active",
+                        work_type="docs", points=1)
+    vr = VerifierResult(overall_status="pass", items=())
+    unread = build_gate_inputs(record=record, verifier_result=vr,
+                               diff_stats=DiffStats(readable=False))
+    read = build_gate_inputs(record=record, verifier_result=vr,
+                             diff_stats=DiffStats())
+    assert unread.diff_unreadable is True and read.diff_unreadable is False
 
 
 def test_historical_floor_compresses_score() -> None:

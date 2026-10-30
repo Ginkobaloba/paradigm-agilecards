@@ -74,6 +74,9 @@ class DiffStats:
     files: tuple[str, ...] = ()
     lines_added: int = 0
     lines_removed: int = 0
+    # False when git could not produce the diff. An empty diff and an
+    # unread one are different facts: the gate escalates the second.
+    readable: bool = True
 
     @property
     def total_lines(self) -> int:
@@ -120,9 +123,10 @@ class DiffStats:
         """Run `git diff base...branch --numstat` in the worktree.
 
         Raises RepoQuarantined / UntrustedRepo (git_safety) rather than
-        guess. Returns an empty DiffStats on any git failure, logged here --
-        the gate treats an unreadable diff as "no diff signal" and leans on
-        the other inputs.
+        guess. On any git failure, logged here, returns a DiffStats with
+        `readable=False`: the confidence gate turns that into the
+        `diff_unreadable` hard escalator (human review), never into "no
+        lines changed, nothing sensitive touched".
 
         The range ends with `--`: without it git also tests whether the
         range is a FILE, by stat()ing it under the cwd. In a deep state dir
@@ -145,12 +149,13 @@ class DiffStats:
         # RepoQuarantined / UntrustedRepo propagate: an empty diff would
         # read as "nothing sensitive changed" to the confidence gate.
         except (OSError, subprocess.SubprocessError) as exc:
-            log.warning("diff stats unreadable in %s: %s", worktree, exc)
-            return cls()
+            log.warning("diff stats unreadable in %s: %s: %s", worktree,
+                        type(exc).__name__, exc)
+            return cls(readable=False)
         if result.returncode != 0:
             log.warning("diff stats unreadable in %s: git rc=%s %s", worktree,
                         result.returncode, (result.stderr or "").strip()[:400])
-            return cls()
+            return cls(readable=False)
         return cls.from_numstat(result.stdout)
 
 
