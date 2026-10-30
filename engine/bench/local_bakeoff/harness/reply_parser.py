@@ -73,7 +73,10 @@ def parse_reply(reply: str) -> ParseResult:
     current: str | None = None
     body: list[str] = []
     for line in reply.splitlines():
-        marker = line.strip()
+        # A byte-order mark is not whitespace to strip(); before a header it
+        # failed a correct reply (#88 re-review S-F9). Markers only: content
+        # lines keep every character.
+        marker = line.strip().lstrip("﻿")
         header = _HEADER.match(marker)
         if header is not None:
             if current is not None:

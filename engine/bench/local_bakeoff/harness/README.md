@@ -89,6 +89,23 @@ than edited there:
   and capabilities.
 - **D's top_k.** The table gives "(none)". Leaving top_k out would let
   Ollama's default of 40 apply, so it is sent as 0 (no top-k cut).
+- **pass^3.** PROTOCOL.md computes it over cards with no infra error. Then
+  infra errors on exactly the cards an arm cannot solve RAISED its pass^3
+  (0.700 to 1.000 with 3 errors in 30, inside the 10% cap; #88 re-review
+  N1). The headline `pass_pow_3` counts an errored card as a fail; the
+  protocol's figure is `pass_pow_3_clean_cards`, reported next to it.
+- **Scorer files.** PROTOCOL.md names two (`run_bakeoff.py`,
+  `reply_parser.py`); the harness hashes three, adding `verify_child.py`,
+  which runs the verifier.
+- **A byte-order mark** before a block header or end marker is ignored when
+  the marker is matched (it is not whitespace to `strip()`). Content lines
+  keep every character.
+- **A harness failure on one card-run** (an exception while scoring) is
+  recorded on that row as `harness_error` with outcome `infra_error`, and
+  makes the arm invalid; it never stops the arm and is never the model's fail.
+- **Pinned arms only.** An arm name not in `ARMS` is refused. `--model` off
+  the arm's tag (with `--allow-off-tag`) or `--num-ctx` other than 32768 runs,
+  is listed in `config.off_protocol`, and makes the arm invalid.
 
 ## Reading results
 
@@ -99,13 +116,23 @@ than edited there:
 - Each card-run has exactly one outcome: pass, parse failure, truncated, AC
   failure, verifier timeout, forged, model timeout or infra error.
 - `config` in `summary.json` holds the Ollama version, the digest and every
-  option sent. `pool_problems` refuses to pool arms that differ in digest,
-  options, think, Ollama version, exam or scorer.
+  option sent. The digest is pinned: it is read again after load and after
+  every card-run (per row, `digest`), and any change from the pre-load read
+  makes the arm invalid. `pool_problems` is a helper for whoever combines
+  results: it names arms that differ in digest, options, think, Ollama
+  version, exam or scorer. Nothing in the harness pools results itself.
+- There is no "first use" stamp. What stops results being mixed across
+  exams is the refusal to run while `results/` holds rows from another exam
+  digest; what dates the exam is the server push time above.
 - A **suspect** run wrote a forgery token (`os._exit`, `sys.modules`, ...).
   The canary decides forgery; the token only flags the run for a human.
 - **Time** is over non-error exam card-runs, with any model load inside a
-  request taken out (`card_seconds`); `reloads_in_runs` counts mid-arm
-  reloads. `residency` (`/api/ps`) says whether the model sat fully in VRAM
+  request taken out (`card_seconds`, never below 0; `load_exceeds_wall_runs`
+  counts the rows where Ollama's load time was longer than the wall time);
+  `reloads_in_runs` counts mid-arm loads over 1 s. Not seen by the harness:
+  a reload whose `load_duration` Ollama reports as 0 or leaves out, and
+  page-in from the HDD for layers offloaded to the CPU (arm D), which is not
+  in `load_duration`. `residency` (`/api/ps`) says whether the model sat fully in VRAM
   (`size_vram == size`); without that, times are not comparable across arms.
 - **VRAM** figures are whole-card nvidia-smi reads for one GPU (`--gpu-index`).
   This machine runs WDDM, which has no per-process VRAM, so they include the
@@ -118,6 +145,20 @@ than edited there:
   `thinking` field is counted (`thinking_chars`) but never parsed. A1 and A2
   strip inline think tags before parsing; `pass_at_1_raw` scores the raw
   reply as a sensitivity line.
+- **Known gaps in A1/A2, kept as the frozen protocol defines them:** only
+  lowercase `<think>`/`</think>` are stripped, so `<THINK>`, `<thinking>`
+  and gpt-oss harmony channel text that leaks into `content` (rather than
+  Ollama's `thinking` field, where it belongs when `think` is set) are
+  scored as written, usually a parse failure. A literal `</think>` inside a
+  final file block triggers A2 and fails a correct reply. Read
+  `thinking_chars` and the replies for arm D before reading its parse
+  failures as skill.
+- **The canary can be evaded on purpose:** code that skips its forgery when
+  `test_canary` is in `sys.argv` passes undetected (#88 re-review N2). It
+  catches the forgeries a model stumbles into, not one written against it;
+  the negative controls still fail under that forgery.
+- `summary.unload` says whether unloading returned an error and whether
+  `/api/ps` still lists the model afterwards.
 - Every row and summary carries `exam_version`, `exam_digest`, `scorer`
   (file hashes), `repo_head`, and the Python and pytest versions.
 

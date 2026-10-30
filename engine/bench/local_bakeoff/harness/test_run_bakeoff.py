@@ -445,7 +445,9 @@ def test_infra_errors_leave_the_denominator_and_are_reported() -> None:
     s = rb.summarize("T", "m", rows, runs=3)
     assert s["card_runs"] == 30 and s["answered_card_runs"] == 29 and s["infra_errors"] == 1
     assert s["pass_at_1"] == 1.0 and s["pass_at_1_errors_as_fails"] == pytest.approx(29 / 30)
-    assert s["pass_pow_3"] == 1.0 and s["pass_pow_3_cards_left_out"] == 1
+    # N1: the errored card is a pass^3 fail; the clean-cards figure leaves it out.
+    assert s["pass_pow_3"] == 0.9 and s["pass_pow_3_clean_cards"] == 1.0
+    assert s["pass_pow_3_cards_left_out"] == 1
     assert s["arm_valid"], s["invalid_reasons"]
 
 
@@ -880,3 +882,167 @@ def test_the_probe_samples_with_seeds_keeps_replies_and_nulls_a_failed_call(
                "residency": None, "vram": {}, "refusal_probes": probes}
     md = rb.render_md(summary)
     assert "ERROR HTTP 500" in md and "not scored, not ranked" in md
+
+
+# ---- #88 re-review v2: N1, N3/N4, I-F7, I-F8, N6, N7, M-11, S-F9 ----------
+
+
+def _n1_row(card_id: str, run: int, outcome: str) -> dict[str, Any]:
+    return {"card_id": card_id, "run": run, "outcome": outcome, "passed": outcome == "pass",
+            "forged": False, "verdict": "pass" if outcome == "pass" else "fail",
+            "touched_tests": [], "suspect": [], "started_at": 0.0, "ended_at": 1.0}
+
+
+def test_infra_errors_on_the_cards_an_arm_cannot_solve_never_raise_pass_pow_3() -> None:
+    """N1: errored cards dropped out of pass^3, so 3 infra errors (inside the
+    10% cap) on exactly the 3 unsolvable cards raised it from 0.700 to 1.000."""
+    exam = sorted(c.card_id for c in rb.load_cards() if c.card_id not in rb.NEGATIVE_CONTROLS)
+    solved, unsolved = exam[:7], exam[7:]
+    records = [_n1_row(cid, run, "pass") for cid in solved for run in (1, 2, 3)]
+    records += [_n1_row(cid, run, "infra_error" if run == 1 else "ac_failure")
+                for cid in unsolved for run in (1, 2, 3)]
+    records += [_n1_row(cid, run, "ac_failure") for cid in sorted(rb.NEGATIVE_CONTROLS)
+                for run in (1, 2, 3)]
+    s = rb.summarize("T", "m", records, 3)
+    assert s["arm_valid"] and s["infra_errors"] == 3  # inside the cap: still valid
+    assert s["pass_pow_3"] == 0.7  # an errored card is a fail
+    assert s["pass_pow_3_clean_cards"] == 1.0 and s["pass_pow_3_cards_left_out"] == 3
+    no_errors = [dict(r, outcome="ac_failure") if r["outcome"] == "infra_error" else r
+                 for r in records]
+    assert rb.summarize("T", "m", no_errors, 3)["pass_pow_3"] == 0.7  # control: same number
+
+
+class _Digests(FakeClient):
+    def __init__(self, flip_after: int | None) -> None:
+        super().__init__(lambda u: "nothing")
+        self.reads, self.flip_after = 0, flip_after
+
+    def digest(self) -> str | None:
+        self.reads += 1
+        flipped = self.flip_after is not None and self.reads > self.flip_after
+        return "d" * 64 if flipped else "c" * 64
+
+
+@pytest.mark.parametrize("flip_after,changed", [(None, False), (3, True), (0, True)],
+                         ids=["stable", "mid-arm", "at-load"])
+def test_a_digest_change_during_the_arm_invalidates_it(tmp_path: Path, flip_after: int | None,
+                                                       changed: bool) -> None:
+    """N3: a fake server flipped the digest after 10 requests and the arm
+    stayed valid. N4: the pre-load read alone missed a swap before load."""
+    cards = [c for c in rb.load_cards() if c.card_id in ("bk-01", "bk-02", "bk-03")]
+    client = _Digests(flip_after)
+    summary = rb.run_arm(arm="T", client=client, runs=2, out_dir=tmp_path / "out", vram=NoVram(),
+                         probe=False, cards=cards, config={"digest": "c" * 64})
+    assert client.reads == 1 + 6  # after load, then after every card-run
+    reasons = [r for r in summary["invalid_reasons"] if "digest changed" in r]
+    assert bool(reasons) is changed
+    rows = [json.loads(x) for x in (tmp_path / "out" / "runs.jsonl").read_text().splitlines()]
+    assert all(r["digest"] for r in rows)
+
+
+def test_a_block_ntfs_folds_into_tests_is_a_flag_not_a_crash(tmp_path: Path) -> None:
+    """I-F7: `tests./x.py` raised FileNotFoundError in suspect_hits and killed the arm."""
+    cards = [c for c in rb.load_cards() if c.card_id == "bk-01"]
+    files = {**_solution("bk-01"), "tests./x.py": "x = 1\n"}
+    _run(tmp_path, lambda user: _blocks(files), cards=cards)
+    record = json.loads((tmp_path / "out" / "runs.jsonl").read_text().splitlines()[0])
+    assert any("unreadable after apply" in hit for hit in record["suspect"]), record
+
+
+def test_a_harness_failure_on_one_row_is_recorded_and_invalidates(tmp_path: Path) -> None:
+    cards = [c for c in rb.load_cards() if c.card_id in ("bk-01", "bk-02")]
+
+    def broken(*a: Any, **kw: Any) -> dict[str, Any]:
+        raise RuntimeError("scorer bug")
+
+    summary = _run(tmp_path, lambda user: _blocks(_solution(_card_of(user, cards).card_id)),
+                   cards=cards, verify=broken)
+    rows = [json.loads(x) for x in (tmp_path / "out" / "runs.jsonl").read_text().splitlines()]
+    assert len(rows) == 2 and all(r["harness_error"] == "RuntimeError: scorer bug" for r in rows)
+    assert all(r["outcome"] == "infra_error" for r in rows)
+    assert any("failed to score 2" in r for r in summary["invalid_reasons"])
+
+
+def test_an_arm_without_declared_sampling_refuses(capsys: pytest.CaptureFixture[str]) -> None:
+    """I-F8: an unknown arm name plus --model ran with no sampling pins, valid."""
+    assert rb.main(["--arm", "Z", "--model", "qwen3:30b", "--no-lease"]) == 2
+    assert "no declared sampling" in capsys.readouterr().out
+
+
+def test_an_off_protocol_option_is_labeled_and_invalid(monkeypatch: pytest.MonkeyPatch,
+                                                       tmp_path: Path) -> None:
+    reached: list[dict[str, Any]] = []
+    real_run_arm = rb.run_arm
+    for name in ("scorer_problems", "frozen_tree_problems", "results_problems",
+                 "positive_control"):
+        monkeypatch.setattr(rb, name, lambda: [])
+    monkeypatch.setattr(rb.OllamaClient, "describe",
+                        lambda self: {"model": self.name, "ollama_version": "0.40.13",
+                                      "digest": "c" * 64})
+    monkeypatch.setattr(rb, "run_arm", lambda **kw: reached.append(kw) or {"arm_valid": False})
+    monkeypatch.setattr(rb, "render_md", lambda s: "")
+    assert rb.main(["--arm", "A", "--num-ctx", "16384", "--no-lease"]) == 3
+    assert reached[0]["config"]["off_protocol"] == ["num_ctx 16384, not 32768"]
+    cards = [c for c in rb.load_cards() if c.card_id == "bk-01"]
+    summary = real_run_arm(arm="T", client=FakeClient(lambda u: "x"), runs=1,
+                           out_dir=tmp_path / "out", vram=NoVram(), probe=False, cards=cards,
+                           config=reached[0]["config"])
+    assert "off protocol: num_ctx 16384, not 32768" in summary["invalid_reasons"]
+
+
+def test_a_body_cut_off_mid_read_is_an_infra_error() -> None:
+    """N6: http.client.IncompleteRead escaped and aborted the arm."""
+    class Short(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.send_header("Content-Length", "500")
+            self.end_headers()
+            self.wfile.write(b'{"message": {"content": "x"')  # then the connection closes
+            self.close_connection = True
+
+        def log_message(self, *a: Any) -> None:
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Short)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        reply = rb.OllamaClient("m:1", host=f"http://127.0.0.1:{server.server_port}",
+                                timeout_sec=5).chat("s", "u")
+    finally:
+        server.shutdown()
+    assert reply.error_kind == "infra" and "IncompleteRead" in reply.error
+
+
+def test_a_load_longer_than_the_wall_is_clamped_and_counted(tmp_path: Path) -> None:
+    """N7: card_seconds went negative."""
+    cards = [c for c in rb.load_cards() if c.card_id == "bk-01"]
+
+    class Odd(FakeClient):
+        def chat(self, system: str, user: str, *, seed: int | None = None) -> rb.Reply:
+            return rb.Reply("x", 0.0, 6.0, load_seconds=10.0)
+
+    summary = rb.run_arm(arm="T", client=Odd(lambda u: ""), runs=1, out_dir=tmp_path / "out",
+                         vram=NoVram(), probe=False, cards=cards)
+    assert summary["median_card_seconds"] == 0.0 and summary["load_exceeds_wall_runs"] == 1
+
+
+def test_unload_reports_whether_it_took() -> None:
+    """M-11: unload errors were swallowed and nothing checked /api/ps after."""
+    server, _ = _capture_server(_SERVER_REPLIES)  # /api/ps still lists the model
+    try:
+        result = _client_b(server.server_port).unload()
+    finally:
+        server.shutdown()
+    assert result == {"error": None, "still_loaded": True}
+    down = rb.OllamaClient("m:1", host="http://127.0.0.1:9", timeout_sec=2).unload()
+    assert down["error"] and down["still_loaded"] is None
+
+
+def test_a_bom_before_the_first_header_still_parses() -> None:
+    """S-F9."""
+    from reply_parser import parse_reply
+    parsed = parse_reply("﻿<<<FILE a.py>>>\nx = 1\n<<<END FILE>>>\n")
+    assert parsed.ok and parsed.blocks[0].path == "a.py"
+    assert parse_reply("<<<FILE a.py>>>\n﻿x = 1\n<<<END FILE>>>\n").blocks[0].content.startswith(
+        "﻿")  # content keeps it

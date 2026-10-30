@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -349,6 +350,15 @@ class OllamaClient:
             "options": self._options(), "seed_base": SEED_BASE, "think": self.think,
         }
 
+    def digest(self) -> str | None:
+        """The tag's digest now, from /api/tags; None if it cannot be read."""
+        try:
+            models = self._get("/api/tags").get("models") or []
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
+            return None
+        return next((m.get("digest") for m in models
+                     if self.name in (m.get("name"), m.get("model"))), None)
+
     def residency(self) -> dict[str, Any]:
         """/api/ps for this model: GPU-resident only if size_vram == size."""
         try:
@@ -382,7 +392,8 @@ class OllamaClient:
             payload["think"] = self.think
         try:
             data = self._post("/api/chat", payload)
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError,
+                ValueError) as exc:  # HTTPException: a body cut off mid-read (N6)
             slow = isinstance(exc, TimeoutError) or isinstance(
                 getattr(exc, "reason", None), TimeoutError)
             return Reply("", started, time.time(), error=f"{type(exc).__name__}: {exc}",
@@ -407,11 +418,14 @@ class OllamaClient:
             total_seconds=_seconds(data, "total_duration"),
         )
 
-    def unload(self) -> None:
+    def unload(self) -> dict[str, Any]:
+        """keep_alive 0, then /api/ps: the result says whether it took (M-11)."""
+        error = None
         try:
             self._post("/api/generate", {"model": self.name, "prompt": "", "keep_alive": 0})
-        except (urllib.error.URLError, OSError, ValueError):
-            pass
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        return {"error": error, "still_loaded": self.residency().get("loaded")}
 
 
 # ---- VRAM ---------------------------------------------------------------
@@ -642,7 +656,11 @@ def suspect_hits(scratch: Path, written: tuple[str, ...]) -> list[str]:
         parts = PurePosixPath(rel).parts
         if not rel.endswith(".py") or parts[0].casefold() == "tests":
             continue
-        text = (scratch / rel).read_text(encoding="utf-8", errors="replace")
+        try:
+            text = (scratch / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:  # e.g. `tests./x.py`: NTFS folds it into tests/, which the restore reset
+            hits.append(f"{rel}: unreadable after apply ({type(exc).__name__})")
+            continue
         hits += [f"{rel}: {token}" for token in SUSPECT_TOKENS if token in text]
     return hits
 
@@ -795,7 +813,11 @@ def card_seconds(record: dict[str, Any]) -> float:
     """A card-run's time with any model load inside it taken out: the arm's
     first load is timed apart (summary.load), and a mid-arm reload is the
     disk's time, not the model's."""
-    return record["ended_at"] - record["started_at"] - (record.get("load_seconds") or 0.0)
+    return max(0.0, record["ended_at"] - record["started_at"] - (record.get("load_seconds") or 0.0))
+
+
+def _load_exceeds_wall(record: dict[str, Any]) -> bool:
+    return (record.get("load_seconds") or 0.0) > record["ended_at"] - record["started_at"]
 
 
 def summarize(arm: str, model: str, records: list[dict[str, Any]], runs: int) -> dict[str, Any]:
@@ -810,6 +832,12 @@ def summarize(arm: str, model: str, records: list[dict[str, Any]], runs: int) ->
         by_card.setdefault(r["card_id"], []).append(r)
     clean_cards = {cid: rs for cid, rs in by_card.items()
                    if len(rs) == runs and all(r["outcome"] != "infra_error" for r in rs)}
+    # N1: with errored cards left out, errors on exactly the cards an arm
+    # cannot solve RAISED its pass^3 (0.700 to 1.000 inside the 10% cap).
+    # The headline counts an errored card as a fail; the protocol's
+    # clean-cards figure is reported next to it (harness/README.md).
+    all_passed = sum(len(rs) == runs and all(r["outcome"] == "pass" for r in rs)
+                     for rs in by_card.values())
     # A control counts as passed by the verifier's verdict, whatever else was
     # flagged, and it must actually have run (PROTOCOL.md v2).
     control_passes = [r for r in controls if r.get("verdict") == VERDICT_PASS]
@@ -827,6 +855,9 @@ def summarize(arm: str, model: str, records: list[dict[str, Any]], runs: int) ->
     forged = [{"card_id": r["card_id"], "run": r["run"]} for r in records if r["forged"]]
     if forged:
         invalid.append(f"forged card-runs: {len(forged)}")
+    harness_errors = [r for r in records if r.get("harness_error")]
+    if harness_errors:
+        invalid.append(f"the harness failed to score {len(harness_errors)} card-run(s)")
     return {
         "label": LABEL, "arm": arm, "model": model, "runs_per_card": runs,
         "card_runs": len(exam), "answered_card_runs": len(answered),
@@ -838,8 +869,10 @@ def summarize(arm: str, model: str, records: list[dict[str, Any]], runs: int) ->
         "pass_at_1_raw": (sum(r.get("raw_passed", r["passed"]) for r in answered) / len(answered)
                           if answered else None),
         "think_flags": {f: sum(bool(r.get(f)) for r in records) for f in THINK_FLAGS},
-        "pass_pow_3": (sum(all(r["outcome"] == "pass" for r in rs) for rs in clean_cards.values())
-                       / len(clean_cards) if clean_cards else None),
+        "pass_pow_3": all_passed / len(by_card) if by_card else None,
+        "pass_pow_3_clean_cards": (sum(all(r["outcome"] == "pass" for r in rs)
+                                       for rs in clean_cards.values())
+                                   / len(clean_cards) if clean_cards else None),
         "pass_pow_3_cards_left_out": len(by_card) - len(clean_cards),
         "outcomes": {o: sum(r["outcome"] == o for r in exam) for o in OUTCOMES},
         "parse_failures": sum(r["outcome"] == "parse_failure" for r in exam),
@@ -860,6 +893,7 @@ def summarize(arm: str, model: str, records: list[dict[str, Any]], runs: int) ->
         "max_load_seconds_in_runs": max((r.get("load_seconds") or 0.0 for r in timed),
                                         default=None),
         "reloads_in_runs": sum((r.get("load_seconds") or 0.0) > RELOAD_SEC for r in records),
+        "load_exceeds_wall_runs": sum(_load_exceeds_wall(r) for r in records),
         "timed_card_runs": len(timed),
     }
 
@@ -900,6 +934,11 @@ def run_arm(*, arm: str, client: ModelClient, runs: int, out_dir: Path,
     vram.start()  # before load, so the load's own peak is sampled
     load = client.load()  # timed apart from every card-run
     residency = client.residency() if hasattr(client, "residency") else None
+    # N3/N4: the digest is pinned, not just recorded: read after load and
+    # after every card-run; any change from the pre-load read invalidates.
+    read_digest = getattr(client, "digest", None)
+    pinned = config.get("digest")
+    digests: list[str | None] = [read_digest()] if read_digest and pinned else []
     records: list[dict[str, Any]] = []
     probes: list[dict[str, Any]] = []
     try:
@@ -924,18 +963,32 @@ def run_arm(*, arm: str, client: ModelClient, runs: int, out_dir: Path,
                     stripped, flags = strip_think(reply.content)
                     changed = stripped != reply.content
                     record.update(label_set, **flags)
+                    if digests:
+                        digests.append(read_digest())
+                        record["digest"] = digests[-1]
                     if reply.error_kind == "infra":  # no answer: nothing to score
                         record.update(parsed=False, parse_failure=None, blocks=0,
                                       touched_tests=[], suspect=[], passed=False, ac=[],
                                       verifier_timeout=False, forged=False,
                                       think_in_block=False, raw_passed=False)
                     else:
-                        record.update(score_reply(card, stripped, verify=verify))  # A2+A1: primary
-                        # Sensitivity: the raw reply, scored only when stripping changed it.
-                        record["raw_passed"] = (
-                            score_reply(card, reply.content, verify=verify)["passed"]
-                            if changed else record["passed"])
-                    record["outcome"] = outcome(record, reply, getattr(client, "num_ctx", None))
+                        try:
+                            record.update(score_reply(card, stripped, verify=verify))  # A2+A1
+                            # Sensitivity: the raw reply, scored only when stripping changed it.
+                            record["raw_passed"] = (
+                                score_reply(card, reply.content, verify=verify)["passed"]
+                                if changed else record["passed"])
+                        except Exception as exc:  # noqa: BLE001 - one row, never the arm (I-F7)
+                            record.update(parsed=False, parse_failure=None, blocks=0,
+                                          touched_tests=[], suspect=[], passed=False, ac=[],
+                                          verifier_timeout=False, forged=False,
+                                          think_in_block=False, raw_passed=False,
+                                          harness_error=f"{type(exc).__name__}: {exc}")
+                    # A harness failure is not the model's answer: counted with infra
+                    # errors, and it invalidates the arm.
+                    record["outcome"] = ("infra_error" if record.get("harness_error")
+                                         else outcome(record, reply,
+                                                      getattr(client, "num_ctx", None)))
                     record["card_seconds"] = card_seconds(record)
                     (out_dir / "replies").mkdir(exist_ok=True)
                     (out_dir / "replies" / f"{card.card_id}-r{run}.txt").write_text(
@@ -949,10 +1002,18 @@ def run_arm(*, arm: str, client: ModelClient, runs: int, out_dir: Path,
         probes = refusal_probe(client, out_dir) if probe else []
     finally:
         vram_stats = vram.stop()
-        client.unload()
+        unload = client.unload()
     after_unload = vram.read()
     peak = vram_stats["peak_mib"]
     summary = summarize(arm, client.name, records, runs)
+    changed_digests = sorted({str(d) for d in digests if d != pinned})
+    if changed_digests:
+        summary["invalid_reasons"].append(
+            f"the model's digest changed during the arm: {pinned} then {changed_digests}")
+    for problem in config.get("off_protocol") or []:
+        summary["invalid_reasons"].append(f"off protocol: {problem}")
+    summary["arm_valid"] = not summary["invalid_reasons"]
+    summary["unload"] = unload if isinstance(unload, dict) else None
     summary.update(label_set, config=config, load=load, residency=residency,
                    vram={"baseline_mib": baseline, **vram_stats,
                          "delta_mib": peak - baseline if None not in (peak, baseline) else None,
@@ -972,8 +1033,9 @@ def render_md(s: dict[str, Any]) -> str:
              f"python {s.get('python')}, pytest {s.get('pytest')}",
              f"- **Valid:** {'yes' if s['arm_valid'] else 'NO: ' + '; '.join(s['invalid_reasons'])}",
              f"- pass@1: {pct(s['pass_at_1'])} over {s['answered_card_runs']} answered "
-             f"card-runs; pass^3: {pct(s['pass_pow_3'])} "
-             f"({s['pass_pow_3_cards_left_out']} card(s) left out for an infra error)",
+             f"card-runs; pass^3: {pct(s['pass_pow_3'])} (an errored card counts as a fail; "
+             f"over clean cards only: {pct(s['pass_pow_3_clean_cards'])}, "
+             f"{s['pass_pow_3_cards_left_out']} card(s) left out)",
              f"- Errors as fails: pass@1 {pct(s['pass_at_1_errors_as_fails'])} over "
              f"{s['card_runs']} card-runs; infra errors: {s['infra_errors']}",
              f"- Sensitivity (A1/A2, raw reply): pass@1 {pct(s['pass_at_1_raw'])}; "
@@ -1022,14 +1084,20 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     arm = ARMS.get(args.arm)
-    pinned = arm.tag if arm else None
+    if arm is None:  # I-F8: no declared sampling, so nothing to pin a run to
+        print(f"refusing: arm {args.arm!r} is not in ARMS, so it has no declared sampling")
+        return 2
+    pinned = arm.tag
     if args.model is None:
-        if pinned is None:
-            ap.error(f"arm {args.arm!r} has no pinned tag; pass --model")
         args.model = pinned
-    elif pinned is not None and args.model != pinned and not args.allow_off_tag:
+    elif args.model != pinned and not args.allow_off_tag:
         print(f"refusing: arm {args.arm} is pinned to {pinned!r}, not {args.model!r}")
         return 2
+    off_protocol = []
+    if args.model != pinned:
+        off_protocol.append(f"model {args.model!r}, not the arm's tag {pinned!r}")
+    if args.num_ctx != NUM_CTX:
+        off_protocol.append(f"num_ctx {args.num_ctx}, not {NUM_CTX}")
     for why, problems in (
             ("the runner or harness source differs from HEAD, so the labels would not "
              "name what scored the run", scorer_problems()),
@@ -1052,14 +1120,14 @@ def main(argv: list[str] | None = None) -> int:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out = args.out or HERE / "results" / f"{args.arm}-{stamp}"
     client = OllamaClient(args.model, host=args.host, num_ctx=args.num_ctx,
-                          sampling=dict(arm.sampling) if arm else {},
-                          think=arm.think if arm else None, timeout_sec=args.timeout)
+                          sampling=dict(arm.sampling), think=arm.think, timeout_sec=args.timeout)
     try:
         config = client.describe()
     except (urllib.error.URLError, OSError, ValueError) as exc:
         print(f"refusing: could not read the server's version, tags or model: {exc}")
         return 2
-    config["sampling_source"] = arm.source if arm else "none: not a pinned arm"
+    config["sampling_source"] = arm.source
+    config["off_protocol"] = off_protocol  # labeled, and the arm is invalid (I-F8)
     problems = server_problems(config)
     if problems:
         print("refusing: " + "; ".join(problems))
