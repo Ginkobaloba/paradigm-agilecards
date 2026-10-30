@@ -56,11 +56,15 @@ touching code.
 - **What passed:** 432 V3-1 plant trials with 0 markers and 0 trusted (the
   positive control on main fired 10 of 12). V3-5, M1-M9 and V3-4 all
   killed. Suite 998, ruff clean, 31 of 34 mutants killed.
-- **Process:** fixes go on #91's branch (`fix/runner-87-followups`, worktree
-  `ac-87fu`) only once Daedalus says the branch is open again; it was
-  frozen during the verify. Because B1 is live on main, ask Daedalus
-  whether it should ship as its own urgent PR ahead of the rest. Whoever
-  re-verifies has to be a different session from the author.
+- **Process (Daedalus, 00:57):**
+  1. **B1 ships FIRST, as its own small PR from main**, ahead of the rest of
+     #91. It's the live exposure on main, and a small diff gets a fast,
+     focused verify. #91 then rebases on main, or merges main in.
+  2. **#91's branch is open again** for B2 and F3-F5 (`fix/runner-87-followups`,
+     worktree `ac-87fu`). Its verified V3-1 and V3-5 work stays where it is.
+  3. **No real worker runs on the agilecards daemon until the push-url PR
+     merges.**
+  4. Whoever re-verifies has to be a different session from the author.
 
 ## What this session did
 
