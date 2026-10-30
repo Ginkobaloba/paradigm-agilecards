@@ -1,0 +1,12 @@
+# 2026-10-30 00:45 CDT - local bake-off: offline re-score tool; v2 baseline 144/144 identical
+- **Who:** PromptBuilder seat (Claude Opus 5.5), at Daedalus's direction, before the v3 harness refactor.
+- **Change:**
+  - Adds `harness/rescore.py`. It re-scores every saved reply with the current scorer, offline (no model, no GPU), and diffs each row's scoring fields (passed, parsed, parse_failure, blocks, touched_tests, suspect, forged, verifier_timeout, think_in_block, raw_passed, outcome) against what the arm recorded.
+  - A reply whose saved file doesn't hash to the row's `reply_sha256` is reported as not re-scorable, never as a difference.
+  - `test_rescore.py` gives each check a case where it must fire.
+  - README: `pool_problems` only compares runs of the same model, so a scorer change between arms needs this evidence.
+  - EXAM_V3_PLAN: the long-context lease ceiling is the board's max grant at run time, not 22 GB.
+- **Why:** the v3 refactor changes `run_bakeoff.py`'s hash. A later arm scored under a new hash is comparable to A to E only if the new scorer scores their saved replies exactly as the old one did. This run is the baseline: it proves the tool, and that scoring reproduces at all, before anything changes.
+- **Result:** A, B, C and E: 144 of 144 rows identical, 0 different, 0 not re-scorable. Scorer hashes unchanged from the arms' own: run_bakeoff.py a22a33f5..., reply_parser.py 9ddd1007..., verify_child.py 301bf619.... The rows include 24 control rows (must fail) and 120 graded rows (pass), so both verdicts were reproduced.
+- **State after:** the v3 refactor may start. It must show 144 of 144 again under its new hash before any v3 or D run, and if any row differs it stops and the rows go to Daedalus.
+- **Refs:** engine/bench/local_bakeoff/harness/rescore.py; engine/bench/local_bakeoff/harness/test_rescore.py; engine/bench/local_bakeoff/harness/README.md; engine/bench/local_bakeoff/harness/EXAM_V3_PLAN.md

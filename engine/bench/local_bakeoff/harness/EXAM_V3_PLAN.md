@@ -128,12 +128,18 @@ draft and the v2 numbers, and each is folded in above:
 
 ## Decisions (Daedalus, 2026-10-30)
 
-- **Long-context sub-exam:** `num_ctx` 65536. Each arm takes the lease it
-  measures, up to 22 GB, only in an announced window with Studio confirmed
-  idle. GPU residency is reported per arm, and offload is part of this
-  sub-exam's result, never pooled with the main exam's. An arm that can't
-  hold 64K resident at 22 GB is reported "doesn't fit at 64K". The context
-  is never shrunk to make an arm fit.
+- **Long-context sub-exam:** `num_ctx` 65536. Each arm takes the largest
+  lease the GPU board grants at run time, in an announced window with Studio
+  confirmed idle. The grant is recorded per arm. (Tonight that was about
+  19.5 GB. The first draft's "up to 22 GB" can't be granted: the board's
+  budget is 24564 MiB minus a 4096 MiB margin that protects the desktop,
+  which is 20468 MiB, and that margin is not loosened for a benchmark.) GPU
+  residency is reported per arm, and offload is part of this sub-exam's
+  result, never pooled with the main exam's. An arm that can't hold 64K
+  resident is reported "doesn't fit at 64K within the board's max grant".
+  The context is never shrunk to make an arm fit. A fit-helper such as
+  KV-cache quantization would have to apply identically to every arm and be
+  declared: it's a proposal to bring to Daedalus, not something to build.
 - **Long-context budget:** `num_predict` stays 26624, as in the main exam, so
   context length is the only variable between the two. Prompts target 35K to
   38K tokens: 38K is the maximum, measured as the full prompt (card, seed and

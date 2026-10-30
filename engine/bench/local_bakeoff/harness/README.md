@@ -126,6 +126,12 @@ than edited there:
   makes the arm invalid. `pool_problems` is a helper for whoever combines
   results: it names arms that differ in digest, options, think, Ollama
   version, exam or scorer. Nothing in the harness pools results itself.
+  It compares runs of the SAME model only: two different models scored
+  under different scorer hashes are not flagged. So a scorer change between
+  arms (for example arm D on v2 after the v3 refactor) is legitimate only
+  with equivalence evidence: `rescore.py` re-scores every saved reply under
+  the new scorer, and every row must come back identical to what its arm
+  recorded. Ledger the old hash, the new hash and the count.
 - There is no "first use" stamp. What stops results being mixed across
   exams is the refusal to run while `results/` holds rows from another exam
   digest; what dates the exam is the server push time above.
