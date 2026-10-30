@@ -3,6 +3,65 @@
 Seat: PromptBuilder (Claude Opus 5.5). Coordinator: Daedalus. Session
 2026-10-29 evening to 2026-10-30 00:45 CDT.
 
+## FIRST TASK NEXT SESSION: #91 Deep Verify FAILED (received 00:56)
+
+Daedalus's independent verify of #91 (product code at `ae68cfa`, the same
+as `3319e86`) failed. The report is at
+`C:\Users\Drama\AppData\Local\Temp\claude\C--dev\9d799f8e-f7bc-4e2f-ac99-2c7f2f117055\scratchpad\verify-ac91\DEEP_VERIFY_pr91.md`,
+with repros in `w\urlwin.py` and `w\urlrace.py` beside it. Read it before
+touching code.
+
+- **B1 (high, blocker; already on MAIN through #87, so not a #91
+  regression; #91 claimed V3-1 closed):**
+  - The race: a sibling worker rewrites the integration clone's
+    `remote.origin.url` after `git remote add` and before the second
+    `trust_daemon_clone` baseline. It won 40 of 40.
+  - The attacker url gets baselined. The push through
+    `run_git(keep_gh_credentials=True)` to a local bare repo then runs the
+    receiver's pre-receive hook with `GH_TOKEN` in its env. Local transport
+    strips `GIT_CONFIG_COUNT`, so the hooksPath override never reaches the
+    receiving git.
+  - So it's code execution with the push credential. This handoff's
+    RUNNER_CONTRACT text ("run no program ... where the integrated commit
+    is pushed") is FALSE, and it was PromptBuilder's claim.
+  - A plant before the baseline is refused (12 of 12). The hole is exactly
+    the window between remote-add and the baseline.
+  - Fix, all three:
+    (a) push to the url the daemon read from the PROJECT, passed explicitly
+        (`git push <url> ...`), never through the clone's remote config;
+    (b) read `remote.origin.url` back after `remote add` and compare it
+        before baselining;
+    (c) refuse non-https and non-ssh push urls (file://, local paths), so a
+        local-transport receive-pack can never run.
+    Plus a race test that does what the repro did.
+- **B2 (high, on the literal claim):**
+  - The engine is right: readable=False goes to human_review, and the
+    escalator can't be disabled. But the daemon's gate is shadow-only:
+    `_record_gate_shadow` changes no routing, and daemon.py:1721-1722 calls
+    `_verifier_apply_pass` right after it, unconditionally.
+  - A `RepoQuarantined` from `from_worktree` is swallowed by
+    `except Exception` with no audit record.
+  - The missing-claim-paths fallback is `DiffStats()` with readable=True.
+  - Fix: make the claim text say "audited as escalation; routing is
+    shadow-only until the gate goes live"; stop swallowing RepoQuarantined;
+    make the fallback readable=False. Whether the gate routes at all is a
+    separate decision, not this PR's.
+- **F3 (medium):** a prep-time GitUnavailable leaves 2 store events and 1
+  run dir per poll, without bound, while git is down. Cap or dedupe it.
+  (The ledger's "a log line per poll" understated this.)
+- **F4 (low):** pin http-alternates with a test, and fix the merge-gate
+  reason string.
+- **F5 (low):** the short test ids still fail at basetemp 96+, so derive
+  the ids from a hash.
+- **What passed:** 432 V3-1 plant trials with 0 markers and 0 trusted (the
+  positive control on main fired 10 of 12). V3-5, M1-M9 and V3-4 all
+  killed. Suite 998, ruff clean, 31 of 34 mutants killed.
+- **Process:** fixes go on #91's branch (`fix/runner-87-followups`, worktree
+  `ac-87fu`) only once Daedalus says the branch is open again; it was
+  frozen during the verify. Because B1 is live on main, ask Daedalus
+  whether it should ship as its own urgent PR ahead of the rest. Whoever
+  re-verifies has to be a different session from the author.
+
 ## What this session did
 
 - **Windows Update** is now approve-only, with auto-restore after a reboot
@@ -19,7 +78,7 @@ Seat: PromptBuilder (Claude Opus 5.5). Coordinator: Daedalus. Session
   allowlist and refuses alternates and attributes; V3-5 changes how binary
   deltas are counted. The M2-M4, M6, M8, M9 and V3-4 tests are in, and every
   new test was run against a mutant. CI: engine runner 986 passed, 0 failed.
-  Deep Verify is pending and is Daedalus's.
+  Deep Verify FAILED (see the first section).
 - **Issue #92** filed (low): card ids are not length-bounded in branch and
   ref paths.
 - **Bake-off, exam v2:** A, B, C and E are all valid at 100%, so the exam
@@ -45,8 +104,7 @@ Seat: PromptBuilder (Claude Opus 5.5). Coordinator: Daedalus. Session
 
 ## What the next session should do first
 
-1. **Do not push to #91.** Daedalus's Deep Verify is running there, and
-   Daedalus merges it when it passes.
+1. **#91 Deep Verify FAILED.** See the first section: B1, B2, F3-F5.
 2. **The #88 merge** needs a short targeted review of the commits after
    `5c2e640`: `a411fe0` (small fixes), `252d59f` (the flush test), and
    `a2c8a2e`, `a93dff3`, `9b6b022` and `493ae2b` (docs). Ask Daedalus who
