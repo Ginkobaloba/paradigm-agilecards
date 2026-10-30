@@ -12,6 +12,10 @@ runs git and delegates to it. The glob matchers back the gate's
 """
 from __future__ import annotations
 
+import logging  # DEBUG ONLY
+import os  # DEBUG ONLY
+import shutil  # DEBUG ONLY
+
 import re
 import subprocess
 from dataclasses import dataclass
@@ -136,11 +140,9 @@ class DiffStats:
         # RepoQuarantined / UntrustedRepo propagate: an empty diff would
         # read as "nothing sensitive changed" to the confidence gate.
         except (OSError, subprocess.SubprocessError) as exc:
-            import logging, shutil, os  # DEBUG ONLY, never merged
             logging.getLogger(__name__).warning("DBG diff raised %r git=%s which=%s cwd_exists=%s",
                                                 exc, git_path, shutil.which(git_path), os.path.isdir(worktree))
             return cls()
-        import logging, shutil, os  # DEBUG ONLY, never merged
         logging.getLogger(__name__).warning(
             "DBG diff rc=%s git=%s which=%s cwd=%s exists=%s range=%s...%s stdout=%r stderr=%r",
             result.returncode, git_path, shutil.which(git_path), worktree, os.path.isdir(worktree),
