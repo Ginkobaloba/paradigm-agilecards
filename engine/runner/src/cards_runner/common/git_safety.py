@@ -17,7 +17,7 @@ without first proving it unchanged:
    (the executor's shell has a HOME) is never read by the daemon. gh's
    credential helper, which normally lives there, is pinned explicitly.
 3. **Overrides for repo config.** `GIT_CONFIG_COUNT` entries outrank every
-   config file: an empty `core.hooksPath`, `core.fsmonitor=false`, the
+   config file: `core.hooksPath` at the null device, `core.fsmonitor=false`, the
    credential helper reset, and a few more.
 4. **A persisted baseline.** The repo's own config and hooks are
    fingerprinted the first time the daemon sees the repo (or when an
@@ -28,10 +28,10 @@ without first proving it unchanged:
    which could disagree with git), minus the `branch.<name>.remote/merge`
    keys the daemon's own `push -u` writes.
 
-The empty hooks dir and the trust store live in a daemon state dir. Same-
-user files are never truly private, so the hooks dir is re-emptied before
-every use, and the trust store on disk is only a fallback: this process's
-in-memory records are authoritative (see `_MEMORY`).
+Hooks are pointed at the null device. The trust store lives in a daemon
+state dir; same-user files are never truly private, so the store on disk
+is only a fallback: this process's in-memory records are authoritative
+(see `_MEMORY`).
 
 What this does NOT close: same-user processes on Windows are not isolated,
 so a determined payload could read another process's memory or write
@@ -46,6 +46,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,6 +75,12 @@ _MEMORY: dict[str, "TrustRecord"] = {}
 # not what the daemon's own calls run. The executor's tools still use PATH.
 _PINNED_BINARIES: dict[str, str] = {}
 _PINNABLE: tuple[str, ...] = ("git", "gh", "powershell.exe")
+# The identity on the daemon's own commits (the one commit per card that
+# integrates a worker's patch), read once at configure() from the owner's
+# real config, before any executor ran. Model-chosen identities and
+# commit messages never reach a pushed commit.
+_IDENTITY: dict[str, str] = {}
+_FALLBACK_IDENTITY: dict[str, str] = {"user.name": "cards-runner", "user.email": "cards-runner@users.noreply.github.com"}
 
 
 class RepoQuarantined(RuntimeError):
@@ -83,6 +90,18 @@ class RepoQuarantined(RuntimeError):
         super().__init__(f"repository {common_dir} is quarantined: {reason}")
         self.common_dir = common_dir
         self.reason = reason
+
+
+class UntrustedRepo(RuntimeError):
+    """A path resolves to a repo the daemon was never told to trust."""
+
+
+class GitUnavailable(UntrustedRepo):
+    """git could not be run to read a repo's config (timeout, OSError).
+
+    Refused for this call, never a fingerprint change: hashing the failure
+    made the baseline mismatch and quarantined the PROJECT persistently
+    (#87 v2 re-verify L4-2-config-timeout)."""
 
 
 def state_dir_for(todo_root: Path) -> Path:
@@ -101,6 +120,34 @@ def configure(state_dir: Path) -> None:
         found = shutil.which(name)
         if found:
             _PINNED_BINARIES[name] = found
+    _IDENTITY.clear()
+    _IDENTITY.update(_read_identity())
+
+
+def _read_identity() -> dict[str, str]:
+    found: dict[str, str] = {}
+    git = _PINNED_BINARIES.get("git")
+    for key in ("user.name", "user.email"):
+        value = None
+        for scope in ("--global", "--system"):
+            if git is None:
+                break
+            try:
+                cp = subprocess.run([git, "config", scope, "--get", key], capture_output=True,
+                                    text=True, timeout=10, check=False, env=scrub_environment())
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if cp.returncode == 0 and cp.stdout.strip():
+                value = cp.stdout.strip()
+                break
+        found[key] = value or _FALLBACK_IDENTITY[key]
+    return found
+
+
+def commit_identity() -> list[tuple[str, str]]:
+    """`extra_config` for a daemon-authored commit: the identity pinned at boot."""
+    identity = _IDENTITY or _FALLBACK_IDENTITY
+    return [("user.name", identity["user.name"]), ("user.email", identity["user.email"])]
 
 
 def resolved(binary: str) -> str:
@@ -118,23 +165,24 @@ def _state_dir() -> Path:
     return _STATE_DIR
 
 
-def empty_hooks_dir() -> Path:
-    """A hooks dir with nothing in it, verified (and emptied) before each use."""
-    path = _state_dir() / "nohooks"
-    if path.exists() and (not path.is_dir() or any(path.iterdir())):
-        shutil.rmtree(path, ignore_errors=True) if path.is_dir() else path.unlink()
-    path.mkdir(exist_ok=True)
-    return path
-
-
 def git_config_overrides(*, gh_path: str | None = None) -> list[tuple[str, str]]:
     """Command-line-precedence config for every daemon git call."""
     overrides = [
-        ("core.hooksPath", str(empty_hooks_dir())),
+        # The null device, not an emptied directory: a directory emptied at
+        # env-build time was writable until git read it, and a hook planted
+        # in that window ran in the daemon's push with GH_TOKEN (#87 L4-4).
+        ("core.hooksPath", os.devnull),
+        # refs/replace planted by a sibling made the committed-tree check
+        # see a benign tree while another was pushed (#87 L4-3).
+        ("core.useReplaceRefs", "false"),
         ("core.fsmonitor", "false"),
         ("core.askPass", ""),
         ("diff.external", ""),
         ("protocol.ext.allow", "never"),
+        # Refuse paths NTFS or HFS+ would alias to `.git` (`.GIT`, `git~1`,
+        # `.git.`, ...) in any checkout or apply the daemon does.
+        ("core.protectNTFS", "true"),
+        ("core.protectHFS", "true"),
         # An empty value resets the helper list built from every config
         # file, so a repo-set helper is dropped ...
         ("credential.helper", ""),
@@ -151,6 +199,7 @@ def hardened_git_env(
     *,
     keep_gh_credentials: bool = True,
     gh_path: str | None = None,
+    extra_config: Sequence[tuple[str, str]] = (),
 ) -> dict[str, str]:
     """The env for a daemon git/gh call: no keys, no user config, pinned overrides."""
     env = scrub_environment(
@@ -163,14 +212,32 @@ def hardened_git_env(
     env["GIT_CONFIG_SYSTEM"] = os.devnull
     env["GIT_CONFIG_NOSYSTEM"] = "1"
     env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
     if keep_gh_credentials and gh_path is None:
         gh_path = _PINNED_BINARIES.get("gh") or shutil.which("gh")
-    overrides = git_config_overrides(gh_path=gh_path if keep_gh_credentials else None)
+    overrides = [*git_config_overrides(gh_path=gh_path if keep_gh_credentials else None),
+                 *extra_config]
     env["GIT_CONFIG_COUNT"] = str(len(overrides))
     for i, (key, value) in enumerate(overrides):
         env[f"GIT_CONFIG_KEY_{i}"] = key
         env[f"GIT_CONFIG_VALUE_{i}"] = value
     return env
+
+
+def verifier_env() -> dict[str, str]:
+    """The env for the verifier's model-written shell ACs: an empty block
+    (no secrets, no PATH) plus what keeps a `git` run there off the user's
+    and the system's config, credential helpers included."""
+    return {
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GCM_INTERACTIVE": "never",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_VALUE_0": "",
+    }
 
 
 # ---- the baseline ---------------------------------------------------------
@@ -223,9 +290,9 @@ def config_entries(path: Path) -> list[ConfigEntry] | None:
             cwd=str(_state_dir()), capture_output=True, timeout=GIT_TIMEOUT_SEC,
             check=False, env=env,
         )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GitUnavailable(f"git config could not read {path}: {exc}") from exc
+    if proc.returncode != 0:  # git ran and could not parse it: hashed as raw bytes
         return None
     entries: list[ConfigEntry] = []
     for record in proc.stdout.decode("utf-8", errors="surrogateescape").split("\0"):
@@ -276,6 +343,36 @@ def _config_files(common_dir: Path) -> list[Path]:
     return files
 
 
+_INCLUDE_DEPTH = 10  # git's own limit is 10 nested includes
+
+
+def _hash_conditional_includes(digest: "hashlib._Hash", config: Path,
+                               entries: list[ConfigEntry], *, depth: int) -> None:
+    """Hash every `includeIf.<cond>.path` target `config` names, whether or
+    not its condition holds now (conditions can be made to hold later).
+    `--includes` expands only unconditional includes, so before this an
+    edit to a conditional target (a new remote.origin.url) changed what git
+    did without changing the hash (#87 deep verify gitexec-F2)."""
+    for key, value in entries:
+        if not (key.startswith("includeif.") and key.endswith(".path")) or not value:
+            continue
+        target = Path(os.path.expanduser(value))
+        if not target.is_absolute():
+            target = config.parent / target
+        digest.update(b"<includeIf>" + key.encode("utf-8", "surrogateescape") + b"\0")
+        if depth >= _INCLUDE_DEPTH:
+            digest.update(b"<too deep>\0")
+            continue
+        try:
+            digest.update(target.read_bytes() + b"\0")
+        except OSError:
+            digest.update(b"<absent>\0")
+            continue
+        nested = config_entries(target)
+        if nested is not None:
+            _hash_conditional_includes(digest, target, nested, depth=depth + 1)
+
+
 def fingerprint(common_dir: Path) -> str:
     """Hash of what can make git run a program: config (as git parses it) + hooks.
 
@@ -305,6 +402,7 @@ def fingerprint(common_dir: Path) -> str:
             else:
                 digest.update(b"\n" + value.encode("utf-8", "surrogateescape"))
             digest.update(b"\0")
+        _hash_conditional_includes(digest, path, entries, depth=0)
     hooks = common_dir / "hooks"
     if hooks.is_dir():
         for path in sorted(p for p in hooks.rglob("*") if p.is_file() and p.suffix != ".sample"):
@@ -370,6 +468,208 @@ def trust_repo(common_dir: Path) -> str:
     return value
 
 
+def trust_daemon_clone(path: Path) -> None:
+    """Baseline a clone the daemon itself just made (this process only).
+
+    Called once `git init` has filled the clone's pinned, daemon-made
+    `.git`, and again after the daemon's own config writes. Never persisted:
+    a restarted daemon has no use for an old attempt's clone, and the
+    reaper removes it. The clone's own `.git` must be its common dir, with
+    no `commondir` file redirecting git's writes elsewhere, and that pairing
+    is recorded: every later call and `forget` use the record, never a
+    fresh read of a `.git` a sibling worker could have repointed (#87 deep
+    verify L4-1, gitexec-F1; v2 re-verify L4-1-pre-pin).
+    """
+    common = common_dir_of(path)
+    expected = Path(os.path.abspath(path)) / ".git"
+    if common is None:
+        raise UntrustedRepo(f"{path} is not a repository after clone")
+    if _key(common) != _key(expected.resolve()) or _is_reparse_point(expected):
+        raise UntrustedRepo(f"daemon clone {path} resolves to {common}, not its own .git")
+    _refuse_indirection(Path(path))
+    value = fingerprint(common)
+    with _LOCK:
+        _MEMORY[str(common)] = TrustRecord(value)
+        _DAEMON_CLONES[_key(path)] = str(common)
+
+
+def forget(path: Path) -> None:
+    """Drop this process's record for a daemon clone about to be removed.
+
+    Uses the pairing recorded at trust time: re-reading `path/.git` here let
+    a verifier AC point it at the project and drop the PROJECT's record."""
+    with _LOCK:
+        common = _DAEMON_CLONES.pop(_key(path), None)
+        if common is not None:
+            _MEMORY.pop(common, None)
+
+
+# ---- daemon clones: pinned while the daemon uses them (#87 L4-1) ----------
+#
+# A sibling worker (same user, max_parallel > 1) could rename a daemon
+# clone dir aside and put a junction to the project in its place between
+# the daemon's git calls, so the daemon committed into the operator's
+# checkout. Checking the path at creation is not enough: it has to hold at
+# the moment of use. On Windows the daemon therefore holds an open handle on
+# every directory from the clones root down to each clone's `.git` while it
+# works there, opened WITHOUT FILE_SHARE_DELETE: while that handle is open,
+# no process can rename or delete the directory, so the swap cannot happen.
+# Each pin also refuses a reparse point and a final path other than the one
+# asked for. Elsewhere (POSIX, unverified) each pin and each call re-checks
+# that the path is not a symlink; that narrows the window but does not
+# close it.
+
+_DAEMON_CLONES: dict[str, str] = {}
+_TLS = threading.local()
+
+
+def _key(path: Path | str) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    attrs = getattr(st, "st_file_attributes", 0)
+    return bool(attrs & 0x400) or os.path.islink(path)  # FILE_ATTRIBUTE_REPARSE_POINT
+
+
+class ClonePinned(UntrustedRepo):
+    """A daemon clone directory could not be pinned as itself."""
+
+
+class _Pins:
+    def __init__(self) -> None:
+        self._held: dict[str, object] = {}
+
+    def pin(self, path: Path) -> None:
+        key = _key(path)
+        if key in self._held:
+            return
+        self._held[key] = _open_pin(Path(path)) if os.name == "nt" else _posix_pin(Path(path))
+
+    def release(self, path: Path) -> None:
+        handle = self._held.pop(_key(path), None)
+        if handle is not None and os.name == "nt":
+            _close_pin(handle)
+
+    def close(self) -> None:
+        for key in list(self._held):
+            self.release(Path(key))
+
+
+def _posix_pin(path: Path) -> None:
+    if _is_reparse_point(path) or not path.is_dir():
+        raise ClonePinned(f"{path} is a link or not a directory")
+    return None
+
+
+def _kernel32():  # noqa: ANN202
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    k32.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD,
+                                              wintypes.DWORD]
+    k32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    return k32
+
+
+_ERROR_SHARING_VIOLATION = 32
+_PIN_RETRY_DELAYS: tuple[float, ...] = (0.05, 0.25)
+
+
+def _open_pin(path: Path) -> object:
+    import ctypes
+
+    k32 = _kernel32()
+    # Another opener holding DELETE access (an indexer, a scanner, or a
+    # sibling on purpose) makes the open fail with a sharing violation. Try
+    # twice more, briefly, then fail closed (#87 v2 re-verify L4-1-pin-dos).
+    for delay in (*_PIN_RETRY_DELAYS, None):
+        handle = k32.CreateFileW(
+            # FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES. A data access right is
+            # what makes the share mode bind: a handle with attribute access only
+            # takes no part in sharing checks, and a rename went through.
+            str(path), 0x1 | 0x80,
+            0x1 | 0x2,  # FILE_SHARE_READ | FILE_SHARE_WRITE, deliberately NOT FILE_SHARE_DELETE
+            None, 3,  # OPEN_EXISTING
+            0x02000000 | 0x00200000,  # FILE_FLAG_BACKUP_SEMANTICS (a dir) | OPEN_REPARSE_POINT
+            None)
+        if handle not in (None, ctypes.c_void_p(-1).value):
+            break
+        error = ctypes.get_last_error()
+        if error != _ERROR_SHARING_VIOLATION or delay is None:
+            raise ClonePinned(f"cannot pin {path}: {ctypes.WinError(error)}")
+        time.sleep(delay)
+    try:
+        # The name is held now; what it names cannot be swapped. Check it.
+        attrs = k32.GetFileAttributesW(str(path))
+        if attrs == 0xFFFFFFFF or not attrs & 0x10 or attrs & 0x400:
+            raise ClonePinned(f"{path} is a reparse point or not a directory")
+        buf = ctypes.create_unicode_buffer(32768)
+        if not k32.GetFinalPathNameByHandleW(handle, buf, len(buf), 0):
+            raise ClonePinned(f"cannot read the final path of {path}")
+        final = buf.value[4:] if buf.value.startswith("\\\\?\\") else buf.value
+        if _key(final) != _key(Path(path).resolve()):
+            raise ClonePinned(f"{path} is {final}")
+    except BaseException:
+        k32.CloseHandle(handle)
+        raise
+    return handle
+
+
+def _close_pin(handle: object) -> None:
+    _kernel32().CloseHandle(handle)
+
+
+class pinned_clones:  # noqa: N801 - used as a context manager, like open()
+    """The pin set for daemon clones: the current one if a caller already
+    holds one (the daemon, across integrate, verify and push), else a new
+    one released on exit."""
+
+    def __enter__(self) -> _Pins:
+        self._own = getattr(_TLS, "pins", None) is None
+        if self._own:
+            _TLS.pins = _Pins()
+        return _TLS.pins
+
+    def __exit__(self, *exc: object) -> None:
+        if self._own:
+            pins, _TLS.pins = _TLS.pins, None
+            pins.close()
+
+
+def _refuse_indirection(path: Path) -> None:
+    """A daemon clone's `.git` is a plain directory with no `commondir`:
+    with one, git writes refs and objects wherever it points (the project's
+    `.git`), while the fingerprint covers only this clone's config."""
+    dot_git = path / ".git"
+    if not dot_git.is_dir() or (dot_git / "commondir").exists():
+        raise UntrustedRepo(f"daemon clone {path}: .git is not a plain directory "
+                            f"(a gitdir file or commondir redirects it)")
+
+
+def _check_daemon_clone(path: Path) -> None:
+    """At the moment of use: a daemon clone must still be itself."""
+    with _LOCK:
+        common = _DAEMON_CLONES.get(_key(path))
+    if common is None:
+        return
+    if _is_reparse_point(Path(path)) or _is_reparse_point(Path(path) / ".git"):
+        raise UntrustedRepo(f"daemon clone {path} was replaced by a link")
+    _refuse_indirection(Path(path))
+    now = common_dir_of(Path(path))
+    if now is None or str(now) != common:
+        raise UntrustedRepo(f"daemon clone {path} now resolves to {now}, not {common}")
+
+
 def _quarantine(common_dir: Path, reason: str) -> None:
     with _LOCK:
         previous = _MEMORY.get(str(common_dir))
@@ -382,10 +682,6 @@ def _quarantine(common_dir: Path, reason: str) -> None:
     log.error("QUARANTINED repository %s: %s", common_dir, reason)
 
 
-class UntrustedRepo(RuntimeError):
-    """A path resolves to a repo the daemon was never told to trust."""
-
-
 def assert_trusted(path: Path, *, first_sight_ok: bool = False) -> Path | None:
     """Raise unless `path`'s repo still matches its trusted baseline.
 
@@ -396,6 +692,7 @@ def assert_trusted(path: Path, *, first_sight_ok: bool = False) -> Path | None:
     Returns the common dir, or None when `path` has no `.git` at all (the
     caller's git then cannot walk up, see GIT_CEILING_DIRECTORIES).
     """
+    _check_daemon_clone(path)
     common = common_dir_of(path)
     if common is None:
         return None
@@ -423,6 +720,7 @@ def run_git(
     gh_path: str | None = None,
     timeout: float = GIT_TIMEOUT_SEC,
     first_sight_ok: bool = False,
+    extra_config: Sequence[tuple[str, str]] = (),
 ) -> subprocess.CompletedProcess[str]:
     """Run one daemon git or gh command, hardened. The only way the daemon does.
 
@@ -432,12 +730,17 @@ def run_git(
     walking above `cwd` to find some other repo. `cwd=None` is for gh calls
     that touch no checkout.
     """
-    env = hardened_git_env(keep_gh_credentials=keep_gh_credentials, gh_path=gh_path)
+    env = hardened_git_env(keep_gh_credentials=keep_gh_credentials, gh_path=gh_path,
+                           extra_config=extra_config)
     if cwd is not None:
         assert_trusted(cwd, first_sight_ok=first_sight_ok)
         env["GIT_CEILING_DIRECTORIES"] = str(Path(cwd).resolve().parent)
     argv = [resolved(argv[0]), *argv[1:]] if argv else []
+    # UTF-8 with surrogateescape, not the locale codec: under cp1252 one
+    # filename git prints that the codec cannot decode killed subprocess's
+    # reader thread, left stdout None and wedged the daemon tick (#87 L4-2).
     return subprocess.run(
         argv, cwd=str(cwd) if cwd is not None else None,
-        capture_output=True, text=True, timeout=timeout, check=False, env=env,
+        capture_output=True, text=True, encoding="utf-8", errors="surrogateescape",
+        timeout=timeout, check=False, env=env,
     )

@@ -17,7 +17,7 @@ import pytest
 from cards_runner.common import git_safety
 from cards_runner.daemon.diff_stats import DiffStats
 from cards_runner.daemon.pr_lifecycle import SubprocessGhRunner
-from cards_runner.daemon.worktree import prune_git_worktrees
+from cards_runner.daemon import clones
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "cards_runner"
 
@@ -27,7 +27,7 @@ ALLOWED = {
     "common/git_safety.py": "the hardened runner itself",
     "common/process_group.py": "launches the worker (spawn_in_job)",
     "store/dolt_store.py": "runs the dolt binary on the card store",
-    "verifier/handlers/deterministic.py": "runs card AC commands with env={}",
+    "common/sandbox.py": "the sandbox seam: worker spawn and verifier shell ACs",
     "cli/doctor.py": "`<binary> --version` only, no repo",
     "common/locks.py": "ctypes OpenProcess/GetExitCodeProcess for PID liveness only",
 }
@@ -165,7 +165,8 @@ def test_every_daemon_git_and_gh_call_carries_the_hardened_env(
     gh.push(tmp_path, "card/x")
     gh.open_pr(tmp_path, title="t", body="b", base="main")
     DiffStats.from_worktree(tmp_path, branch="card/x", base_branch="main")
-    prune_git_worktrees(project_dir=tmp_path)
+    with pytest.raises(clones.CloneError):  # the fake git prints no sha
+        clones.resolve_base_sha(tmp_path, "main")
 
     assert len(calls) == 4
     for call in calls:

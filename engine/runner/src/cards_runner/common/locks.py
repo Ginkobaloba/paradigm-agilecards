@@ -21,9 +21,8 @@ import errno
 import os
 import sys
 import time
-from contextlib import contextmanager
 from pathlib import Path
-from typing import IO, Iterator
+from typing import IO
 
 
 class LockHeldError(Exception):
@@ -196,22 +195,3 @@ def pid_alive(pid: int) -> bool:
     except PermissionError:
         # The PID exists but is owned by another user. Treat as alive.
         return True
-
-
-@contextmanager
-def held_worktree_mutex(
-    runner_lock_path: Path,
-    timeout_sec: float = 60.0,
-) -> Iterator[None]:
-    """Hold the global `.runner.lock` for the duration of the `with` block.
-
-    Use sparingly: the lock is held only across the actual
-    `git worktree add` call. Anything else inside the block adds
-    contention for sibling claim threads.
-    """
-    lock = FileLock(runner_lock_path)
-    lock.acquire(blocking=True, timeout_sec=timeout_sec)
-    try:
-        yield
-    finally:
-        lock.release()

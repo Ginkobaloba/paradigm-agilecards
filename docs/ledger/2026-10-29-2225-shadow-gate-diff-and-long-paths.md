@@ -1,0 +1,12 @@
+# 2026-10-29 22:25 CDT - the shadow gate read an empty diff in deep state dirs
+- **Who:** PromptBuilder seat (Claude Opus 5.5), at Daedalus's request after CI's "engine runner battery" failed #87 on three heads (bccc0cd, 3c68c25, 691c2eb: 1 failed, 939 passed, 29 skipped, run 40994290047). Locally it passed (969).
+- **Change:**
+  - `DiffStats.from_worktree` ends the revision range with `--`. Without it git also `stat()`ed the 83-character `base...sha` as a file under the cwd. In CI's state dir (about 190 characters) that went past Windows' 260-character limit, git died with "fatal: failed to stat '…': Filename too long" (rc 128), and the function returned an empty diff. The confidence gate then saw no changed lines and nothing sensitive: fail-open, in shadow mode today.
+  - That failure is now logged ("diff stats unreadable", with git's rc and stderr). The docstring said the caller logged it; nothing did.
+  - `diff-index`, `rev-list` and `diff-tree` in `_integrate` end their revisions with `--` too. Those fail closed (CloneError), but would break the same way in a deeper dir.
+- **Why:** a gate input that silently goes empty in production-like paths is a fail-open. It went unseen because the local paths were short enough, and "local suite green" is not CI green.
+- **How it was found:** a throwaway draft PR (#90, closed, never merged) logged the diff's rc and stderr in CI. A local test now builds the same depth: without the fix it fails with the same rc 128 "failed to stat", and with the fix it reads 3 lines.
+- **CI skips:** the 29 tests CI skips are `tests/store` Dolt tests, skipped because CI has no `dolt` binary. They are unrelated to this failure.
+- **Open, for the follow-up:** an unreadable diff still reads as "no diff signal". It should fail closed before the gate routes anything.
+- **State after:** runner suite 971 pass locally, ruff clean. CI result is quoted in the PR, not here.
+- **Refs:** engine/runner/src/cards_runner/daemon/diff_stats.py `from_worktree`; engine/runner/src/cards_runner/daemon/clones.py `_integrate`; engine/runner/tests/test_deep_verify_fixes.py `test_diff_stats_read_a_deep_repo`; engine/runner/tests/test_deep_verify_gaps.py `test_gap_shadow_gate_diff_comes_from_the_integration_clone`

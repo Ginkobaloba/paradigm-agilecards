@@ -50,6 +50,7 @@ from ..common.types import (
     now_utc_iso,
 )
 from .invoker import InvokeRequest, InvokeResult, Invoker, StubInvoker
+from .patch_emit import emit_patch
 
 
 log = logging.getLogger(__name__)
@@ -141,8 +142,13 @@ def run_worker(
     trace_id: str,
     heartbeat_interval_sec: float,
     invoker: Invoker,
+    base_sha: str | None = None,
 ) -> int:
-    """Run one worker lifecycle. Returns the process exit code."""
+    """Run one worker lifecycle. Returns the process exit code.
+
+    With `base_sha` (a real clone, not skip-worktree mode) the change is
+    handed back as `<run_dir>/result.patch` once the invoker returns.
+    """
     run_dir = card_path.parent
     snap = parse_card_file(card_path)
     request = InvokeRequest(
@@ -182,6 +188,14 @@ def run_worker(
         attempt_trace_id=attempt_trace_id,
         duration_sec=duration_sec,
     )
+    if base_sha:
+        try:
+            emitted = emit_patch(worktree=worktree, base_sha=base_sha, run_dir=run_dir)
+        except Exception:  # noqa: BLE001 - the daemon blocks a card with no patch
+            log.exception("patch emission crashed")
+            emitted = False
+        if not emitted:
+            log.error("no patch written; the daemon will not integrate this attempt")
     _write_result_sidecar(run_dir, attempt_trace_id, rc, result)
     return rc
 
@@ -334,6 +348,7 @@ def main_from_env() -> int:
             trace_id=trace_id,
             heartbeat_interval_sec=heartbeat_interval_sec,
             invoker=invoker,
+            base_sha=os.environ.get("CARDS_RUNNER_BASE_SHA") or None,
         )
     except Exception:
         log.exception("worker outer loop crashed")

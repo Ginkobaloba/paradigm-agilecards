@@ -97,16 +97,18 @@ def _spawn_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
                plan: spawner.MapPlan | None) -> dict[str, str]:
     seen: dict[str, str] = {}
 
-    def fake_spawn(args: list[str], *, env: dict[str, str], **_: object) -> object:
-        seen.update(env)
-        return object()
+    class FakeLauncher:
+        """Since #87 the worker starts through the SandboxLauncher seam."""
 
-    monkeypatch.setattr(spawner, "spawn_in_job", fake_spawn)
+        def spawn_worker(self, args: list[str], *, env: dict[str, str], **_: object) -> object:
+            seen.update(env)
+            return object()
+
     run_dir = tmp_path / "run"
     claim = ClaimedCard(card_id="c1", attempt_trace_id="a1", trace_id="t1", run_dir=run_dir,
                         worktree_path=tmp_path, card_file=run_dir / "card.md")
     spawner.spawn_worker(cfg=DaemonConfig(todo_root=tmp_path, invoker="sdk"), claim=claim,
-                         run_dir=run_dir, map_plan=plan)
+                         run_dir=run_dir, map_plan=plan, launcher=FakeLauncher())
     return seen
 
 

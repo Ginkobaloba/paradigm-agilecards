@@ -68,7 +68,10 @@ class GhRunner(Protocol):
 
     def is_available(self) -> bool: ...
 
-    def push(self, worktree: Path, branch: str, *, set_upstream: bool = True) -> GhCallResult: ...
+    def push(
+        self, worktree: Path, branch: str, *, set_upstream: bool = True,
+        sha: str | None = None,
+    ) -> GhCallResult: ...
 
     def open_pr(
         self,
@@ -78,6 +81,7 @@ class GhRunner(Protocol):
         body: str,
         base: str,
         draft: bool = False,
+        head: str | None = None,
     ) -> GhCallResult: ...
 
     def merge_pr(
@@ -126,8 +130,11 @@ class NullGhRunner:
     def is_available(self) -> bool:
         return False
 
-    def push(self, worktree: Path, branch: str, *, set_upstream: bool = True) -> GhCallResult:
-        del worktree, branch, set_upstream
+    def push(
+        self, worktree: Path, branch: str, *, set_upstream: bool = True,
+        sha: str | None = None,
+    ) -> GhCallResult:
+        del worktree, branch, set_upstream, sha
         return GhCallResult(ok=False, reason="gh disabled")
 
     def open_pr(
@@ -138,8 +145,9 @@ class NullGhRunner:
         body: str,
         base: str,
         draft: bool = False,
+        head: str | None = None,
     ) -> GhCallResult:
-        del worktree, title, body, base, draft
+        del worktree, title, body, base, draft, head
         return GhCallResult(ok=False, reason="gh disabled")
 
     def merge_pr(
@@ -202,14 +210,19 @@ class SubprocessGhRunner:
         return shutil.which(self.gh_path) is not None and shutil.which(self.git_path) is not None
 
     def push(
-        self, worktree: Path, branch: str, *, set_upstream: bool = True
+        self, worktree: Path, branch: str, *, set_upstream: bool = True,
+        sha: str | None = None,
     ) -> GhCallResult:
-        # `git push -u origin branch` from inside the per-card worktree.
-        # The runner's worktree was created off `base_branch`; the executor
-        # committed on `card/<id>`. The push uses `origin` as the remote
-        # (the runner does not yet support multi-remote projects; chunk 5+
-        # can add that when a project needs it).
+        # With `sha` (the daemon's integration clone): push exactly that
+        # commit, `git push origin <sha>:refs/heads/<branch>`, so what lands
+        # is what the verifier checked even if a ref moved since. No `-u`:
+        # the clone is thrown away. Without `sha` (skip-worktree mode):
+        # `git push -u origin branch`. The runner does not yet support
+        # multi-remote projects.
         args = [self.git_path, "push"]
+        if sha is not None:
+            args.extend(["origin", f"{sha}:refs/heads/{branch}"])
+            return self._run(args, cwd=worktree)
         if set_upstream:
             args.append("-u")
         args.extend(["origin", branch])
@@ -223,6 +236,7 @@ class SubprocessGhRunner:
         body: str,
         base: str,
         draft: bool = False,
+        head: str | None = None,
     ) -> GhCallResult:
         # `gh pr create --base BASE --title T --body B [--draft]` returns
         # the PR URL on stdout. We parse it back into the result so the
@@ -233,6 +247,9 @@ class SubprocessGhRunner:
             "--title", title,
             "--body", body,
         ]
+        if head is not None:
+            # Named explicitly: the integration clone has no upstream set.
+            args.extend(["--head", head])
         if draft:
             args.append("--draft")
         result = self._run(args, cwd=worktree)

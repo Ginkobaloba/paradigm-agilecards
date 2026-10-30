@@ -74,6 +74,14 @@ This is a **4-chunk build** per the runner design and
   `--sibling-reviewer`, `--amendment-reviewer`, `--gh`,
   `--auto-merge-strategy`, `--no-boot-alive-check`,
   `--forensic-ttl-hours`, `--worktree-prune`, `--project-config`).
+- **Worker isolation, 2026-10-29.** Each attempt runs in a throwaway
+  clone of the project, not a `git worktree`. The executor hands its
+  change back as a patch; the daemon applies it in its own clone,
+  checks every path and mode, commits once, verifies that commit in a
+  third clone and pushes exactly its sha. The daemon never runs git in
+  a directory model-run code wrote to (`daemon/clones.py`). Model-run
+  code starts only through `common/sandbox.py`. `--worktree-prune` is
+  now accepted and ignored.
 
 ## How card state works after the cutover
 
@@ -130,12 +138,12 @@ runner/
     common/           card I/O, atomic ops, env scrub, locks, Job
                       Object, canonical_config (chunk 4 YAML loader),
                       project_config (chunk 5 project.yaml + reload)
-    daemon/           polling loop, store-backed claim, worktree,
-                      orphan reclaim, verifier dispatch (chunk 3),
+    daemon/           polling loop, store-backed claim, per-attempt
+                      clones (worker, integration, verify), orphan
+                      reclaim, verifier dispatch (chunk 3),
                       eligibility / merge_gate / pr_lifecycle /
                       reaper (chunk 4), unblocker /
-                      sibling_reviewer / amendment_reviewer +
-                      worktree prune (chunk 5)
+                      sibling_reviewer / amendment_reviewer (chunk 5)
     store/            CardRepository interface + SQLite/Dolt stores
     verifier/         cold-read verifier (chunk 3): canonical AC
                       types, deterministic handlers, cascading

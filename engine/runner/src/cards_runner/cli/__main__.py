@@ -161,13 +161,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_start.add_argument(
         "--worktree-prune", action="store_true",
-        help="enable hourly `git worktree prune` sweeps against each "
-        "project the runner touches. Off by default.",
+        help="obsolete and ignored (workers use throwaway clones, not git "
+        "worktrees); accepted so existing launch commands still start.",
     )
     p_start.add_argument(
         "--worktree-prune-interval-sec", type=int, default=None,
-        help="how often to run the worktree prune sweep, in seconds "
-        "(default 3600). Ignored when --worktree-prune is off.",
+        help="obsolete and ignored, with --worktree-prune.",
     )
     p_start.add_argument(
         "--project-config",

@@ -20,7 +20,7 @@ nice-to-have, not a correctness requirement. The next tick retries.
 from __future__ import annotations
 
 import logging
-import shutil
+
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +28,7 @@ from typing import Iterable
 
 from ..common.types import DaemonConfig, RuntimePaths
 from ..store import DEFAULT_TENANT, CardRepository, CardStatus
+from .clones import remove_tree
 
 
 log = logging.getLogger(__name__)
@@ -154,7 +155,9 @@ def _dir_mtime(path: Path) -> float:
 
 def _remove_tree(path: Path) -> bool:
     try:
-        shutil.rmtree(path, ignore_errors=False)
+        # A run dir now holds the worker's clone, whose object files git
+        # marks read-only; plain rmtree fails on them on Windows.
+        remove_tree(path)
         return True
     except Exception as exc:  # noqa: BLE001
         log.warning("could not reap run dir %s: %s", path, exc)
