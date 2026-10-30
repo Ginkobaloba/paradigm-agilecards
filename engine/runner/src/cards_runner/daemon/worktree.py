@@ -1,375 +1,50 @@
-"""Worktree creation, verification, and teardown.
+"""The per-attempt branch name, and the stub tree for skip-worktree mode.
 
-Per RUNNER_CONTRACT.md "Worktree isolation and cross-contamination
-defense" the runner serializes `git worktree add` calls behind the
-global `.runner.lock` mutex to defeat the `.git/config.lock` race
-(Claude Code issue #34645).
+Real cards no longer get a `git worktree`: a worktree shares the
+project's `.git` with the worker, so the daemon's next git call in the
+project read whatever model-run code had written there. Each worker now
+gets a throwaway clone (daemon/clones.py). What is left here:
 
-Chunk 1 supports two modes:
-
-- **Real mode** (default): we call `git worktree add` via subprocess
-  and verify the four post-create checks. The card's `project` field
-  names the source repo.
-- **Skip mode** (`DaemonConfig.skip_worktree=True`): we create a plain
-  directory under `_runs/<attempt>/worktree` and skip git entirely.
-  Tests use this when running against a tmp directory that is not a
-  git repo.
-
-This module does not own the env scrub or the worker spawn; those
-live in `daemon.spawner`. We only own the disk side of worktree
-preparation.
+- `attempt_branch_name`, shared by clone prep and the merge gate.
+- `prepare_stub_worktree`: a plain directory for `skip_worktree` mode,
+  where tests run the daemon against a tmp dir that is not a repo.
 """
 from __future__ import annotations
 
 import logging
-import shutil
-import subprocess
-import sys
 from pathlib import Path
-from typing import Final
-
-from ..common.git_safety import RepoQuarantined, UntrustedRepo, resolved, run_git
-from ..common.locks import held_worktree_mutex
-from ..common.types import RuntimePaths
 
 
 log = logging.getLogger(__name__)
-
-GIT_WORKTREE_TIMEOUT_SEC: Final[float] = 60.0
-
-
-class WorktreeCreateError(Exception):
-    """Raised when worktree creation or verification fails."""
 
 
 def attempt_branch_name(base_branch: str, attempt_trace_id: str) -> str:
     """A per-attempt working branch name.
 
     A card's working branch cannot be a fixed name. After a verify-fail
-    bounce the card returns to `backlog` and is re-claimed, but the prior
-    attempt's worktree is kept for the forensic run-dir TTL (default 24h)
-    and still pins the fixed branch. A fixed name therefore collides on the
-    next `git worktree add` ("branch already used by worktree") and the card
-    livelocks at poll cadence -- the claim-fail-bounce-retry loop the runner
-    is built around cannot actually retry.
+    bounce the card returns to `backlog` and is re-claimed while the prior
+    attempt's branch may still exist (pushed, or awaiting review). A fixed
+    name therefore collides on the next attempt's push or PR, and the
+    claim-fail-bounce-retry loop the runner is built around cannot retry.
 
     Suffixing the attempt id makes each claim's branch unique, so a retry
-    proceeds instead of colliding, and each attempt's worktree and PR are
+    proceeds instead of colliding, and each attempt's clone and PR are
     independently traceable. `base_branch` is used only as a prefix and is
     never created as a bare ref, so no `card/<id>` vs `card/<id>/<attempt>`
     directory/file ref conflict can arise.
 
-    Callers that create OR reference the branch for a given attempt (worktree
-    prep, and the merge gate's push + PR) must derive it here, so the name is
-    identical across the attempt's whole lifecycle.
+    Callers that create OR reference the branch for a given attempt (clone
+    prep, and the merge gate's push + PR) must derive it here, so the name
+    is identical across the attempt's whole lifecycle.
     """
     return f"{base_branch}/{attempt_trace_id[:12]}"
 
 
-def prepare_worktree(
-    *,
-    paths: RuntimePaths,
-    project_dir: Path,
-    branch_name: str,
-    base_branch: str,
-    worktree_path: Path,
-    skip_git: bool = False,
-) -> None:
-    """Create and verify a per-card worktree.
-
-    Holds the global mutex for the duration of the `git worktree add`
-    call only. Verification runs outside the mutex.
-
-    Steps:
-        1. Acquire the global worktree-creation mutex.
-        2. If skip_git: mkdir and return.
-        3. Otherwise:
-            a. Ensure the branch exists (create off base_branch if needed).
-            b. `git worktree add <path> <branch>`.
-        4. Release the mutex.
-        5. Verify: directory exists and is non-empty; `git worktree
-           list` includes the path; `git status` runs clean.
-
-    Raises `WorktreeCreateError` on any failure. Caller is expected
-    to roll back (move card back to backlog) and surface the error.
-    """
-    worktree_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with held_worktree_mutex(paths.runner_lock, timeout_sec=60.0):
-        if skip_git:
-            worktree_path.mkdir(parents=True, exist_ok=True)
-            (worktree_path / ".cards-stub-worktree").write_text(
-                f"branch={branch_name}\nbase={base_branch}\n",
-                encoding="utf-8",
-            )
-            log.info("prepared stub worktree at %s", worktree_path)
-            return
-
-        if not (project_dir / ".git").exists():
-            raise WorktreeCreateError(
-                f"project_dir {project_dir} is not a git repo"
-            )
-
-        _ensure_branch(project_dir, branch_name, base_branch)
-
-        try:
-            _run_powershell_git(
-                project_dir,
-                ["worktree", "add", str(worktree_path), branch_name],
-                first_sight_ok=True,
-            )
-        except subprocess.CalledProcessError as exc:
-            raise WorktreeCreateError(
-                f"git worktree add failed: rc={exc.returncode} "
-                f"stdout={exc.stdout!r} stderr={exc.stderr!r}"
-            ) from exc
-
-    if skip_git:
-        return
-
-    # Verification runs outside the mutex, but it must not be able to leave
-    # a half-created worktree behind. `git worktree add` has already
-    # succeeded and registered the worktree (and pinned `branch_name` to
-    # it). If verification then raises, the caller rolls the card back to
-    # `backlog` and the next poll re-claims it -- at which point
-    # `git worktree add` fails with "branch already used by worktree" and
-    # the card livelocks at poll cadence, forever, never reaching the
-    # executor or the verifier.
-    #
-    # So `prepare_worktree` is atomic: either it returns with a verified
-    # worktree, or it raises having removed the one it created.
-    try:
-        _verify_worktree(project_dir, worktree_path)
-    except WorktreeCreateError:
-        log.warning(
-            "worktree verification failed for %s; removing the worktree this "
-            "call created so the branch is not left pinned to it",
-            worktree_path,
-        )
-        try:
-            teardown_worktree(
-                paths=paths,
-                project_dir=project_dir,
-                worktree_path=worktree_path,
-                skip_git=False,
-            )
-        except Exception:  # noqa: BLE001 - teardown is best-effort
-            log.exception(
-                "worktree teardown after failed verification also failed for "
-                "%s; `git worktree prune` may be required",
-                worktree_path,
-            )
-        raise
-
-
-def prune_git_worktrees(
-    *,
-    project_dir: Path,
-    expire_after: str | None = None,
-) -> subprocess.CompletedProcess[str] | None:
-    """Run `git worktree prune` against a project repo.
-
-    Chunk 5 defensive sweep. The chunk-4 forensic reaper deletes the
-    `_runs/<attempt>/` directory tree; that drops the worktree's
-    filesystem but leaves the administrative `.git/worktrees/<id>/`
-    entries that git tracks. `git worktree prune` is the official
-    cleanup verb for those entries -- it removes any whose worktree
-    directory has gone missing.
-
-    Returns the `CompletedProcess` for the operator's log, or None when
-    the project_dir is not a git repository (a skip-git daemon, or a
-    test against a tmp dir). Failures are NOT raised: this is a
-    defensive sweep, and a transient git error should not crash the
-    tick.
-    """
-    if not (project_dir / ".git").exists():
-        log.debug("prune skipped: %s is not a git repository", project_dir)
-        return None
-    args = ["worktree", "prune", "-v"]
-    if expire_after:
-        args.extend(["--expire", expire_after])
-    try:
-        return _run_powershell_git(project_dir, args, first_sight_ok=True)
-    except subprocess.CalledProcessError as exc:
-        log.warning(
-            "git worktree prune failed in %s: rc=%s stderr=%r",
-            project_dir, exc.returncode, exc.stderr,
-        )
-        return None
-    except subprocess.TimeoutExpired as exc:
-        log.warning("git worktree prune timed out in %s: %s", project_dir, exc)
-        return None
-    except (RepoQuarantined, UntrustedRepo) as exc:
-        log.warning("git worktree prune skipped for %s: %s", project_dir, exc)
-        return None
-
-
-def teardown_worktree(
-    *,
-    paths: RuntimePaths,
-    project_dir: Path,
-    worktree_path: Path,
-    skip_git: bool = False,
-) -> None:
-    """Remove a worktree. Best-effort.
-
-    Chunk 1 does NOT call this during normal lifecycle. Worktrees
-    are preserved for the forensic TTL (default 24h) and reaped by
-    the reaper (chunk 4). This function is exposed so the reaper
-    has a single seam to invoke later.
-    """
-    with held_worktree_mutex(paths.runner_lock, timeout_sec=60.0):
-        if skip_git:
-            shutil.rmtree(worktree_path, ignore_errors=True)
-            return
-        try:
-            _run_powershell_git(
-                project_dir,
-                ["worktree", "remove", "--force", str(worktree_path)],
-                first_sight_ok=True,
-            )
-        except (subprocess.CalledProcessError, RepoQuarantined, UntrustedRepo) as exc:
-            log.warning("git worktree remove failed: %s", exc)
-            shutil.rmtree(worktree_path, ignore_errors=True)
-
-
-def _ensure_branch(project_dir: Path, branch_name: str, base_branch: str) -> None:
-    """Create `branch_name` off `base_branch` if it does not exist.
-
-    A re-claim after orphan reclaim hits an existing branch; that is
-    fine and we leave it alone.
-    """
-    try:
-        _run_powershell_git(
-            project_dir, ["rev-parse", "--verify", branch_name], first_sight_ok=True,
-        )
-        log.debug("branch %s already exists", branch_name)
-        return
-    except subprocess.CalledProcessError:
-        pass
-    _run_powershell_git(
-        project_dir,
-        ["branch", branch_name, base_branch],
-        first_sight_ok=True,
+def prepare_stub_worktree(*, worktree_path: Path, branch_name: str, base_branch: str) -> None:
+    """Skip-worktree mode: a plain directory, no git."""
+    worktree_path.mkdir(parents=True, exist_ok=True)
+    (worktree_path / ".cards-stub-worktree").write_text(
+        f"branch={branch_name}\nbase={base_branch}\n",
+        encoding="utf-8",
     )
-
-
-def _registered_worktrees(project_dir: Path) -> list[Path]:
-    """Return the worktree paths git currently has registered for a repo.
-
-    Parses `git worktree list --porcelain`, whose contract is one
-    `worktree <path>` line per entry. We use the porcelain form on
-    purpose: the human-readable form aligns columns and truncates, and
-    is explicitly not a stable interface.
-
-    Paths are resolved so callers can compare them to a `Path` without
-    caring about separators, case, or relative segments.
-    """
-    listing = _run_powershell_git(
-        project_dir, ["worktree", "list", "--porcelain"], first_sight_ok=True,
-    )
-    found: list[Path] = []
-    for line in listing.stdout.splitlines():
-        if not line.startswith("worktree "):
-            continue
-        raw = line[len("worktree "):].strip()
-        if not raw:
-            continue
-        try:
-            found.append(Path(raw).resolve())
-        except (OSError, ValueError):  # pragma: no cover - defensive
-            log.debug("unparseable worktree path from git: %r", raw)
-    return found
-
-
-def _verify_worktree(project_dir: Path, worktree_path: Path) -> None:
-    """Run the four post-create checks. Raises `WorktreeCreateError` on miss."""
-    if not worktree_path.exists():
-        raise WorktreeCreateError(f"{worktree_path} does not exist after create")
-    if not any(worktree_path.iterdir()):
-        raise WorktreeCreateError(f"{worktree_path} is empty after create")
-
-    # Compare resolved Paths, NOT substrings of the listing.
-    #
-    # This check used to be `str(worktree_path) not in listing.stdout`, which
-    # could never pass on Windows: `str(Path(...))` yields backslashes
-    # (`C:\dev\...`) while git always reports worktree paths POSIX-style
-    # (`C:/dev/...`). Every worktree prep therefore failed its own
-    # post-condition on the development platform, rolled back, and (see
-    # `prepare_worktree`) livelocked the card. Path comparison is a
-    # path-level question; doing it on raw strings was the bug.
-    registered = _registered_worktrees(project_dir)
-    if worktree_path.resolve() not in registered:
-        raise WorktreeCreateError(
-            f"{worktree_path} not present in `git worktree list` "
-            f"(registered: {[str(p) for p in registered]})"
-        )
-
-    try:
-        _run_powershell_git(worktree_path, ["status"])
-    except subprocess.CalledProcessError as exc:
-        raise WorktreeCreateError(
-            f"`git status` failed in {worktree_path}: {exc}"
-        ) from exc
-
-    # Defensive: no leftover `.git/*.lock` files.
-    git_dir = worktree_path / ".git"
-    if git_dir.is_dir():
-        for entry in git_dir.iterdir():
-            if entry.name.endswith(".lock"):
-                raise WorktreeCreateError(
-                    f"leftover lock file {entry} in worktree"
-                )
-
-
-def _run_powershell_git(
-    cwd: Path,
-    args: list[str],
-    *,
-    first_sight_ok: bool = False,
-) -> subprocess.CompletedProcess[str]:
-    """Run `git <args>` in `cwd`, through the hardened runner.
-
-    Per SESSION_PROTOCOL.md section 7, git ops on Windows go through
-    PowerShell. On non-Windows hosts we fall back to direct invocation
-    so the suite runs on Linux CI. The chunk 1 tests use skip-git
-    mode, so this path is exercised mainly on Windows during real
-    operation.
-
-    `git_safety.run_git` gives PowerShell (and so git) the hardened env
-    and refuses to run in a repo whose config or hooks changed since it
-    was trusted: the next card's prep runs in the same shared `.git` a
-    previous executor could write to. Raises CalledProcessError on a
-    non-zero exit, as callers expect.
-    """
-    if sys.platform == "win32":
-        # Invoke PowerShell with the git command. Use `& git ...` so
-        # PowerShell does not parse positional arguments oddly.
-        ps_args = [resolved("git"), *args]
-        cmd = [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "& " + " ".join(_quote_for_powershell(a) for a in ps_args),
-        ]
-    else:
-        cmd = [resolved("git"), *args]
-    proc = run_git(
-        cmd, cwd=cwd, timeout=GIT_WORKTREE_TIMEOUT_SEC, first_sight_ok=first_sight_ok,
-    )
-    if proc.returncode != 0:
-        raise subprocess.CalledProcessError(
-            proc.returncode, cmd, output=proc.stdout, stderr=proc.stderr,
-        )
-    return proc
-
-
-def _quote_for_powershell(arg: str) -> str:
-    """Quote an argument for the PowerShell -Command string.
-
-    Embedded single quotes are doubled; the whole thing is wrapped
-    in single quotes. Good enough for git arguments (which do not
-    contain single quotes in practice).
-    """
-    return "'" + arg.replace("'", "''") + "'"
+    log.info("prepared stub worktree at %s", worktree_path)

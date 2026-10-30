@@ -120,7 +120,7 @@ def _tier_map(tmp: Path, model: str) -> Path:
 
 def _spawn_env(tmp: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     seen: dict[str, str] = {}
-    monkeypatch.setattr(spawner, "spawn_in_job", lambda args, *, env, **_: seen.update(env) or object())
+    monkeypatch.setattr("cards_runner.common.sandbox.spawn_in_job", lambda args, *, env, **_: seen.update(env) or object())
     run_dir = tmp / "run"
     claim = ClaimedCard(card_id="c", attempt_trace_id="a", trace_id="t", run_dir=run_dir,
                         worktree_path=tmp, card_file=run_dir / "card.md")
@@ -260,16 +260,10 @@ def test_hardened_git_env_drops_keys_and_pins_the_exec_config() -> None:
     pinned = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
               for i in range(int(env["GIT_CONFIG_COUNT"]))}
     assert pinned["core.fsmonitor"] == "false"
-    assert Path(pinned["core.hooksPath"]).is_dir()
-    assert not any(Path(pinned["core.hooksPath"]).iterdir())
+    assert pinned["core.hooksPath"] == os.devnull  # nothing can be planted in it
+    assert pinned["core.useReplaceRefs"] == "false" and env["GIT_NO_REPLACE_OBJECTS"] == "1"
     no_gh = git_safety.hardened_git_env(base, keep_gh_credentials=False)
     assert "GH_TOKEN" not in no_gh
-
-
-def test_a_planted_file_in_the_empty_hooks_dir_is_removed_before_use() -> None:
-    first = git_safety.empty_hooks_dir()
-    (first / "pre-push").write_text("#!/bin/sh\nexit 0\n")
-    assert not any(git_safety.empty_hooks_dir().iterdir())
 
 
 def test_user_and_system_config_are_the_null_device() -> None:
@@ -463,10 +457,10 @@ def test_a_worktree_repointed_at_another_repo_is_refused(tmp_path: Path) -> None
 
 @needs_git
 @pytest.mark.parametrize("planted_after_trust", [False, True])
-def test_worktree_prep_runs_no_planted_hook(planted_after_trust: bool, tmp_path: Path) -> None:
-    # F1: the next card's `git worktree add` runs in the shared .git.
-    from cards_runner.common.types import RuntimePaths
-    from cards_runner.daemon.worktree import prepare_worktree
+def test_clone_prep_runs_no_planted_hook(planted_after_trust: bool, tmp_path: Path) -> None:
+    # F1: the next card's prep runs git in the project, which earlier
+    # model-run code could write by absolute path.
+    from cards_runner.daemon.clones import prepare_worker_clone
 
     work = _repo_with_remote(tmp_path)
     marker = tmp_path / "post-checkout-fired.txt"
@@ -486,16 +480,14 @@ def test_worktree_prep_runs_no_planted_hook(planted_after_trust: bool, tmp_path:
     else:
         git_safety.trust_repo(_common(work))  # rigged at first sight: overrides alone
 
-    paths = RuntimePaths.from_root(tmp_path / "todo")
-    paths.ensure()
-    kwargs = dict(paths=paths, project_dir=work, branch_name="card/z",
-                  base_branch="main", worktree_path=tmp_path / "card-wt")
+    kwargs = dict(project_dir=work, branch="card/z", base_branch="main",
+                  dest=tmp_path / "card-wt")
     if planted_after_trust:
         with pytest.raises(git_safety.RepoQuarantined):
-            prepare_worktree(**kwargs)
+            prepare_worker_clone(**kwargs)
     else:
-        prepare_worktree(**kwargs)
-    assert not marker.exists(), "worktree prep ran a planted hook"
+        prepare_worker_clone(**kwargs)
+    assert not marker.exists(), "clone prep ran a planted hook"
 
 
 @needs_git

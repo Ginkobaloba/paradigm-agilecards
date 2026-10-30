@@ -35,7 +35,7 @@ import os
 import signal
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import FrameType
 from typing import Any, Optional
@@ -89,6 +89,17 @@ from .confidence_gate import (
     build_gate_inputs,
     read_bucket_history,
 )
+from .clones import (
+    CloneError,
+    PatchRejected,
+    attempt_clone_dir,
+    integrate_patch,
+    prepare_verify_clone,
+    prepare_worker_clone,
+    read_patch,
+    reap_stale_clones,
+    remove_attempt_clones,
+)
 from .diff_stats import DiffStats
 from .orphan import reclaim, scan_for_orphans
 from .pr_lifecycle import GhRunner
@@ -102,12 +113,7 @@ from .sibling_reviewer import (
 )
 from .spawner import spawn_worker
 from .unblocker import UnblockDecision, unblock_merged_cards
-from .worktree import (
-    WorktreeCreateError,
-    attempt_branch_name,
-    prepare_worktree,
-    prune_git_worktrees,
-)
+from .worktree import attempt_branch_name, prepare_stub_worktree
 
 
 # How many times the daemon re-runs the verifier on a `VerifierError`
@@ -168,7 +174,12 @@ class Daemon:
         self._owns_repo = repo is None
         self._last_tick_at: float = 0.0
         self._last_tick_summary: dict[str, int] = {}
-        self._last_prune_at: float = 0.0
+        if cfg.worktree_prune_enabled:
+            # Obsolete since workers moved to clones (daemon/clones.py): the
+            # runner no longer registers worktrees in a project. Accepted so
+            # an existing launch command still starts.
+            log.warning("--worktree-prune is obsolete and ignored: workers use "
+                        "throwaway clones, not git worktrees")
         # Merge gate. Tests pass a `FakeGhRunner`; production builds use
         # the default subprocess wrapper. When `pr_gate_enabled=False`
         # both the gate and the runner are no-ops by design.
@@ -446,6 +457,10 @@ class Daemon:
                     summary["run_dirs_reaped"] += 1
         except Exception:  # noqa: BLE001
             log.exception("forensic reaper failed; continuing")
+        try:
+            reap_stale_clones(self.paths, set(self._workers.keys()))
+        except Exception:  # noqa: BLE001
+            log.exception("clone reaper failed; continuing")
 
         # 0.5 Sweep stale reviewer markers (chunk 6d). Same cadence + the
         #     same "best-effort, retry next tick" semantics as the
@@ -483,14 +498,6 @@ class Daemon:
                     self._record_contract_outcome(d.card_id, survived=True)
         except Exception:  # noqa: BLE001
             log.exception("pr unblocker failed; continuing")
-
-        # 0b. Chunk 5: `git worktree prune` sweep. The chunk-4 reaper
-        #     deletes the `_runs/<attempt>/` tree; this drops the dead
-        #     administrative `.git/worktrees/<id>/` entries that the
-        #     project repo still tracks. Rate-limited by
-        #     `worktree_prune_interval_sec`; off by default.
-        if self.cfg.worktree_prune_enabled:
-            self._maybe_prune_git_worktrees()
 
         # 0c. Chunk 5: sibling-agent reviewer for tier-3/4 PRs.
         #     Walks blocked/requires_review cards and posts a gh review.
@@ -700,29 +707,26 @@ class Daemon:
             log.error("claimed card %s vanished before spawn", claim.card_id)
             return False
 
-        project = record.project
-        base_branch_name = str(
-            record.field_value("branch") or f"card/{claim.card_id}"
-        )
-        branch = attempt_branch_name(base_branch_name, claim.attempt_trace_id)
-        base = record.field_value("base_branch") or "main"
+        project_dir, base, branch = self._clone_coordinates(record, claim)
         try:
-            prepare_worktree(
-                paths=self.paths,
-                project_dir=Path(project) if project else self.paths.todo_root,
-                branch_name=str(branch),
-                base_branch=str(base),
-                worktree_path=claim.worktree_path,
-                skip_git=self.cfg.skip_worktree,
-            )
+            if self.cfg.skip_worktree:
+                prepare_stub_worktree(worktree_path=claim.worktree_path,
+                                      branch_name=branch, base_branch=base)
+            else:
+                # A throwaway clone, not a worktree: the worker gets its own
+                # `.git`, and the base is pinned to a sha (daemon/clones.py).
+                claim = replace(claim, base_sha=prepare_worker_clone(
+                    project_dir=project_dir, base_branch=base, branch=branch,
+                    dest=claim.worktree_path,
+                ))
         except (RepoQuarantined, UntrustedRepo) as exc:
             # Not a rollback: re-claiming would hit the same refusal every
             # poll. A human re-trusts the repo (`cards-runner trust-repo`).
             self._route_untrusted_repo_to_blocked(claim, str(exc))
             return False
-        except WorktreeCreateError as exc:
+        except (CloneError, OSError) as exc:
             log.error(
-                "worktree prep failed for %s: %s; rolling back",
+                "worker clone prep failed for %s: %s; rolling back",
                 claim.card_id, exc,
             )
             self._rollback_to_backlog(claim)
@@ -755,6 +759,16 @@ class Daemon:
             spawned_at=time.monotonic(),
         )
         return True
+
+    def _clone_coordinates(self, record: CardRecord, claim: ClaimedCard) -> tuple[Path, str, str]:
+        """(project dir, base branch, per-attempt branch) for a claim."""
+        project = record.project
+        base_branch_name = str(
+            record.field_value("branch") or f"card/{claim.card_id}"
+        )
+        branch = attempt_branch_name(base_branch_name, claim.attempt_trace_id)
+        base = str(record.field_value("base_branch") or "main")
+        return (Path(project) if project else self.paths.todo_root), base, branch
 
     def _rollback_to_backlog(self, claim: ClaimedCard) -> None:
         """Return a half-prepared claim to `backlog` in the store."""
@@ -793,30 +807,45 @@ class Daemon:
 
     def _reap_workers(self, summary: dict[str, int]) -> None:
         done: list[str] = []
-        for attempt_id, handle in self._workers.items():
-            rc = handle.process.poll()
-            if rc is None:
-                # Wall-clock safety net. The real cost-cap path lands
-                # in chunk 2b-ii; this generous default is the
-                # last-resort backstop.
-                age = time.monotonic() - handle.spawned_at
-                if age > self.cfg.force_kill_after_seconds:
-                    log.warning(
-                        "force-killing worker attempt=%s after %.1fs",
-                        attempt_id, age,
-                    )
-                    handle.process.kill_tree(grace_sec=2.0)
-                    done.append(attempt_id)
-                continue
-            log.info(
-                "worker exited attempt=%s card_id=%s rc=%d",
-                attempt_id, handle.claim.card_id, rc,
-            )
-            done.append(attempt_id)
-            summary["worker_exits"] += 1
+        try:
+            for attempt_id, handle in list(self._workers.items()):
+                self._reap_one(attempt_id, handle, summary, done)
+        finally:
+            # Always: a handle left tracked is re-processed every tick (#87 patch-F2).
+            for attempt_id in done:
+                self._workers.pop(attempt_id, None)
+
+    def _reap_one(self, attempt_id: str, handle: _WorkerHandle, summary: dict[str, int],
+                  done: list[str]) -> None:
+        rc = handle.process.poll()
+        if rc is None:
+            # Wall-clock safety net. The real cost-cap path lands
+            # in chunk 2b-ii; this generous default is the
+            # last-resort backstop.
+            age = time.monotonic() - handle.spawned_at
+            if age > self.cfg.force_kill_after_seconds:
+                log.warning(
+                    "force-killing worker attempt=%s after %.1fs",
+                    attempt_id, age,
+                )
+                handle.process.kill_tree(grace_sec=2.0)
+                done.append(attempt_id)
+            return
+        log.info(
+            "worker exited attempt=%s card_id=%s rc=%d",
+            attempt_id, handle.claim.card_id, rc,
+        )
+        done.append(attempt_id)
+        summary["worker_exits"] += 1
+        # The worker exited; anything it left running did not. End the
+        # whole job before reading, applying or pushing its output.
+        handle.process.end_job()
+        try:
             self._post_worker_exit(handle, rc)
-        for attempt_id in done:
-            self._workers.pop(attempt_id, None)
+        except Exception:  # noqa: BLE001 - one card must not wedge every later one (L4-2)
+            log.exception("post-exit handling failed for card_id=%s attempt=%s; "
+                          "blocking it", handle.claim.card_id, attempt_id)
+            self._block_after_internal_error(handle.claim)
 
     def _post_worker_exit(self, handle: _WorkerHandle, rc: int) -> None:
         """Land a finished worker's results back into the store.
@@ -923,12 +952,10 @@ class Daemon:
         self._emit_escalated_events(claim, fields.get("cascade_history"))
         self._record_executor_metrics(claim, fields, sidecar)
 
-        untrusted = self._repo_untrusted_after_run(claim)
-        if untrusted is not None:
-            # Before ANY routing: the verifier, the merge gate and the
-            # shadow ledger would all run git in this repo next.
-            self._route_untrusted_repo_to_blocked(claim, untrusted)
-        elif rc in (EXIT_COST_CAP_HALT, EXIT_HALT_SIGNAL):
+        # No git runs in the worker's clone from here on: it is model-written.
+        # A clean exit's change arrives as a patch and is integrated in a
+        # daemon clone first (`_integrate_worker_patch`).
+        if rc in (EXIT_COST_CAP_HALT, EXIT_HALT_SIGNAL):
             self._route_halt_to_blocked(claim, rc, sidecar)
         elif rc != 0:
             log.warning(
@@ -943,8 +970,105 @@ class Daemon:
             # verifier (RUNNER_CONTRACT.md "AC amendment protocol").
             self._route_to_amendments(claim, body_md=body_md, fields=fields)
         else:
-            # Clean executor exit: dispatch the verifier.
-            self._dispatch_verifier(claim, body_md=body_md, fields=fields, sidecar=sidecar)
+            # Clean executor exit: integrate the patch, then verify.
+            try:
+                # One pin set from integration through verify and push: no
+                # sibling can swap a daemon clone dir in between (L4-1).
+                with git_safety.pinned_clones():
+                    integrated = self._integrate_worker_patch(claim)
+                    if integrated is not None:
+                        self._dispatch_verifier(
+                            integrated, body_md=body_md, fields=fields, sidecar=sidecar,
+                        )
+            finally:
+                # The push (if any) is done and the pins are released; the
+                # daemon clones are not forensic state. The worker clone
+                # stays with the run dir.
+                remove_attempt_clones(self.paths, claim.attempt_trace_id)
+
+    def _integrate_worker_patch(self, claim: ClaimedCard) -> ClaimedCard | None:
+        """Apply the worker's patch in a daemon clone and commit it once.
+
+        Runs only after the worker's whole job has ended (`_reap_workers`),
+        so nothing from THIS attempt is alive to race the read or the apply.
+        Another attempt's worker may be (`max_parallel > 1`, same user). It
+        cannot swap the daemon's clones (they are pinned and re-checked at
+        every call), but it can still write into them by absolute path: that
+        is the declared same-user residual (RUNNER_CONTRACT.md "What this does
+        not isolate"), not something these checks bound. Returns
+        the claim with `integration_path` / `integrated_sha` set, the claim
+        unchanged in skip-worktree mode, or None after routing the card to
+        `blocked` (no patch, a refused patch, or an untrusted project).
+        """
+        if self.cfg.skip_worktree or claim.base_sha is None:
+            return claim
+        record = self.repo.get_card(claim.card_id, tenant_id=self.tenant_id)
+        if record is None:  # pragma: no cover - just wrote it.
+            log.error("card %s vanished before integration", claim.card_id)
+            return None
+        project_dir, base, branch = self._clone_coordinates(record, claim)
+        root = attempt_clone_dir(self.paths, claim.attempt_trace_id)
+        try:
+            data = read_patch(claim.run_dir)
+            root.mkdir(parents=True, exist_ok=True)
+            # Applied from the daemon's own copy, read once, never from the
+            # run dir the worker could write.
+            patch_copy = root / "worker.patch"
+            patch_copy.write_bytes(data)
+            sha = integrate_patch(
+                project_dir=project_dir, base_branch=base, base_sha=claim.base_sha,
+                branch=branch, patch_file=patch_copy, dest=root / "integration",
+                message=(f"{record.card_id}: {record.title or record.card_id}\n\n"
+                         f"Cards-Runner-Attempt: {claim.attempt_trace_id}\n"),
+            )
+        except (RepoQuarantined, UntrustedRepo) as exc:
+            self._route_untrusted_repo_to_blocked(claim, str(exc))
+            return None
+        except (PatchRejected, CloneError, OSError) as exc:
+            self._route_patch_refused_to_blocked(claim, str(exc))
+            return None
+        except Exception as exc:  # noqa: BLE001 - e.g. TimeoutExpired: never wedge the tick
+            log.exception("integration failed for card_id=%s", claim.card_id)
+            self._route_patch_refused_to_blocked(claim, f"{type(exc).__name__}: {exc}")
+            return None
+        log.info("integrated card_id=%s at %s", claim.card_id, sha[:12])
+        return replace(claim, integration_path=root / "integration", integrated_sha=sha)
+
+    def _route_patch_refused_to_blocked(self, claim: ClaimedCard, detail: str) -> None:
+        """Block a card whose change could not be integrated. Not retried:
+        a refused patch is the executor's output, and a rerun is a human's
+        call."""
+        reason = f"worker change not integrated: {detail}"
+        log.error("routing card_id=%s to blocked: %s", claim.card_id, reason)
+        try:
+            self.repo.transition(
+                claim.card_id,
+                to_status=CardStatus.BLOCKED.value,
+                tenant_id=self.tenant_id,
+                actor_id=claim.attempt_trace_id,
+                actor_type=ActorType.EXECUTOR.value,
+                event_type=EventType.BLOCKED.value,
+                payload={"reason": reason, "error": "patch_refused"},
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("failed to block card %s on a refused patch: %s", claim.card_id, exc)
+
+    def _block_after_internal_error(self, claim: ClaimedCard) -> None:
+        """Block a card whose post-exit handling raised. Best effort: the
+        tick goes on either way, so later cards are still reaped and claimed."""
+        try:
+            self.repo.transition(
+                claim.card_id,
+                to_status=CardStatus.BLOCKED.value,
+                tenant_id=self.tenant_id,
+                actor_id=claim.attempt_trace_id,
+                actor_type=ActorType.EXECUTOR.value,
+                event_type=EventType.BLOCKED.value,
+                payload={"reason": "internal error after the worker exited; see the daemon log",
+                         "error": "post_exit_internal_error"},
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("failed to block card %s after an internal error: %s", claim.card_id, exc)
 
     @staticmethod
     def _read_result_sidecar(run_dir: Path) -> dict[str, Any]:
@@ -1128,13 +1252,13 @@ class Daemon:
         if writer is None:
             return
         try:
-            branch = str(record.field_value("branch") or "")
-            base = str(record.field_value("base_branch")
-                       or self.cfg.pr_base_branch_default)
+            # The integrated commit against its pinned base, read in the
+            # daemon's integration clone (never the worker's).
             diff = DiffStats.from_worktree(
-                claim.worktree_path, branch=branch, base_branch=base,
-                git_path=self.cfg.git_path,
-            ) if branch else DiffStats()
+                claim.integration_path, branch=claim.integrated_sha,
+                base_branch=claim.base_sha, git_path=self.cfg.git_path,
+            ) if (claim.integration_path and claim.integrated_sha
+                  and claim.base_sha) else DiffStats()
             rework = 0
             history = None
             if record.work_type is not None and record.points is not None:
@@ -1404,22 +1528,6 @@ class Daemon:
         # up-front contract did not survive unchanged.
         self._record_contract_outcome(claim.card_id, survived=False)
 
-    def _repo_untrusted_after_run(self, claim: ClaimedCard) -> str | None:
-        """Why the card's repo can no longer be trusted, or None.
-
-        Checks the worktree's repo against the baseline the daemon recorded
-        when it first saw the project (never re-taken at claim, so a
-        change left by an earlier card is not absorbed). A mismatch also
-        quarantines the repo for every later card (git_safety).
-        """
-        if self.cfg.skip_worktree:
-            return None
-        try:
-            git_safety.assert_trusted(claim.worktree_path)
-        except (RepoQuarantined, UntrustedRepo) as exc:
-            return str(exc)
-        return None
-
     def _route_untrusted_repo_to_blocked(self, claim: ClaimedCard, detail: str) -> None:
         """Block a card whose repo's git config or hooks are not trusted.
 
@@ -1523,6 +1631,10 @@ class Daemon:
             )
             return
 
+        verify_tree = self._verify_tree(claim)
+        if verify_tree is None:
+            return
+
         # Retry loop. Per the contract the orchestrator retries the
         # verifier; the verifier itself does not.
         result: VerifierResult | None = None
@@ -1532,10 +1644,12 @@ class Daemon:
                 result = verify_card(
                     card_id=claim.card_id,
                     card_body=card_body,
-                    worktree=claim.worktree_path,
-                    env={},  # the daemon owns scrubbing; the verifier
-                             # inherits an empty block, the contract's
-                             # most defensive default.
+                    worktree=verify_tree,
+                    # The daemon owns scrubbing: no secrets, no PATH, only
+                    # the switches that stop a shell AC's git from reading
+                    # system or global config (credential.helper=manager
+                    # was reachable with env={}: #87 deep verify L5-F1).
+                    env=git_safety.verifier_env(),
                     subjective_client=self._build_subjective_client(),
                     subjective_starting_tier=self.cfg.subjective_starting_tier,
                     subjective_max_tier=self.cfg.subjective_max_tier,
@@ -1582,6 +1696,36 @@ class Daemon:
                 claim,
                 VerifierError(f"unknown verdict {result.overall_status!r}"),
             )
+
+    def _verify_tree(self, claim: ClaimedCard) -> Path | None:
+        """Where the verifier's checks run: a clone detached at the
+        integrated sha, so it checks exactly the commit the merge gate will
+        push. Model-written shell ACs run there, so the daemon runs no git
+        in it afterwards. None after routing the card to `blocked`."""
+        if claim.integration_path is None or claim.integrated_sha is None:
+            # Skip-worktree mode only: outside it `_integrate_worker_patch`
+            # either set both or routed the card away before this point.
+            return claim.worktree_path
+        record = self.repo.get_card(claim.card_id, tenant_id=self.tenant_id)
+        if record is None:  # pragma: no cover - just wrote it.
+            return None
+        _, _, branch = self._clone_coordinates(record, claim)
+        dest = attempt_clone_dir(self.paths, claim.attempt_trace_id) / "verify"
+        try:
+            prepare_verify_clone(integration=claim.integration_path, branch=branch,
+                                 sha=claim.integrated_sha, dest=dest)
+        except (RepoQuarantined, UntrustedRepo) as exc:
+            self._route_untrusted_repo_to_blocked(claim, str(exc))
+            return None
+        except (CloneError, OSError) as exc:
+            self._verifier_route_error(claim, VerifierError(f"verify clone failed: {exc}"))
+            return None
+        except Exception as exc:  # noqa: BLE001 - e.g. TimeoutExpired: never wedge the tick
+            log.exception("verify clone failed for card_id=%s", claim.card_id)
+            self._verifier_route_error(
+                claim, VerifierError(f"verify clone failed: {type(exc).__name__}: {exc}"))
+            return None
+        return dest
 
     def _verifier_skip_eligible(
         self,
@@ -2075,44 +2219,3 @@ class Daemon:
         if client is None:
             return None
         return AnthropicAmendmentEditorClient(client=client)
-
-    # ---- chunk 5: git worktree prune sweep ---------------------------
-
-    def _maybe_prune_git_worktrees(self) -> None:
-        """Run `git worktree prune` per project once the interval elapses.
-
-        The runner does not (today) track the set of project repos
-        explicitly; we derive it from the distinct `project` fields on
-        live cards. A project with zero cards in the store contributes
-        nothing -- which is correct, the runner has nothing to clean up
-        there.
-        """
-        if self.cfg.skip_worktree:
-            return  # tests run against tmp dirs, never against a real git repo.
-        if self.cfg.worktree_prune_interval_sec <= 0:
-            return
-        now = time.monotonic()
-        if self._last_prune_at and now - self._last_prune_at < (
-            self.cfg.worktree_prune_interval_sec
-        ):
-            return
-        seen: set[Path] = set()
-        for record in self.repo.query_cards(tenant_id=self.tenant_id):
-            project = record.project
-            if not project:
-                continue
-            try:
-                project_dir = Path(project).resolve()
-            except OSError:
-                continue
-            if project_dir in seen:
-                continue
-            seen.add(project_dir)
-            try:
-                prune_git_worktrees(project_dir=project_dir)
-            except Exception:  # noqa: BLE001 - defensive sweep.
-                log.exception(
-                    "worktree prune sweep failed for %s; continuing",
-                    project_dir,
-                )
-        self._last_prune_at = now

@@ -12,6 +12,7 @@ runs git and delegates to it. The glob matchers back the gate's
 """
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
 from dataclasses import dataclass
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import Iterable
 
 from ..common.git_safety import run_git
+
+log = logging.getLogger(__name__)
 
 
 def _glob_to_regex(pattern: str) -> re.Pattern[str]:
@@ -117,9 +120,15 @@ class DiffStats:
         """Run `git diff base...branch --numstat` in the worktree.
 
         Raises RepoQuarantined / UntrustedRepo (git_safety) rather than
-        guess. Returns an empty DiffStats on any git failure -- the gate treats
-        an unreadable diff as "no diff signal" and leans on the other
-        inputs (the caller logs the failure)."""
+        guess. Returns an empty DiffStats on any git failure, logged here --
+        the gate treats an unreadable diff as "no diff signal" and leans on
+        the other inputs.
+
+        The range ends with `--`: without it git also tests whether the
+        range is a FILE, by stat()ing it under the cwd. In a deep state dir
+        that path passed Windows' 260-character limit, git died with
+        "Filename too long", and the gate silently saw an empty diff (#87
+        CI, the shadow-gate gap test)."""
         try:
             result = run_git(
                 # --no-renames so a rename can't dodge a sensitive-path
@@ -130,14 +139,17 @@ class DiffStats:
                 # to run a diff driver or helper here (git_safety).
                 [git_path, "diff", "--numstat",
                  "--no-renames", "--no-ext-diff", "--no-textconv",
-                 f"{base_branch}...{branch}"],
+                 f"{base_branch}...{branch}", "--"],
                 cwd=worktree, timeout=30,
             )
         # RepoQuarantined / UntrustedRepo propagate: an empty diff would
         # read as "nothing sensitive changed" to the confidence gate.
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as exc:
+            log.warning("diff stats unreadable in %s: %s", worktree, exc)
             return cls()
         if result.returncode != 0:
+            log.warning("diff stats unreadable in %s: git rc=%s %s", worktree,
+                        result.returncode, (result.stderr or "").strip()[:400])
             return cls()
         return cls.from_numstat(result.stdout)
 

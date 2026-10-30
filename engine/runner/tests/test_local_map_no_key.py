@@ -160,7 +160,7 @@ def test_spawner_passes_the_tier_map_and_local_endpoint_not_keys(
         seen.update(env)
         return object()
 
-    monkeypatch.setattr(spawner, "spawn_in_job", fake_spawn)
+    monkeypatch.setattr("cards_runner.common.sandbox.spawn_in_job", fake_spawn)
     map_path = _tier_map(tmp_path, ALL_LOCAL)
     monkeypatch.setenv(ENV_TIER_MAP_PATH, str(map_path))
     monkeypatch.setenv("CARDS_RUNNER_OLLAMA_BASE_URL", "http://ollama.invalid:11434/v1")
@@ -332,7 +332,7 @@ def _spawn_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str
         seen.update(env)
         return object()
 
-    monkeypatch.setattr(spawner, "spawn_in_job", fake_spawn)
+    monkeypatch.setattr("cards_runner.common.sandbox.spawn_in_job", fake_spawn)
     run_dir = tmp_path / "run-spawn"
     claim = ClaimedCard(
         card_id="c2", attempt_trace_id="a2", trace_id="t2", run_dir=run_dir,
