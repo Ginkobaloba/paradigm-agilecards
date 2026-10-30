@@ -1,0 +1,15 @@
+# 2026-10-29 22:00 CDT - clone per worker v3: what the re-verify says the text got wrong
+- **Who:** PromptBuilder seat (Claude Opus 5.5), at Daedalus's request after the targeted re-verify of #87 at 3c68c25 (PASS: 1,110 swap trials, 0 accepted, 0 project damage). Docs only: no code changed after 3c68c25.
+- **Change:** corrections to the 2026-10-29 20:55 entry and the PR body.
+  - **V3-1:** "nothing is filled before it is pinned" holds for SWAPS only. In the window after the emptiness check and before `git init` and the baseline, a sibling (same user) can WRITE into the pinned, empty `.git`, for example `.git/config` or `.git/info/attributes`. `git init` keeps those files, the baseline trusts them, and the daemon's own `git checkout` then runs a planted smudge filter. The verifier saw it accepted in 31 of 36 trials and through the full flow in 4 of 4. v2 behaved the same, so this is not a regression. An `objects/info/alternates` plant is also accepted, with read-only effect. This is now an explicit residual: **a same-user write made before the baseline is trusted, and daemon git executes it.**
+  - **V3-2:** "integration adds `origin` only to push" was wrong. `_integrate` runs `remote add origin` right after `checkout -b`, so the integration clone holds `origin` through verify and push. The worker and verify clones have no remote.
+  - **V3-3:** on any `UntrustedRepo`, `GitUnavailable` included, the card is blocked with no retry, and the message says the config or hooks changed. For a timeout that message is wrong. Declared here; the fix goes in the follow-up.
+  - The Refs of this PR's ledger entries pointed at a scratchpad outside the repo. They now name the reports, which Daedalus commits with the merge.
+- **Why:** each sentence corrected here claimed more than the code does.
+- **State after:** code unchanged at 3c68c25: 969 pass, ruff clean. Follow-up PR, after the merge:
+  - V3-1 hardening: pass `-c` overrides for `filter.*`, `core.attributesFile` and `core.hooksPath` to the daemon's checkout, and refuse or overwrite any `.git` file the daemon did not write before the baseline.
+  - A distinct, retryable path for `GitUnavailable`, with an accurate message.
+  - A test that pins `GitUnavailable` as an `UntrustedRepo` (V3-4).
+  - The delta cap also counts reverse hunks (V3-5; this fails closed, low).
+  - The fix for the whole same-user class is OS-level isolation (a container launcher), and that is Drew's decision.
+- **Refs:** the #87 v3 re-verify report (DEEP_VERIFY_pr87_r3.md, committed with the merge); engine/runner/src/cards_runner/daemon/clones.py `_clone`, `_integrate`; engine/RUNNER_CONTRACT.md "What this does not isolate"

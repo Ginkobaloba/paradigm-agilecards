@@ -246,7 +246,11 @@ reader assumes otherwise):
   Scheduler or COM. That process survives `end_job`.
 - Same-user writes by absolute path: the state dir, other attempts'
   files, the project dir; Credential Manager and other ambient
-  same-user access; another process's memory.
+  same-user access; another process's memory. This includes a write into
+  a daemon clone's pinned, empty `.git` before its baseline (a planted
+  `config` or `info/attributes`): `git init` keeps it, the baseline trusts
+  it, and the daemon's own git then runs it (a smudge filter at checkout).
+  Pins stop swaps, not writes.
 - Cards are verified and pushed against the base pinned at claim. Two
   cards that merge cleanly but break each other, or a base rewritten
   after the pin, are caught by the project's CI and branch protection,
