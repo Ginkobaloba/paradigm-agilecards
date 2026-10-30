@@ -361,6 +361,92 @@ def test_a_worker_clone_holds_no_other_branch_objects(tmp_path: Path) -> None:
     assert subprocess.run(["git", "cat-file", "-e", other], cwd=project).returncode == 0  # control
 
 
+# ---- patches (patch-F1, patch-F3) ------------------------------------------
+
+
+def _new_file_patch(path: str, content: bytes = b"shadow\n") -> bytes:
+    blob = subprocess.run(["git", "hash-object", "--stdin"], input=content, capture_output=True,
+                          check=True).stdout.decode().strip()
+    body = b"".join(b"+" + line + b"\n" for line in content.rstrip(b"\n").split(b"\n"))
+    n = content.count(b"\n")
+    return (f"diff --git a/{path} b/{path}\nnew file mode 100644\nindex {'0' * 40}..{blob}\n"
+            f"--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{n} @@\n").encode("utf-8") + body
+
+
+def _apply(project: Path, base: str, tmp_path: Path, patch: bytes, dest: str = "int") -> str:
+    pf = tmp_path / f"{dest}.patch"
+    pf.write_bytes(patch)
+    return integrate_patch(project_dir=project, base_branch="main", base_sha=base,
+                           branch="card/x/1", patch_file=pf, dest=tmp_path / dest, message="m")
+
+
+@pytest.mark.parametrize("path", ["Readme.md", "readme.MD", "Tests/t.py", "Tests/u.py"],
+                         ids=["case", "case-ext", "case-path", "case-dir-only"])
+def test_a_path_that_collides_on_a_case_insensitive_disk_is_refused(tmp_path: Path,
+                                                                    path: str) -> None:
+    """patch-F1: README.md and Readme.md both committed; the NTFS verify
+    clone held one of them, so the verifier checked a different tree."""
+    project, base = _trusted_project(tmp_path)
+    if path.startswith("Tests/"):
+        (project / "tests").mkdir()
+        (project / "tests" / "t.py").write_text("x = 1\n")
+        _g(project, "add", "-A")
+        _g(project, "-c", "user.email=t@example.test", "-c", "user.name=t", "commit", "-q", "-m", "t")
+        base = _g(project, "rev-parse", "HEAD").strip()
+        git_safety.trust_repo(git_safety.common_dir_of(project))
+    with pytest.raises(clones.PatchRejected, match="collide"):
+        _apply(project, base, tmp_path, _new_file_patch(path))
+
+
+def test_an_nfd_twin_of_an_nfc_name_is_refused(tmp_path: Path) -> None:
+    import unicodedata
+    project, base = _trusted_project(tmp_path)
+    nfc = unicodedata.normalize("NFC", "café.txt")
+    nfd = unicodedata.normalize("NFD", nfc)
+    patch = _new_file_patch(nfc) + _new_file_patch(nfd, b"twin\n")
+    with pytest.raises(clones.PatchRejected, match="collide"):
+        _apply(project, base, tmp_path, patch)
+
+
+def test_a_case_only_rename_and_an_old_collision_are_not_blocked(tmp_path: Path) -> None:
+    """Controls: only collisions the patch ADDS are refused."""
+    project, base = _trusted_project(tmp_path)
+    rename = _patch_for(tmp_path, lambda r: (_g(r, "mv", "README.md", "tmp.md"),
+                                             _g(r, "mv", "tmp.md", "Readme.md")))
+    assert _apply(project, base, tmp_path, rename, "int1") != base
+    # A base that already holds a collision (made through the index, not the disk).
+    blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=project, input=b"twin\n",
+                          capture_output=True, check=True).stdout.decode().strip()
+    _g(project, "update-index", "--add", "--cacheinfo", f"100644,{blob},Readme.md")
+    _g(project, "-c", "user.email=t@example.test", "-c", "user.name=t", "commit", "-q", "-m", "c")
+    collided = _g(project, "rev-parse", "HEAD").strip()
+    names = _g(project, "ls-tree", "--name-only", collided).split()
+    assert "README.md" in names and "Readme.md" in names  # the base really collides
+    git_safety.trust_repo(git_safety.common_dir_of(project))
+    unrelated = _patch_for(tmp_path, lambda r: (r / "src.py").write_text("x = 1\n"))
+    assert _apply(project, collided, tmp_path, unrelated, "int2") != collided
+
+
+def test_binary_hunks_that_inflate_past_the_cap_are_refused_before_apply(tmp_path: Path) -> None:
+    """patch-F3: 6 MB of patch inflated to 1 GiB in git apply."""
+    project, base = _trusted_project(tmp_path)
+    real = _patch_for(tmp_path, lambda r: (r / "b.bin").write_bytes(b"\0" * 4096))
+    assert b"literal 4096" in real  # the size line the cap reads
+    assert _apply(project, base, tmp_path, real, "ok") != base  # control: a small binary applies
+    huge = real.replace(b"literal 4096", f"literal {clones.PATCH_MAX_INFLATED_BYTES + 1}".encode())
+    # Anchored to the cap's own message: the edited size line also corrupts
+    # the hunk, and git's own refusal mentions "inflate" too.
+    with pytest.raises(clones.PatchRejected, match=r"^binary hunks inflate to"):
+        _apply(project, base, tmp_path, huge, "huge")
+
+
+def test_a_patch_over_the_file_count_is_refused(tmp_path: Path) -> None:
+    project, base = _trusted_project(tmp_path)
+    patch = b"".join(_new_file_patch(f"f{i}.txt") for i in range(clones.PATCH_MAX_FILES + 1))
+    with pytest.raises(clones.PatchRejected, match="files, over"):
+        _apply(project, base, tmp_path, patch)
+
+
 # ---- L4-2: the tick never wedges ------------------------------------------
 
 

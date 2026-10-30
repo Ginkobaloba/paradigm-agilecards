@@ -33,6 +33,7 @@ import re
 import shutil
 import stat
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Final
 
@@ -45,7 +46,12 @@ log = logging.getLogger(__name__)
 
 # A card's change is source code. Anything bigger is refused, not applied.
 PATCH_MAX_BYTES: Final[int] = 20 * 1024 * 1024
+# What the patch's binary hunks may inflate to, and how many files it may touch.
+PATCH_MAX_INFLATED_BYTES: Final[int] = 64 * 1024 * 1024
+PATCH_MAX_FILES: Final[int] = 2000
 CLONE_TIMEOUT_SEC: Final[float] = 300.0
+_DIFF_HEADER_RE: Final[re.Pattern[bytes]] = re.compile(rb"^diff --git ", re.M)
+_BINARY_SIZE_RE: Final[re.Pattern[bytes]] = re.compile(rb"^(literal|delta) ([0-9]+)\r?$", re.M)
 
 _SYMLINK_MODE: Final[str] = "120000"
 _GITLINK_MODE: Final[str] = "160000"
@@ -256,6 +262,7 @@ def _integrate(*, project_dir: Path, base_sha: str, branch: str, patch_file: Pat
     git_safety.trust_daemon_clone(dest)
     if patch_file.stat().st_size == 0:
         return base_sha
+    _refuse_oversized(patch_file.read_bytes())
     proc = run_git([resolved("git"), "apply", "--cached", "--binary", "--whitespace=nowarn",
                     "--", str(patch_file)], cwd=dest, timeout=CLONE_TIMEOUT_SEC)
     if proc.returncode != 0:
@@ -276,7 +283,45 @@ def _integrate(*, project_dir: Path, base_sha: str, branch: str, patch_file: Pat
         raise PatchRejected(f"integrated commit is not one commit on {base_sha[:12]}")
     _refuse_bad_entries(_parse_raw(_git(dest, "diff-tree", "-r", "--raw", "-z",
                                         "--no-renames", base_sha, sha)))
+    new = _case_collisions(_tree_paths(dest, sha)) - _case_collisions(_tree_paths(dest, base_sha))
+    if new:
+        raise PatchRejected(f"patch adds paths that collide on a case-insensitive "
+                            f"filesystem: {sorted(new)[:5]}")
     return sha
+
+
+def _refuse_oversized(patch: bytes) -> None:
+    """Refuse before git inflates anything (#87 deep verify patch-F3): a
+    binary hunk states its inflated size, and 6 MB of patch inflated to 1 GiB."""
+    files = len(_DIFF_HEADER_RE.findall(patch))
+    if files > PATCH_MAX_FILES:
+        raise PatchRejected(f"patch touches {files} files, over {PATCH_MAX_FILES}")
+    inflated = sum(int(m.group(2)) for m in _BINARY_SIZE_RE.finditer(patch))
+    if inflated > PATCH_MAX_INFLATED_BYTES:
+        raise PatchRejected(f"binary hunks inflate to {inflated} bytes, "
+                            f"over {PATCH_MAX_INFLATED_BYTES}")
+
+
+def _tree_paths(dest: Path, sha: str) -> list[str]:
+    out = _git(dest, "ls-tree", "-r", "-z", "--name-only", "--full-tree", sha)
+    return [p for p in out.split("\x00") if p]
+
+
+def _case_collisions(paths: list[str]) -> set[str]:
+    """Normalized names (files and every directory above them) that two
+    different paths share under casefold plus NFC (#87 deep verify patch-F1:
+    README.md and Readme.md both committed, while the NTFS verify clone held
+    only one, so the verifier checked a different tree than was pushed)."""
+    seen: dict[str, str] = {}
+    collisions: set[str] = set()
+    for path in paths:
+        parts = path.split("/")
+        for i in range(1, len(parts) + 1):
+            original = "/".join(parts[:i])
+            key = unicodedata.normalize("NFC", original).casefold()
+            if seen.setdefault(key, original) != original:
+                collisions.add(key)
+    return collisions
 
 
 def prepare_verify_clone(*, integration: Path, branch: str, sha: str, dest: Path) -> None:
