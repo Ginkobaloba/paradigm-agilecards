@@ -241,6 +241,13 @@ class DaemonConfig:
     # worktrees to prune. Kept so existing launch commands still parse;
     # the daemon warns and ignores them.
     worktree_prune_enabled: bool = False
+    # What a card does when the PINNED local tier map
+    # (CARDS_RUNNER_TIER_MAP_YAML) is missing or broken. `stop` (default,
+    # fail closed): the worker gets no key and the card fails. `warn`: if
+    # ANTHROPIC_API_KEY was set at start, the card runs on the hosted map,
+    # with a warning naming the paid model, the model stamped on the card,
+    # and a `map_fallback` event. Without a key, `warn` behaves as `stop`.
+    on_local_map_unavailable: str = "stop"
     worktree_prune_interval_sec: int = 3600
     # Chunk 6d: cleanup TTL for the per-card reviewer markers under
     # signals/sibling_reviews/ and signals/amendment_reviews/. The sweep

@@ -153,6 +153,13 @@ def main(argv: list[str] | None = None) -> int:
         "default; the project's project.yaml must also enable it.",
     )
     p_start.add_argument(
+        "--on-local-map-unavailable", choices=("stop", "warn"), default="stop",
+        help="when the pinned local tier map (CARDS_RUNNER_TIER_MAP_YAML) is missing "
+        "or broken: 'stop' (default) fails closed; 'warn' runs the card on the "
+        "hosted (PAID) map if ANTHROPIC_API_KEY was set at start, warning at start "
+        "and per card, naming the model on the card, and logging an event",
+    )
+    p_start.add_argument(
         "--worktree-prune", action="store_true",
         help="obsolete and ignored (workers use throwaway clones, not git "
         "worktrees); accepted so existing launch commands still start.",
@@ -386,6 +393,39 @@ def _anthropic_key_problem(args: argparse.Namespace) -> str | None:
     return None
 
 
+def _local_map_unavailable() -> str | None:
+    """Why the PINNED tier map cannot load (missing or broken), or None.
+
+    This is the one condition `--on-local-map-unavailable` governs. A SET
+    env var is a pin (canonical_config.load_tier_map): it never silently
+    falls back to another map, so under `stop` this refuses the start.
+    """
+    raw = os.environ.get(ENV_TIER_MAP_PATH)
+    if not raw:
+        return None
+    if not Path(raw).is_file():
+        return f"{ENV_TIER_MAP_PATH} points at {raw}, which is not a file"
+    try:
+        load_tier_map()
+    except CanonicalConfigMissing as exc:
+        return f"{ENV_TIER_MAP_PATH}: {exc}"
+    return None
+
+
+def _paid_fallback_banner(why: str | None) -> str:
+    """The start-time warning for `--on-local-map-unavailable warn`."""
+    hosted = load_tier_map(honor_pin=False)
+    paid = ", ".join(f"tier {p}: {m}" for p, m, _ in tiers_needing_a_key(hosted.points_to_model_map()))
+    rule = "!" * 72
+    if why is not None:
+        head = ("WARNING: the local tier map is UNAVAILABLE; cards will run on PAID "
+                f"hosted models ({why}).")
+    else:
+        head = ("NOTICE: --on-local-map-unavailable warn. If the local tier map becomes "
+                "unavailable, cards will run on PAID hosted models.")
+    return f"{rule}\n{head}\nHosted map {hosted.source}: {paid or 'no paid tier'}\n{rule}"
+
+
 def _tier_map_problem() -> str | None:
     """Why the tier map the worker will load is unusable, or None.
 
@@ -422,8 +462,9 @@ def _pin_worker_env() -> str | None:
         path = Path(raw).expanduser()
         if not path.is_absolute():
             path = path.resolve()
-        if not path.is_file():
-            return f"{ENV_TIER_MAP_PATH} points at {path}, which is not a file"
+        # Absolute even when missing: a map that reappears later is then
+        # the same file for the worker. Whether a missing one may start is
+        # `_local_map_unavailable`'s question.
         os.environ[ENV_TIER_MAP_PATH] = str(path)
     for name in LOCAL_BASE_URL_ENV:
         url = os.environ.get(name)
@@ -455,6 +496,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
             getattr(args, "amendment_reviewer", False)
         ),
         worktree_prune_enabled=bool(getattr(args, "worktree_prune", False)),
+        on_local_map_unavailable=getattr(args, "on_local_map_unavailable", "stop"),
         boot_worker_alive_check=not bool(
             getattr(args, "no_boot_alive_check", False)
         ),
@@ -497,10 +539,25 @@ def _cmd_start(args: argparse.Namespace) -> int:
         )
         return 2
     if args.invoker in ("sdk", "sdk-tools"):
-        env_problem = _pin_worker_env() or _tier_map_problem()
+        env_problem = _pin_worker_env()
         if env_problem is not None:
             print(f"error: {env_problem}", file=sys.stderr)
             return 2
+        unavailable = _local_map_unavailable()
+        warn = getattr(args, "on_local_map_unavailable", "stop") == "warn"
+        has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+        if unavailable is not None and not (warn and has_key):
+            hint = ("; --on-local-map-unavailable warn falls back to the hosted map only "
+                    "when ANTHROPIC_API_KEY is set" if warn else "")
+            print(f"error: {unavailable}{hint}", file=sys.stderr)
+            return 2
+        if warn and has_key and os.environ.get(ENV_TIER_MAP_PATH):
+            print(_paid_fallback_banner(unavailable), file=sys.stderr)
+        if unavailable is None:
+            map_problem = _tier_map_problem()
+            if map_problem is not None:
+                print(f"error: {map_problem}", file=sys.stderr)
+                return 2
     key_problem = _anthropic_key_problem(args)
     if key_problem is not None:
         print(

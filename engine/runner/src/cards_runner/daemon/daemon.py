@@ -111,7 +111,7 @@ from .sibling_reviewer import (
     StaticSiblingReviewerClient,
     run_sibling_reviews,
 )
-from .spawner import spawn_worker
+from .spawner import LOCAL_MAP_MODES, MapPlan, plan_worker_map, spawn_worker
 from .unblocker import UnblockDecision, unblock_merged_cards
 from .worktree import attempt_branch_name, prepare_stub_worktree
 
@@ -166,6 +166,8 @@ class Daemon:
         # The trusted git baselines and the empty config files every daemon
         # git call points at (git_safety). Daemon-side, outside any worktree.
         git_safety.configure(git_safety.state_dir_for(self.paths.todo_root))
+        if cfg.on_local_map_unavailable not in LOCAL_MAP_MODES:
+            raise ValueError(f"on_local_map_unavailable must be one of {LOCAL_MAP_MODES}")
         self.tenant_id = DEFAULT_TENANT
         self._workers: dict[str, _WorkerHandle] = {}
         self._stop_event = threading.Event()
@@ -742,11 +744,18 @@ class Daemon:
             self._rollback_to_backlog(claim)
             return False
 
+        map_plan: MapPlan | None = None
+        if self.cfg.invoker == "sdk":
+            # Per card, not once at start: a pinned map can vanish mid-run.
+            map_plan = plan_worker_map(self.cfg.on_local_map_unavailable, record.points)
+            if map_plan.fallback:
+                self._record_map_fallback(claim, map_plan)
         try:
             process = spawn_worker(
                 cfg=self.cfg,
                 claim=claim,
                 run_dir=claim.run_dir,
+                map_plan=map_plan,
             )
         except Exception:
             log.exception("worker spawn failed for %s", claim.card_id)
@@ -759,6 +768,38 @@ class Daemon:
             spawned_at=time.monotonic(),
         )
         return True
+
+    def _record_map_fallback(self, claim: ClaimedCard, plan: MapPlan) -> None:
+        """`on_local_map_unavailable: warn`: say, loudly and durably, that
+        this card is about to bill a hosted model instead of running locally.
+
+        The warning goes to the log, the paid model is written onto the card,
+        and a `map_fallback` event is appended. A store failure here is
+        logged, not raised: the warning has already been emitted.
+        """
+        log.warning(
+            "PAID MODEL: card %s runs on %s (hosted tier map) because the local "
+            "tier map is unavailable: %s", claim.card_id, plan.hosted_model, plan.reason,
+        )
+        try:
+            self.repo.update_card_fields(
+                claim.card_id,
+                {"billed_fallback_model": plan.hosted_model,
+                 "tier_map_fallback_reason": plan.reason},
+                tenant_id=self.tenant_id,
+            )
+            self.repo.append_event(CardEvent(
+                card_id=claim.card_id,
+                tenant_id=self.tenant_id,
+                type=EventType.MAP_FALLBACK.value,
+                actor_id=claim.attempt_trace_id,
+                actor_type=ActorType.RUNNER.value,
+                at=now_utc_iso(),
+                payload={"billed_model": plan.hosted_model, "reason": plan.reason,
+                         "setting": "on_local_map_unavailable=warn"},
+            ))
+        except Exception as exc:  # noqa: BLE001
+            log.error("could not record the map fallback on %s: %s", claim.card_id, exc)
 
     def _clone_coordinates(self, record: CardRecord, claim: ClaimedCard) -> tuple[Path, str, str]:
         """(project dir, base branch, per-attempt branch) for a claim."""

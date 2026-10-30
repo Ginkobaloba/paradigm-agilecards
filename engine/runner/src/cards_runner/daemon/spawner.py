@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import cards_runner
@@ -26,6 +27,41 @@ from ..providers.registry import LOCAL_BASE_URL_ENV, base_url_problem, tiers_nee
 
 
 log = logging.getLogger(__name__)
+
+
+LOCAL_MAP_MODES: tuple[str, ...] = ("stop", "warn")
+
+
+@dataclass(frozen=True)
+class MapPlan:
+    """Which tier map a card's worker runs on.
+
+    `fallback` is True only under `on_local_map_unavailable: warn`, with a
+    key present, when the pinned local map cannot load: the worker is then
+    spawned without the pin (so it loads the hosted map) and with the key.
+    `hosted_model` is the paid model this card's points select there.
+    """
+
+    fallback: bool
+    reason: str = ""
+    hosted_model: str | None = None
+
+
+def plan_worker_map(mode: str, points: int | None) -> MapPlan:
+    """Decide, at spawn time, whether this card falls back to the hosted map."""
+    if mode not in LOCAL_MAP_MODES:
+        raise ValueError(f"on_local_map_unavailable must be one of {LOCAL_MAP_MODES}, not {mode!r}")
+    if not os.environ.get(ENV_TIER_MAP_PATH):
+        return MapPlan(False)  # no pin: nothing local to be unavailable
+    try:
+        load_tier_map()
+        return MapPlan(False)
+    except CanonicalConfigMissing as exc:
+        reason = str(exc)
+    if mode != "warn" or not os.environ.get("ANTHROPIC_API_KEY"):
+        return MapPlan(False, reason=reason)  # stop: fail closed, no key
+    hosted = load_tier_map(honor_pin=False)
+    return MapPlan(True, reason=reason, hosted_model=hosted.model_for(points or min(hosted.tiers)))
 
 
 def _worker_needs_the_key() -> bool:
@@ -67,6 +103,7 @@ def spawn_worker(
     extra_env: dict[str, str] | None = None,
     extra_keep: tuple[str, ...] = (),
     extra_drop: tuple[str, ...] = (),
+    map_plan: MapPlan | None = None,
     launcher: SandboxLauncher | None = None,
 ) -> ManagedProcess:
     """Spawn the per-card worker for `claim`.
@@ -114,7 +151,12 @@ def spawn_worker(
         # the daemon injects exactly one key (not the whole prefix)
         # through `scrub_environment(add=...)`.
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if api_key and _worker_needs_the_key():
+        fallback = map_plan is not None and map_plan.fallback
+        if api_key and fallback:
+            # on_local_map_unavailable: warn. The daemon has already warned,
+            # stamped the card and logged the event (daemon._record_map_fallback).
+            injected["ANTHROPIC_API_KEY"] = api_key
+        elif api_key and _worker_needs_the_key():
             injected["ANTHROPIC_API_KEY"] = api_key
         elif api_key:
             log.info(
@@ -147,6 +189,10 @@ def spawn_worker(
             ENV_TIER_MAP_PATH,
         ):
             value = os.environ.get(passthrough)
+            if passthrough == ENV_TIER_MAP_PATH and fallback:
+                # Not forwarded: without the pin the worker loads the hosted
+                # map, the one plan_worker_map named on the card.
+                continue
             if value:
                 if passthrough == ENV_TIER_MAP_PATH:
                     # Absolute here too, not only in the CLI, so any direct

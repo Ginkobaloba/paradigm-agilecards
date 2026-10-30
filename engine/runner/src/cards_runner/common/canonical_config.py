@@ -219,11 +219,11 @@ def _model_to_tier(model_id: str) -> str:
     return "opus"  # conservative default for unknown models.
 
 
-def _candidate_paths(env_var: str, filename: str, explicit: Path | None) -> list[Path]:
+def _candidate_paths(env_var: str | None, filename: str, explicit: Path | None) -> list[Path]:
     paths: list[Path] = []
     if explicit is not None:
         paths.append(Path(explicit).expanduser())
-    env_value = os.environ.get(env_var)
+    env_value = os.environ.get(env_var) if env_var else None
     if env_value:
         paths.append(Path(env_value).expanduser())
     # Walk up from this file looking for the canonical name. Three hops
@@ -264,7 +264,8 @@ def _read_yaml(path: Path) -> dict[str, Any]:
 
 
 def load_tier_map(
-    path: Path | None = None, *, provider: str = "claude", strict: bool = False
+    path: Path | None = None, *, provider: str = "claude", strict: bool = False,
+    honor_pin: bool = True,
 ) -> TierMap:
     """Load `tier_map_<provider>.yaml`. Falls back to embedded defaults.
 
@@ -277,6 +278,11 @@ def load_tier_map(
     Set `strict=True` to raise `CanonicalConfigMissing` when no YAML is
     reachable -- useful in CI to catch a botched deploy that drops the
     canonical files.
+
+    `honor_pin=False` ignores `CARDS_RUNNER_TIER_MAP_YAML` entirely: it
+    loads exactly the map a worker gets when the pin is NOT forwarded,
+    which is the hosted map the `on_local_map_unavailable: warn` fallback
+    runs on (daemon/spawner.py `plan_worker_map`).
     """
     provider = provider.strip().lower()
     filename = f"tier_map_{provider}.yaml"
@@ -284,7 +290,7 @@ def load_tier_map(
     # FREE local map, never the paid Claude map: a misconfiguration must
     # not silently bill. `claude` is the one known paid map.
     embedded = _EMBEDDED_TIER_MAPS.get(provider, _EMBEDDED_TIER_MAP_LOCAL)
-    pinned = os.environ.get(ENV_TIER_MAP_PATH) if path is None else None
+    pinned = os.environ.get(ENV_TIER_MAP_PATH) if path is None and honor_pin else None
     if pinned:
         # A SET env var is a pin, not a hint: only that file counts, and a
         # missing or broken one raises. Falling through to the repo-root
@@ -294,7 +300,7 @@ def load_tier_map(
         strict = True
         candidates = [Path(pinned).expanduser()]
     else:
-        candidates = _candidate_paths(ENV_TIER_MAP_PATH, filename, path)
+        candidates = _candidate_paths(ENV_TIER_MAP_PATH if honor_pin else None, filename, path)
     found = _first_existing(candidates)
     if found is None:
         if strict:

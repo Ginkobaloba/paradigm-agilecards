@@ -75,6 +75,9 @@ class EventType(str, Enum):
     RECLAIMED = "reclaimed"
     TRANSITIONED = "transitioned"
     MIGRATED = "migrated"
+    # The pinned local tier map was unavailable and the card ran on the
+    # hosted (paid) map under `on_local_map_unavailable: warn`.
+    MAP_FALLBACK = "map_fallback"
 
 
 class ActorType(str, Enum):
