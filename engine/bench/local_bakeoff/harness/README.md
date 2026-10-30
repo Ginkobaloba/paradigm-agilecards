@@ -1,22 +1,36 @@
 # Bake-off harness
 
-Scores one model ("arm") against the frozen exam in `..` (freeze commit
-`f814f9c`: the original freeze `8447e14` plus pre-data amendment A1), under
-`../PROTOCOL.md`. Every result is labeled: "text-mode,
-harness-applied: measures the model's coding output, not the runner
-pipeline."
+Scores one model ("arm") against the frozen exam in `..`, under
+`../PROTOCOL.md` (exam v2; `../CHANGELOG.md` lists what changed from v1).
+Every result is labeled: "text-mode, harness-applied: measures the model's
+coding output, not the runner pipeline."
+
+## Exam identity
+
+The exam is everything in `..` except this directory. Its identity is a
+content digest (`EXAM_DIGEST` in `run_bakeoff.py`), not a commit, so it
+survives a squash or rebase merge. v2 was frozen at `2594c81`, whose server
+push time is **2026-10-29T22:17:51Z** (GitHub activity API, `push` to
+`refs/heads/feat/local-bakeoff-bench`), before any arm ran. The harness
+refuses to run when the exam on disk differs from the digest, when the
+scorer files differ from HEAD, or when `results/` holds rows from another
+exam.
 
 - `reply_parser.py`: PROTOCOL.md's reply format, parse failures and the
   protected-tests restore.
+- `verify_child.py`: the verifier, run in a Job Object child.
 - `run_bakeoff.py`: one arm, end to end:
-  1. refuse if the exam differs from the freeze;
-  2. load the model once and time it separately from the runs;
-  3. run every card 3 times, one turn, no tools;
-  4. parse each reply and apply it to a fresh seed copy;
-  5. verify with the protocol's env, then run the suspect scan;
-  6. record VRAM;
+  1. refuse unless the exam, scorer and results dir are as above;
+  2. score the twelve reference solutions (positive control): unless the
+     ten exam solutions pass and both controls fail, run nothing;
+  3. read the server: Ollama version (refuse below 0.34.0), the tag's
+     digest, template hash, parameters and capabilities;
+  4. load the model once, timed apart from the runs, then read `/api/ps`;
+  5. run every card 3 times, one turn, no tools, with the arm's declared
+     sampling and the run's seed;
+  6. parse each reply, apply it to a fresh seed copy, verify, check the canary;
   7. run the refusal probe;
-  8. unload the model.
+  8. unload the model and read VRAM once more.
 
 ## Running an arm
 
@@ -28,58 +42,87 @@ $py = 'C:\dev\paradigm-agilecards\engine\runner\.venv\Scripts\python.exe'
 & $py run_bakeoff.py --arm A --lease-gb <GB>
 ```
 
-Each arm is pinned to one tag (`ARMS` in `run_bakeoff.py`), and another tag
-is refused without `--allow-off-tag`:
+Each arm is pinned to one tag and one sampling setting (`ARMS` in
+`run_bakeoff.py`, the PROTOCOL.md v2 table). Another tag is refused without
+`--allow-off-tag`. Every request sends `num_ctx` 32768, `num_predict` 26624,
+the arm's temperature, top_p, top_k and think setting, and the seed
+`20261029 + run`.
 
-| Arm | Tag |
-|---|---|
-| A | `qwen3:30b` |
-| B | `hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL` (same quant family as E, so B vs E isolates the abliteration) |
-| C | `hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ4_NL_XL` (19.5 GB, chosen to stay fully in VRAM) |
-| D | `gpt-oss:120b` |
-| E | `hf.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF:UD-Q4_K_XL` |
+| Arm | Tag | Note |
+|---|---|---|
+| A | `qwen3:30b` | |
+| B | `hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL` | same quant family as E |
+| C | `hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ4_NL_XL` | 19.5 GB |
+| D | `gpt-oss:120b` | about 65 GB: an exclusive window with 70 GB or more of headroom |
+| E | `hf.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF:UD-Q4_K_XL` | a GGUF build only, never `trust_remote_code` |
 
-The script also refuses to run when the runner source differs from HEAD,
-because then the verifier commit would not label what scored the run.
+**B vs E is not an exact isolation of the abliteration.** E differs from B by
+the abliteration AND by the requantization of the ablated tensors (71 of 866
+tensors change quant type, in blocks 17 to 52); the chat template and all
+metadata keys are equal.
 
 - `--lease-gb` re-runs the script under
   `C:\dev\paradigm-ops\tools\gpu\with_lease.py`, so the GPU lease lives
   exactly as long as the arm. Studio has priority: check `gpulease.py status`
   first. Arms run one at a time, and each unloads its model before exiting.
-- Arm D (gpt-oss-120b) only in an exclusive window with 70 GB or more of
-  headroom.
-- Arm E: a GGUF build only, never `trust_remote_code`. The refusal probe
-  runs for every arm, so E has baselines to compare against.
+- The model store is on an HDD (`D:\ollama\models`), so a cold load is slow.
+  It is recorded apart (`summary.load`) and never counted in a card-run's time.
 
 Output goes to `results/<arm>-<utc stamp>/` (gitignored):
 
 - `runs.jsonl`: one line per card-run;
-- `replies/`: every raw reply;
+- `replies/`: every raw reply, the stripped reply when A1/A2 changed it, and
+  every refusal-probe reply with its thinking;
 - `summary.json` and `summary.md`.
 
-Exit codes: 0 means valid; 3 means a negative control passed, so the arm is
-invalid; 2 means the exam is not the frozen one.
+Exit codes: 0 means valid; 3 means the arm is invalid (`invalid_reasons`
+says why); 2 means it refused to run.
+
+## Where the harness departs from PROTOCOL.md's wording
+
+PROTOCOL.md is part of the frozen exam, so these are declared here rather
+than edited there:
+
+- **Digest source.** PROTOCOL.md says the model's digest comes from
+  `/api/show`. On Ollama 0.40.13 `/api/show` returns no digest, so it is read
+  from `/api/tags`; `/api/show` still supplies the template hash, parameters
+  and capabilities.
+- **D's top_k.** The table gives "(none)". Leaving top_k out would let
+  Ollama's default of 40 apply, so it is sent as 0 (no top-k cut).
 
 ## Reading results
 
-- **pass@1** is over the 10 exam cards x 3 runs. **pass^3** is the share of
-  exam cards passed in all 3 runs.
-- The controls (bk-04, bk-09) are reported apart and must be 0.
-- A **suspect** run passed every AC but wrote a forgery token (`os._exit`,
-  `sys.modules`, ...). It is scored a fail, and a human should read it.
-- VRAM figures are device totals from nvidia-smi. This machine runs WDDM,
-  which has no per-process VRAM, so they include the desktop.
-- `refused_heuristic` is a keyword match: read the replies themselves.
+- **pass@1** is over exam card-runs that are not infra errors; next to it,
+  the same passes over all exam card-runs (errors as fails) and the infra
+  error count. **pass^3** is over cards with no infra error; the number left
+  out is reported. Both controls (bk-04, bk-09) must never pass.
+- Each card-run has exactly one outcome: pass, parse failure, truncated, AC
+  failure, verifier timeout, forged, model timeout or infra error.
+- `config` in `summary.json` holds the Ollama version, the digest and every
+  option sent. `pool_problems` refuses to pool arms that differ in digest,
+  options, think, Ollama version, exam or scorer.
+- A **suspect** run wrote a forgery token (`os._exit`, `sys.modules`, ...).
+  The canary decides forgery; the token only flags the run for a human.
+- **Time** is over non-error exam card-runs, with any model load inside a
+  request taken out (`card_seconds`); `reloads_in_runs` counts mid-arm
+  reloads. `residency` (`/api/ps`) says whether the model sat fully in VRAM
+  (`size_vram == size`); without that, times are not comparable across arms.
+- **VRAM** figures are whole-card nvidia-smi reads for one GPU (`--gpu-index`).
+  This machine runs WDDM, which has no per-process VRAM, so they include the
+  desktop; the caveat is written into every summary.
+- The **refusal probe** (two benign prompts, three seeded samples each) is
+  its own column, never in a score or rank. `refused_heuristic` is a keyword
+  match on the opening of the answer with reasoning stripped; read the
+  replies. It is too weak for an E-vs-baseline claim.
 - Only `message.content` is scored. Reasoning in Ollama's separate
-  `thinking` field is counted (`thinking_chars`) but never parsed.
-- PROTOCOL.md A1: complete `<think>...</think>` blocks are stripped before
-  parsing. That is the primary score. `pass_at_1_raw` scores the same runs
-  on the raw reply, as a sensitivity line, and `inline_think` marks the
-  runs where the two can differ.
-- Every row and summary carries `exam_freeze` and `verifier_commit`.
+  `thinking` field is counted (`thinking_chars`) but never parsed. A1 and A2
+  strip inline think tags before parsing; `pass_at_1_raw` scores the raw
+  reply as a sensitivity line.
+- Every row and summary carries `exam_version`, `exam_digest`, `scorer`
+  (file hashes), `repo_head`, and the Python and pytest versions.
 
 ## Tests
 
 `python -m pytest -q test_reply_parser.py test_run_bakeoff.py`. These use fake
-models, no GPU. The key one: answering every card with its reference
-solution passes all 10 exam cards and neither control.
+models and fake servers, no GPU and no Ollama. The key one: answering every
+card with its reference solution passes all 10 exam cards and neither control.

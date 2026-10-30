@@ -786,6 +786,18 @@ def _median(values: list[float]) -> float | None:
     return sorted(values)[len(values) // 2] if values else None
 
 
+# A request whose own load_duration exceeds this reloaded the model (warm
+# requests report milliseconds). The HDD model store makes a reload slow.
+RELOAD_SEC = 1.0
+
+
+def card_seconds(record: dict[str, Any]) -> float:
+    """A card-run's time with any model load inside it taken out: the arm's
+    first load is timed apart (summary.load), and a mid-arm reload is the
+    disk's time, not the model's."""
+    return record["ended_at"] - record["started_at"] - (record.get("load_seconds") or 0.0)
+
+
 def summarize(arm: str, model: str, records: list[dict[str, Any]], runs: int) -> dict[str, Any]:
     exam = [r for r in records if r["card_id"] not in NEGATIVE_CONTROLS]
     controls = [r for r in records if r["card_id"] in NEGATIVE_CONTROLS]
@@ -841,12 +853,13 @@ def summarize(arm: str, model: str, records: list[dict[str, Any]], runs: int) ->
         "arm_valid": not invalid,
         # Time over non-error exam card-runs only: fast errors would drag it
         # down and timeouts would pin it to the timeout (PROTOCOL.md v2).
-        "median_card_seconds": _median([r["ended_at"] - r["started_at"] for r in timed]),
+        "median_card_seconds": _median([card_seconds(r) for r in timed]),
         "median_decode_tokens_per_sec": _median(
             [r["output_tokens"] / r["eval_seconds"] for r in timed
              if r.get("output_tokens") and r.get("eval_seconds")]),
         "max_load_seconds_in_runs": max((r.get("load_seconds") or 0.0 for r in timed),
                                         default=None),
+        "reloads_in_runs": sum((r.get("load_seconds") or 0.0) > RELOAD_SEC for r in records),
         "timed_card_runs": len(timed),
     }
 
@@ -923,6 +936,7 @@ def run_arm(*, arm: str, client: ModelClient, runs: int, out_dir: Path,
                             score_reply(card, reply.content, verify=verify)["passed"]
                             if changed else record["passed"])
                     record["outcome"] = outcome(record, reply, getattr(client, "num_ctx", None))
+                    record["card_seconds"] = card_seconds(record)
                     (out_dir / "replies").mkdir(exist_ok=True)
                     (out_dir / "replies" / f"{card.card_id}-r{run}.txt").write_text(
                         reply.content, encoding="utf-8")
@@ -969,7 +983,8 @@ def render_md(s: dict[str, Any]) -> str:
              f"- Config: {s.get('config')}",
              f"- Load: {s['load']}; residency (/api/ps): {s.get('residency')}",
              f"- Time over {s['timed_card_runs']} non-error exam card-runs: median "
-             f"{s['median_card_seconds']} s, decode {s['median_decode_tokens_per_sec']} tok/s",
+             f"{s['median_card_seconds']} s (loads taken out; {s['reloads_in_runs']} "
+             f"mid-arm reload(s)), decode {s['median_decode_tokens_per_sec']} tok/s",
              f"- VRAM (MiB): {s['vram']}",
              f"- VRAM caveat: {VRAM_CAVEAT}"]
     for item in s["suspect"]:

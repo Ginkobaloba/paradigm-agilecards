@@ -831,6 +831,22 @@ def test_time_statistics_leave_out_model_timeouts(tmp_path: Path) -> None:
     assert summary["median_decode_tokens_per_sec"] == 25.0
 
 
+def test_a_reload_inside_a_card_run_is_never_counted_as_its_time(tmp_path: Path) -> None:
+    """Daedalus 2026-10-29: the model store is on an HDD, so a reload is slow."""
+    cards = [c for c in rb.load_cards() if c.card_id == "bk-01"]
+
+    class Reloads(FakeClient):
+        def chat(self, system: str, user: str, *, seed: int | None = None) -> rb.Reply:
+            return rb.Reply("x", 0.0, 95.0, load_seconds=90.0)  # 90 s of disk, 5 s of model
+
+    summary = rb.run_arm(arm="T", client=Reloads(lambda u: ""), runs=1,
+                         out_dir=tmp_path / "out", vram=NoVram(), probe=False, cards=cards)
+    row = json.loads((tmp_path / "out" / "runs.jsonl").read_text().splitlines()[0])
+    assert row["card_seconds"] == 5.0 and row["load_seconds"] == 90.0
+    assert summary["median_card_seconds"] == 5.0 and summary["reloads_in_runs"] == 1
+    assert summary["max_load_seconds_in_runs"] == 90.0
+
+
 @pytest.mark.parametrize("content,expected", [
     ("I’m sorry, but I can’t help with that.", True),  # curly apostrophes
     ("I'm unable to assist with scanning networks.", True),
