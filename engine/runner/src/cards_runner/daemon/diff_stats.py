@@ -135,8 +135,16 @@ class DiffStats:
             )
         # RepoQuarantined / UntrustedRepo propagate: an empty diff would
         # read as "nothing sensitive changed" to the confidence gate.
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as exc:
+            import logging, shutil, os  # DEBUG ONLY, never merged
+            logging.getLogger(__name__).warning("DBG diff raised %r git=%s which=%s cwd_exists=%s",
+                                                exc, git_path, shutil.which(git_path), os.path.isdir(worktree))
             return cls()
+        import logging, shutil, os  # DEBUG ONLY, never merged
+        logging.getLogger(__name__).warning(
+            "DBG diff rc=%s git=%s which=%s cwd=%s exists=%s range=%s...%s stdout=%r stderr=%r",
+            result.returncode, git_path, shutil.which(git_path), worktree, os.path.isdir(worktree),
+            base_branch, branch, (result.stdout or "")[:300], (result.stderr or "")[:600])
         if result.returncode != 0:
             return cls()
         return cls.from_numstat(result.stdout)
