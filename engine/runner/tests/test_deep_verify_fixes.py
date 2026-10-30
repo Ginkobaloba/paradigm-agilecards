@@ -659,6 +659,37 @@ def test_a_binary_delta_is_capped_by_the_result_it_builds(tmp_path: Path) -> Non
         _apply(project, base, tmp_path, huge, "huge")
 
 
+def _delta_hunk(result_size: int) -> bytes:
+    import zlib
+    delta = _varint(200) + _varint(result_size) + bytes([0x90, 200])
+    return f"delta {len(delta)}\n".encode() + _b85_hunk(zlib.compress(delta, 9)) + b"\n"
+
+
+def _literal_hunk() -> bytes:
+    import zlib
+    return b"literal 4\n" + _b85_hunk(zlib.compress(b"tiny", 9)) + b"\n"
+
+
+def test_a_reverse_delta_counts_its_size_not_the_result_it_never_builds() -> None:
+    """V3-5: a forward apply never builds the reverse hunk's result, so a
+    large OLD blob must not refuse the patch. Each slot is pinned against
+    the other: the same delta in the forward slot is refused."""
+    huge = clones.PATCH_MAX_INFLATED_BYTES + 1
+    head = b"diff --git a/b.bin b/b.bin\nGIT binary patch\n"
+    clones._refuse_oversized(head + _literal_hunk() + _delta_hunk(huge))
+    # Per file, not per patch: a second file's reverse slot is spared too.
+    clones._refuse_oversized((head + _literal_hunk() + _delta_hunk(huge)) * 2)
+    with pytest.raises(clones.PatchRejected, match=r"^binary hunks inflate to"):
+        clones._refuse_oversized(head + _delta_hunk(huge) + _literal_hunk())
+    # Past the two slots, with no new header: counted in full.
+    with pytest.raises(clones.PatchRejected, match=r"^binary hunks inflate to"):
+        clones._refuse_oversized(head + _literal_hunk() + _literal_hunk() + _delta_hunk(huge))
+    # A second file's header resets the slots: its forward delta counts.
+    with pytest.raises(clones.PatchRejected, match=r"^binary hunks inflate to"):
+        clones._refuse_oversized(head + _literal_hunk() + _literal_hunk()
+                                 + head + _delta_hunk(huge) + _literal_hunk())
+
+
 def test_a_delta_git_itself_wrote_still_applies(tmp_path: Path) -> None:
     """Control for the header decode: a real `git diff --binary` delta."""
     import random
@@ -702,7 +733,34 @@ def test_an_unreadable_diff_is_logged(tmp_path: Path, caplog: pytest.LogCaptureF
     from cards_runner.daemon.diff_stats import DiffStats
     project, base = _trusted_project(tmp_path)
     stats = DiffStats.from_worktree(project, branch="no-such-rev", base_branch=base)
-    assert stats.total_lines == 0 and "diff stats unreadable" in caplog.text
+    assert stats.total_lines == 0 and stats.readable is False
+    # M8, M9: the rc and git's own words, not just "unreadable".
+    assert "diff stats unreadable" in caplog.text and "git rc=128" in caplog.text
+    assert "no-such-rev" in caplog.text  # from git's stderr
+
+
+def test_a_diff_git_could_not_start_is_logged_and_unreadable(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M6: the exception path logs too, naming the exception."""
+    from cards_runner.daemon import diff_stats
+
+    def no_git(*_: object, **__: object) -> object:
+        raise FileNotFoundError("git not found")
+
+    monkeypatch.setattr(diff_stats, "run_git", no_git)
+    stats = diff_stats.DiffStats.from_worktree(tmp_path, branch="b", base_branch="main")
+    assert stats.readable is False
+    assert "diff stats unreadable" in caplog.text
+    assert "FileNotFoundError" in caplog.text and "git not found" in caplog.text
+
+
+def test_a_read_empty_diff_is_readable(tmp_path: Path) -> None:
+    """Control for the two above: an empty diff git did read stays readable."""
+    from cards_runner.daemon.diff_stats import DiffStats
+    project, base = _trusted_project(tmp_path)
+    stats = DiffStats.from_worktree(project, branch=base, base_branch=base)
+    assert stats.total_lines == 0 and stats.readable is True
 
 
 def test_a_patch_over_the_file_count_is_refused(tmp_path: Path) -> None:

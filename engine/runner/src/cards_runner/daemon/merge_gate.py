@@ -215,6 +215,15 @@ class MergeGate:
             # here, whatever gh runner is wired in, before anything runs.
             try:
                 git_safety.assert_trusted(repo)
+            except git_safety.GitUnavailable as exc:
+                return MergeOutcome(
+                    decision=decision,
+                    to_status=CardStatus.BLOCKED.value,
+                    merge_status=_MS_BLOCKED,
+                    reason=f"git could not run to check the integration clone "
+                           f"(transient, not a change): {exc}",
+                    extra_payload={"error": "git_unavailable"},
+                )
             except (git_safety.RepoQuarantined, git_safety.UntrustedRepo) as exc:
                 return MergeOutcome(
                     decision=decision,

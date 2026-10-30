@@ -43,6 +43,10 @@ _POLICY_ESCALATORS: frozenset[str] = frozenset({
     "sensitive_path_touched",
     "schema_migration_in_diff",
     "regression_rate_alarm_active",
+    # The diff could not be read: every diff signal below is then unknown,
+    # not "nothing changed". Policy, so it cannot be switched off (#87 CI:
+    # a long path made git fail and the gate saw an empty diff).
+    "diff_unreadable",
 })
 
 
@@ -97,7 +101,9 @@ class GateInputs:
     change_request_unresolved: bool = False
     # Sibling agreement.
     sibling_decision: str | None = None  # approve|request_changes|comment|None
-    # Diff signals.
+    # Diff signals. `diff_unreadable`: git could not produce the diff, so
+    # the signals after it are unknown rather than zero.
+    diff_unreadable: bool = False
     diff_total_lines: int = 0
     diff_is_test_only: bool = False
     diff_within_declared_scope: bool = False
@@ -184,6 +190,8 @@ class ConfidenceGate:
         fired: list[str] = []
         if inputs.pin_required:
             fired.append("pin_required")
+        if inputs.diff_unreadable:
+            fired.append("diff_unreadable")
         if inputs.subjective_cleared_tier == "opus":
             fired.append("subjective_cascade_opus_used")
         if inputs.sensitive_path_touched:
@@ -261,6 +269,7 @@ class ConfidenceGate:
             "cascade_climbs": inputs.cascade_climbs,
             "rework_cycles": inputs.rework_cycles,
             "sibling_decision": inputs.sibling_decision,
+            "diff_unreadable": inputs.diff_unreadable,
             "diff_total_lines": inputs.diff_total_lines,
             "diff_is_test_only": inputs.diff_is_test_only,
             "num_medium_risk": sum(
@@ -390,6 +399,7 @@ def build_gate_inputs(
         rework_cycles=rework_cycles,
         verifier_confidence=verifier_conf,
         sibling_decision=sibling_decision,
+        diff_unreadable=not getattr(diff_stats, "readable", True),
         diff_total_lines=diff_stats.total_lines,
         diff_is_test_only=diff_is_test_only,
         diff_within_declared_scope=within_scope,

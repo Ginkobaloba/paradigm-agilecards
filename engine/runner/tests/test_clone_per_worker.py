@@ -424,6 +424,29 @@ def _integrate(tmp: Path, project: Path, patch: bytes) -> str:
                            dest=tmp / f"int-{uuid.uuid4().hex[:6]}", message="m")
 
 
+def test_integration_git_ends_each_revision_list_with_a_double_dash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M2-M4 (#87 CI): without `--` git also stat()s a revision as a path,
+    which fails past Windows' MAX_PATH in a deep state dir."""
+    project = _project(tmp_path)
+    git_safety.assert_trusted(project, first_sight_ok=True)
+    patch = _patch_for(tmp_path, lambda r: (r / "src.py").write_text("x = 1\n"))
+    seen: list[tuple[str, ...]] = []
+    real_git = clones._git
+
+    def spy(cwd: Path, *args: str, **kw: Any) -> Any:
+        seen.append(args)
+        return real_git(cwd, *args, **kw)
+
+    monkeypatch.setattr(clones, "_git", spy)
+    _integrate(tmp_path, project, patch)
+    for verb in ("diff-index", "rev-list", "diff-tree"):
+        calls = [a for a in seen if a and a[0] == verb]
+        assert calls, f"control: integration ran no {verb}"
+        assert all(a[-1] == "--" for a in calls), (verb, calls)
+
+
 def test_a_plain_patch_integrates(tmp_path: Path) -> None:
     project = _project(tmp_path)
     git_safety.assert_trusted(project, first_sight_ok=True)
@@ -602,3 +625,123 @@ def test_model_side_git_runs_a_planted_filter_without_the_key(
     assert "PATH" in dumped.upper(), "control: the planted filter ran and dumped its env"
     assert "sk-ant-test-0042" not in dumped
     assert "gh-test-0042" not in dumped
+
+
+# ---- git that cannot run is not an untrusted repo --------------------------
+
+
+def test_git_unavailable_is_an_untrusted_repo() -> None:
+    # V3-4: every older `except UntrustedRepo` still refuses on it, so the
+    # GitUnavailable handlers must come first to get the retryable route.
+    assert issubclass(git_safety.GitUnavailable, git_safety.UntrustedRepo)
+
+
+def _blocked_error(repo: SqliteRepository, card_id: str) -> object:
+    blocked = [e for e in repo.list_events(card_id) if e.type == "blocked"]
+    return blocked[-1].payload.get("error") if blocked else None
+
+
+@pytest.mark.parametrize("exc", [git_safety.GitUnavailable, git_safety.UntrustedRepo])
+def test_git_unavailable_at_prep_retries_the_card(
+    exc: type[Exception], setup, repo: SqliteRepository, paths: RuntimePaths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _, daemon = setup
+    card_id = f"bTST-CL-gu-prep-{exc.__name__}"
+    _insert(repo, card_id, project)
+
+    def refuse(**_: Any) -> str:
+        raise exc("git config could not read x: timed out")
+
+    monkeypatch.setattr("cards_runner.daemon.daemon.prepare_worker_clone", refuse)
+    assert daemon._prepare_and_spawn(_claim(repo, paths, card_id)) is False
+    card = repo.get_card(card_id)
+    assert card is not None
+    if exc is git_safety.GitUnavailable:
+        assert card.status == CardStatus.BACKLOG.value and _blocked_error(repo, card_id) is None
+    else:  # control: a real trust refusal still blocks
+        assert card.status == CardStatus.BLOCKED.value
+        assert _blocked_error(repo, card_id) == "repo_untrusted"
+
+
+@pytest.mark.parametrize("stage", ["integrate_patch", "prepare_verify_clone", "merge_gate"])
+@pytest.mark.parametrize("exc", [git_safety.GitUnavailable, git_safety.UntrustedRepo])
+def test_git_unavailable_after_the_worker_blocks_with_its_own_reason(
+    stage: str, exc: type[Exception], setup, repo: SqliteRepository, paths: RuntimePaths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, gh, daemon = setup
+    card_id = f"bTST-CL-gu-{stage}-{exc.__name__}"
+    _insert(repo, card_id, project)
+    claim = _spawned(daemon, repo, paths, card_id, monkeypatch)
+    (claim.worktree_path / "anything").write_text("x\n", encoding="utf-8")
+    assert emit_patch(worktree=claim.worktree_path, base_sha=claim.base_sha,
+                      run_dir=claim.run_dir)
+
+    def refuse(*_: Any, **__: Any) -> Any:
+        raise exc("git config could not read x: timed out")
+
+    if stage == "merge_gate":
+        # Only the gate's own check of the integration clone fails.
+        real = git_safety.assert_trusted
+
+        def flaky(repo_dir: Path, *a: Any, **kw: Any) -> Any:
+            if Path(repo_dir).name == "integration" and verified:
+                refuse()
+            return real(repo_dir, *a, **kw)
+
+        verified: list[bool] = []
+        real_verify = __import__("cards_runner.daemon.daemon",
+                                 fromlist=["verify_card"]).verify_card
+
+        def spy(**kw: Any) -> Any:
+            verified.append(True)
+            return real_verify(**kw)
+
+        monkeypatch.setattr("cards_runner.daemon.daemon.verify_card", spy)
+        monkeypatch.setattr(git_safety, "assert_trusted", flaky)
+    else:
+        monkeypatch.setattr(f"cards_runner.daemon.daemon.{stage}", refuse)
+    _exit(daemon, claim)
+    card = repo.get_card(card_id)
+    assert card is not None and card.status == CardStatus.BLOCKED.value and gh.calls == []
+    want = "git_unavailable" if exc is git_safety.GitUnavailable else "repo_untrusted"
+    assert _blocked_error(repo, card_id) == want or (
+        stage == "merge_gate" and card.field_value("merge_status") == "blocked"
+        and _merge_error(repo, card_id) == want)
+
+
+def test_git_unavailable_after_the_worker_never_respawns_it(
+    setup, repo: SqliteRepository, paths: RuntimePaths, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The loop risk: if integration requeued on a git timeout, a git that
+    stays down would rerun the paid worker on every poll. One spawn, then
+    the card stays blocked through later polls."""
+    project, _, daemon = setup
+    card_id = "bTST-CL-gu-noloop"
+    _insert(repo, card_id, project)
+    claim = _spawned(daemon, repo, paths, card_id, monkeypatch)
+    spawns: list[object] = []
+    monkeypatch.setattr("cards_runner.daemon.daemon.spawn_worker",
+                        lambda **kw: (spawns.append(kw), object())[1])
+    (claim.worktree_path / "anything").write_text("x\n", encoding="utf-8")
+    assert emit_patch(worktree=claim.worktree_path, base_sha=claim.base_sha,
+                      run_dir=claim.run_dir)
+
+    def down(*_: Any, **__: Any) -> Any:
+        raise git_safety.GitUnavailable("git config could not read x: timed out")
+
+    monkeypatch.setattr("cards_runner.daemon.daemon.integrate_patch", down)
+    _exit(daemon, claim)
+    for _ in range(3):
+        record = repo.get_card(card_id)
+        assert record is not None and record.status == CardStatus.BLOCKED.value
+        assert daemon._try_claim(record) is None
+    assert spawns == []
+
+
+def _merge_error(repo: SqliteRepository, card_id: str) -> object:
+    for event in reversed(repo.list_events(card_id)):
+        if "error" in event.payload:
+            return event.payload["error"]
+    return None

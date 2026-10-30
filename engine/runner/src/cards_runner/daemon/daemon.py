@@ -41,7 +41,7 @@ from types import FrameType
 from typing import Any, Optional
 
 from ..common import git_safety
-from ..common.git_safety import RepoQuarantined, UntrustedRepo
+from ..common.git_safety import GitUnavailable, RepoQuarantined, UntrustedRepo
 from ..common.locks import FileLock, LockHeldError, pid_alive
 from ..common.logging_setup import setup_daemon_logging
 from ..common.process_group import ManagedProcess
@@ -719,6 +719,13 @@ class Daemon:
                     project_dir=project_dir, base_branch=base, branch=branch,
                     dest=claim.worktree_path,
                 ))
+        except GitUnavailable as exc:
+            # git could not run (a config-read timeout): nothing about the
+            # repo changed and no model work is lost yet, so retry it.
+            log.warning("git unavailable preparing %s: %s; rolling back",
+                        claim.card_id, exc)
+            self._rollback_to_backlog(claim)
+            return False
         except (RepoQuarantined, UntrustedRepo) as exc:
             # Not a rollback: re-claiming would hit the same refusal every
             # poll. A human re-trusts the repo (`cards-runner trust-repo`).
@@ -1021,6 +1028,9 @@ class Daemon:
                 message=(f"{record.card_id}: {record.title or record.card_id}\n\n"
                          f"Cards-Runner-Attempt: {claim.attempt_trace_id}\n"),
             )
+        except GitUnavailable as exc:
+            self._route_git_unavailable_to_blocked(claim, "integration", str(exc))
+            return None
         except (RepoQuarantined, UntrustedRepo) as exc:
             self._route_untrusted_repo_to_blocked(claim, str(exc))
             return None
@@ -1554,6 +1564,32 @@ class Daemon:
         except Exception as exc:  # noqa: BLE001
             log.error("failed to block card %s on an untrusted repo: %s", claim.card_id, exc)
 
+    def _route_git_unavailable_to_blocked(self, claim: ClaimedCard, stage: str,
+                                          detail: str) -> None:
+        """Block a card whose git call could not run after the worker did.
+
+        Not "untrusted": nothing in the repo changed, so the re-trust advice
+        would send a human to the wrong fix. Blocked rather than requeued
+        because the worker's model work is already spent; a rerun is a
+        human's call, and an automatic one could repeat every poll while git
+        stays unavailable.
+        """
+        reason = (f"git could not run during {stage} (transient, the repo is "
+                  f"unchanged); safe to move back to backlog. ({detail})")
+        log.error("routing card_id=%s to blocked: %s", claim.card_id, reason)
+        try:
+            self.repo.transition(
+                claim.card_id,
+                to_status=CardStatus.BLOCKED.value,
+                tenant_id=self.tenant_id,
+                actor_id=claim.attempt_trace_id,
+                actor_type=ActorType.EXECUTOR.value,
+                event_type=EventType.BLOCKED.value,
+                payload={"reason": reason, "error": "git_unavailable"},
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("failed to block card %s on unavailable git: %s", claim.card_id, exc)
+
     def _route_halt_to_blocked(
         self, claim: ClaimedCard, rc: int, sidecar: dict[str, Any]
     ) -> None:
@@ -1714,6 +1750,9 @@ class Daemon:
         try:
             prepare_verify_clone(integration=claim.integration_path, branch=branch,
                                  sha=claim.integrated_sha, dest=dest)
+        except GitUnavailable as exc:
+            self._route_git_unavailable_to_blocked(claim, "verify clone", str(exc))
+            return None
         except (RepoQuarantined, UntrustedRepo) as exc:
             self._route_untrusted_repo_to_blocked(claim, str(exc))
             return None
