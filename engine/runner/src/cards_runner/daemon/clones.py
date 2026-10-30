@@ -299,8 +299,11 @@ def _integrate(*, project_dir: Path, base_sha: str, branch: str, patch_file: Pat
                     "--", str(patch_file)], cwd=dest, timeout=CLONE_TIMEOUT_SEC)
     if proc.returncode != 0:
         raise PatchRejected(f"git apply refused the patch: {proc.stderr.strip()[:400]}")
+    # Every revision argument below ends with `--`, so git never also
+    # stat()s it as a path under `dest`: past Windows' 260-character limit
+    # that stat fails and git dies ("Filename too long", #87 CI).
     changes = _parse_raw(_git(dest, "diff-index", "--cached", "--raw", "-z",
-                              "--no-renames", base_sha))
+                              "--no-renames", base_sha, "--"))
     _refuse_bad_entries(changes)
     if not changes:
         return base_sha
@@ -310,11 +313,11 @@ def _integrate(*, project_dir: Path, base_sha: str, branch: str, patch_file: Pat
     if not _SHA_RE.match(sha):
         raise CloneError(f"unexpected HEAD after commit: {sha!r}")
     # What is pushed is `sha`: check its parent and its tree, not the index.
-    parents = _git(dest, "rev-list", "--parents", "-n", "1", sha).split()
+    parents = _git(dest, "rev-list", "--parents", "-n", "1", sha, "--").split()
     if parents != [sha, base_sha]:
         raise PatchRejected(f"integrated commit is not one commit on {base_sha[:12]}")
     _refuse_bad_entries(_parse_raw(_git(dest, "diff-tree", "-r", "--raw", "-z",
-                                        "--no-renames", base_sha, sha)))
+                                        "--no-renames", base_sha, sha, "--")))
     new = _case_collisions(_tree_paths(dest, sha)) - _case_collisions(_tree_paths(dest, base_sha))
     if new:
         raise PatchRejected(f"patch adds paths that collide on a case-insensitive "

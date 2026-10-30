@@ -676,6 +676,35 @@ def test_a_delta_git_itself_wrote_still_applies(tmp_path: Path) -> None:
     assert _apply(project, base, tmp_path, patch, "real") != base
 
 
+@windows_only
+def test_diff_stats_read_a_deep_repo(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """#87 CI: in a state dir about 190 characters deep, `git diff base...sha`
+    (no `--`) also stat()ed the 83-character range as a file, passed the
+    260-character limit, died with "Filename too long", and the confidence
+    gate read an empty diff. This builds the same depth here."""
+    from cards_runner.daemon.diff_stats import DiffStats
+    deep = tmp_path
+    while len(str(deep)) < 190:
+        deep = deep / ("d" * min(40, 190 - len(str(deep))))
+    project = _project(deep, "p")
+    assert 180 < len(str(project)) < 260 - 52  # git's own object paths still fit
+    git_safety.assert_trusted(project, first_sight_ok=True)
+    base = _g(project, "rev-parse", "HEAD").strip()
+    head = _commit_file(project, "anything", b"a\nb\nc\n")
+    assert len(str(project)) + 1 + len(f"{base}...{head}") > 260  # the case that broke
+    stats = DiffStats.from_worktree(project, branch=head, base_branch=base)
+    assert stats.total_lines == 3, caplog.text
+    assert "unreadable" not in caplog.text
+
+
+def test_an_unreadable_diff_is_logged(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The docstring said the caller logged a failed diff; nothing did."""
+    from cards_runner.daemon.diff_stats import DiffStats
+    project, base = _trusted_project(tmp_path)
+    stats = DiffStats.from_worktree(project, branch="no-such-rev", base_branch=base)
+    assert stats.total_lines == 0 and "diff stats unreadable" in caplog.text
+
+
 def test_a_patch_over_the_file_count_is_refused(tmp_path: Path) -> None:
     project, base = _trusted_project(tmp_path)
     patch = b"".join(_new_file_patch(f"f{i}.txt") for i in range(clones.PATCH_MAX_FILES + 1))
